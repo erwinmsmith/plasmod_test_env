@@ -1,0 +1,57 @@
+{
+  "description": "HNSW benchmark experiment: compare Plasmod vs Qdrant vs Milvus vs LanceDB",
+  "dataset": {
+    "nfcorpus": {
+      "corpus": "data/nfcorpus/corpus.fbin",
+      "queries": "data/nfcorpus/queries.fbin",
+      "n": 3633,
+      "dim": 384
+    },
+    "deep10M": {
+      "corpus": "data/deep/base.10M.fbin",
+      "queries": "data/deep/query.public.10K.fbin",
+      "groundtruth": "data/deep/groundtruth.public.10K.ibin",
+      "n": 10000000,
+      "dim": 96
+    }
+  },
+  "index_configs": {
+    "HNSW": {
+      "description": "Hierarchical Navigable Small World — ANN index. Supported by Qdrant, Milvus, Plasmod",
+      "params": {
+        "qdrant":   { "m": 16, "ef_construct": 256, "ef": 256 },
+        "milvus":   { "M": 16, "efConstruction": 256, "efConstruction": 256 },
+        "plasmod":  { "m": 16, "ef_constr": 256 },
+        "lancedb":  { "type": "IVF_HNSW_PQ", "note": "LanceDB has IVF_HNSW_PQ only (no pure HNSW)" }
+      }
+    },
+    "IVF_FLAT": {
+      "description": "IVF inverted index + flat vector storage. Supported by Qdrant, Milvus, LanceDB",
+      "params": {
+        "qdrant":   { "nlist": 128, "nprobe": 10 },
+        "milvus":   { "nlist": 128, "nprobe": 10 },
+        "lancedb":  { "type": "IVF_FLAT" }
+      }
+    },
+    "IVF_PQ": {
+      "description": "IVF + Product Quantization. Supported by Qdrant, Milvus, LanceDB",
+      "params": {
+        "qdrant":   { "nlist": 128, "nprobe": 10, "compression": "PQ", "compression_ratio": 16 },
+        "milvus":   { "nlist": 128, "nprobe": 10, "m": 16, "nbits": 8 },
+        "lancedb":  { "type": "IVF_PQ", "num_sub_vectors": 16 }
+      }
+    },
+    "FLAT": {
+      "description": "Brute-force scan (baseline). All 4 DBs support this.",
+      "params": {}
+    }
+  },
+  "port_map": {
+    "qdrant":  6333,
+    "milvus":   19530,
+    "plasmod":  8080
+  },
+  "data_dir": {
+    "lancedb": "lancedb_data"
+  }
+}

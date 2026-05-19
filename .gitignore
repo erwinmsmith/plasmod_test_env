@@ -1,0 +1,22 @@
+# Keep folder structure, ignore contents
+data/*
+results/*
+models/*
+!.gitkeep
+
+# Ignore hidden files/dirs
+.*
+# Exception: keep .gitignore itself
+!.gitignore
+
+# Ignore large generated data
+bin/
+logs/
+lancedb_data/
+cpp/build/
+
+# Runtime files
+.server.pid
+*.vlog
+*.mem
+*.log
