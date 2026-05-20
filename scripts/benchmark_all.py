@@ -588,70 +588,290 @@ def benchmark_lancedb(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
 
 # ─── Plasmod ───────────────────────────────────────────────────────────────────
 
-def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
-    """Uses the benchmark binary in http-query mode."""
-    import tempfile
+# Binary protocol constants (must match src/internal/transport/framing.go)
+_MAGIC_INGEST  = b"PLIB"
+_MAGIC_QUERY_W  = b"PLQW"
+_MAGIC_QUERY_B  = b"PLQB"
+_WIRE_VERSION   = 1
 
-    with tempfile.NamedTemporaryFile(suffix=".fbin", delete=False) as f1, \
-         tempfile.NamedTemporaryFile(suffix=".fbin", delete=False) as f2:
-        tmp_idx, tmp_q = f1.name, f2.name
+# ── Low-level binary protocol helpers ──────────────────────────────────────────
 
-    def write_fbin(path, vecs, n, d):
-        with open(path, "wb") as f:
-            f.write(struct.pack("<II", n, d))
-            f.write(struct.pack(f"<{n*d}f", *vecs))
+def _pack_u16(v: int) -> bytes: return struct.pack("<H", v)
+def _pack_u32(v: int) -> bytes: return struct.pack("<I", v)
+def _unpack_u32(b: bytes) -> int: return struct.unpack("<I", b)[0]
+def _unpack_u64(b: bytes) -> int: return struct.unpack("<Q", b)[0]
 
-    write_fbin(tmp_idx, indexed, indexed_n, dim)
-    write_fbin(tmp_q, queries, query_n, dim)
+_WIRE_VERSION   = 3  # wire v3: index_type + IVF params
 
-    # For FLAT vs IVF: Plasmod uses HNSW internally, toggle via plugin flag
-    plugin = "0" if idx_type == "flat" else "1"
-    mode = "http-query-raw" if idx_type == "flat" else "http-query"
+def _build_ingest_payload(seg_id: str, vectors: list[float], n: int, dim: int,
+                          index_type: str = "",
+                          nlist: int = 0, nprobe: int = 0,
+                          m: int = 0, nbits: int = 0,
+                          sq_type: str = "") -> bytes:
+    """Build PLIB v3 ingest payload: header + vectors + object_ids + index_type + IVF params."""
+    # Wire v3: magic(4) + ver(1) + seg + n + dim + vectors + ids + [v3 fields]
+    buf = _MAGIC_INGEST + struct.pack("B", _WIRE_VERSION)
+    buf += _pack_u16(len(seg_id)) + seg_id.encode()
+    buf += _pack_u32(n) + _pack_u32(dim)
+    for i in range(n):
+        for j in range(dim):
+            buf += struct.pack("<f", vectors[i * dim + j])
+    for i in range(n):
+        oid = f"bench-p{i:06d}"
+        buf += _pack_u16(len(oid)) + oid.encode()
+    # v3 fields: index_type + IVF params
+    # index_type string (len+bytes, len=0 if empty)
+    idx_bytes = index_type.encode()
+    buf += _pack_u32(len(idx_bytes)) + idx_bytes
+    # IVF params
+    buf += struct.pack("<i", nlist)
+    buf += struct.pack("<i", nprobe)
+    buf += struct.pack("<i", m)
+    buf += struct.pack("<i", nbits)
+    sq_bytes = sq_type.encode()
+    buf += _pack_u32(len(sq_bytes)) + sq_bytes
+    return buf
 
-    try:
-        r = subprocess.run(
-            [str(BASE / "bin" / "benchmark"),
-             "--mode", mode,
-             "--server-url", "http://127.0.0.1:8080",
-             "--segment", "bench.layer1",
-             "--indexed-dataset", tmp_idx,
-             "--query-dataset", tmp_q,
-             "--queries", str(query_n),
-             "--topk", str(topk),
-             "--plugin", plugin,
-             "--batch-size", str(query_n)],
-            capture_output=True, text=True, timeout=600,
-            cwd=str(BASE),
+def _build_serial_query_payload(seg_id: str, query: list[float], dim: int, topk: int) -> bytes:
+    """Build PLQW single-query payload (nq=1)."""
+    buf = _MAGIC_QUERY_W + struct.pack("B", _WIRE_VERSION)
+    buf += _pack_u16(len(seg_id)) + seg_id.encode()
+    buf += _pack_u32(topk) + _pack_u32(dim)
+    for j in range(dim):
+        buf += struct.pack("<f", query[j])
+    return buf
+
+def _build_batch_query_payload(seg_id: str, queries: list[float], nq: int,
+                                dim: int, topk: int) -> bytes:
+    """Build PLQB batch-query payload."""
+    buf = _MAGIC_QUERY_B + struct.pack("B", _WIRE_VERSION)
+    buf += _pack_u16(len(seg_id)) + seg_id.encode()
+    buf += _pack_u32(topk) + _pack_u32(nq) + _pack_u32(dim)
+    for i in range(nq):
+        for j in range(dim):
+            buf += struct.pack("<f", queries[i * dim + j])
+    return buf
+
+def _parse_batch_response(body: bytes, nq: int, topk: int) -> tuple[list[int], list[float]]:
+    """Parse PLQB response: [nq][topk][id array][dist array] → (ids, dists).
+
+    The server encodes ids and dists as separate contiguous arrays:
+      [nq(u32)][topk(u32)][nq*topk * int64][nq*topk * float32]
+    """
+    if len(body) < 8:
+        return [], []
+    resp_nq   = _unpack_u32(body[0:4])
+    resp_topk = _unpack_u32(body[4:8])
+
+    n_results = min(resp_nq, nq) * resp_topk
+
+    # Read ids: nq*topk * int64 starting at byte 8
+    ids = []
+    for i in range(n_results):
+        off = 8 + i * 8
+        ids.append(_unpack_u64(body[off:off+8]))
+
+    # Read dists: nq*topk * float32 starting at byte 8 + nq*topk*8
+    id_array_size = n_results * 8
+    dists = []
+    for i in range(n_results):
+        off = 8 + id_array_size + i * 4
+        dists.append(struct.unpack("<f", body[off:off+4])[0])
+
+    return ids, dists
+
+
+# ── HTTP session helpers ───────────────────────────────────────────────────────
+
+class _HTTPClient:
+    def __init__(self, base_url: str, timeout: int = 30):
+        self.base = base_url
+        self.timeout = timeout
+        self._session = None
+
+    def _post_binary(self, path: str, payload: bytes) -> tuple[int, bytes]:
+        req = urllib.request.Request(
+            f"{self.base}{path}",
+            data=payload,
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
         )
-        stderr_clean = [l for l in r.stderr.splitlines()
-                       if "FD from fork" not in l and l.strip()]
-        if r.returncode != 0 and stderr_clean:
-            print(f"    Plasmod stderr: {'; '.join(stderr_clean[:3])}")
-        output = r.stdout.strip().split("\n")[-1]
-        data = json.loads(output)
-        # Memory (plasmod process)
-        pid = None
         try:
-            out = subprocess.check_output(
-                ["pgrep", "-f", "bin/plasmod"], text=True, timeout=5)
-            pid = int(out.strip().split()[0])
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except Exception as e:
+            return -1, str(e).encode()
+
+    def ingest(self, seg_id: str, vectors: list[float], n: int, dim: int,
+               index_type: str = "",
+               nlist: int = 0, nprobe: int = 0,
+               m: int = 0, nbits: int = 0,
+               sq_type: str = "") -> bool:
+        payload = _build_ingest_payload(seg_id, vectors, n, dim,
+                                        index_type, nlist, nprobe, m, nbits, sq_type)
+        code, _ = self._post_binary("/v1/internal/rpc/ingest_batch", payload)
+        return code == 200
+
+    def query_serial(self, seg_id: str, query: list[float], dim: int,
+                     topk: int) -> tuple[bool, int, int]:
+        """Send single query (nq=1). Returns (ok, status_code, latency_ms)."""
+        payload = _build_serial_query_payload(seg_id, query, dim, topk)
+        t0 = time.time()
+        code, body = self._post_binary("/v1/internal/rpc/query_warm", payload)
+        lat_ms = (time.time() - t0) * 1000
+        ok = code == 200
+        return ok, code, lat_ms
+
+    def query_batch(self, seg_id: str, queries: list[float], nq: int,
+                    dim: int, topk: int) -> tuple[bool, int, float, list[int], list[float]]:
+        """Send batch query. Returns (ok, status_code, latency_ms, ids, dists)."""
+        payload = _build_batch_query_payload(seg_id, queries, nq, dim, topk)
+        t0 = time.time()
+        code, body = self._post_binary("/v1/internal/rpc/query_warm_batch", payload)
+        lat_ms = (time.time() - t0) * 1000
+        if code == 200:
+            ids, dists = _parse_batch_response(body, nq, topk)
+            return True, code, lat_ms, ids, dists
+        return False, code, lat_ms, [], []
+
+    def unload(self, seg_id: str) -> None:
+        data = json.dumps({"segment_id": seg_id}).encode()
+        req = urllib.request.Request(
+            f"{self.base}/v1/internal/rpc/unload_segment",
+            data=data, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=10)
         except Exception:
             pass
-        mem_val = mem_mb(pid) if pid else 0.0
 
-        return Result(
-            db="Plasmod", index_type=idx_type.upper().replace("_", "-"),
-            n_indexed=indexed_n, n_queries=query_n, dim=dim, topk=topk,
-            build_ms=data["build_ms"],
-            batch_ms=data["batch_ms"], batch_qps=data["batch_qps"],
-            serial_ms=data["serial_ms"], serial_qps=data["serial_qps"],
-            p50_ms=data["p50_ms"], p95_ms=data["p95_ms"], p99_ms=data["p99_ms"],
-            recall=_plasmod_recall(data.get("int_ids", []), indexed, indexed_n, dim, queries, query_n, topk),
-            memory_mb=mem_val,
+    def register_warm(self, seg_id: str, n: int) -> None:
+        obj_ids = [f"bench-p{i:06d}" for i in range(n)]
+        data = json.dumps({"segment_id": seg_id, "object_ids": obj_ids}).encode()
+        req = urllib.request.Request(
+            f"{self.base}/v1/internal/rpc/register_warm",
+            data=data, headers={"Content-Type": "application/json"}, method="POST",
         )
-    finally:
-        os.unlink(tmp_idx)
-        os.unlink(tmp_q)
+        try:
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+
+
+def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
+    """
+    Pure-HTTP Plasmod benchmark — no Go binary, no CGO.
+    All queries sent as real HTTP requests to the running Plasmod server.
+
+    Serial latency = wall-clock time of each individual HTTP request (nq=1).
+    Batch latency  = wall-clock time of one HTTP request with all queries.
+    """
+    seg_id = "bench.layer1"
+    server_url = "http://127.0.0.1:8080"
+    http = _HTTPClient(server_url, timeout=60)
+
+    # Map Python idx_type to Plasmod index type + IVF params
+    INDEX_TYPE_MAP = {
+        "ivf_flat": ("IVF_FLAT", 0, 0, 0, 0, ""),
+        "ivf_pq":   ("IVF_PQ",   0, 0, 16, 8, ""),
+        "ivf_sq8":  ("IVF_SQ8",  0, 0, 0, 0, "INT8"),
+        "hnsw":     ("HNSW",     0, 0, 0, 0, ""),
+        "flat":     ("IVF_FLAT", 0, 0, 0, 0, ""),
+    }
+    ptype, nlist, nprobe, m, nbits, sq_type = INDEX_TYPE_MAP.get(idx_type, ("HNSW", 0, 0, 0, 0, ""))
+    print(f"      [Plasmod HTTP] index_type={ptype} idx_type={idx_type}")
+
+    # ── 1. Unload any stale segment ────────────────────────────────────────────
+    print(f"      [Plasmod HTTP] unloading segment={seg_id}")
+    http.unload(seg_id)
+    time.sleep(1)
+
+    # ── 2. Ingest indexed vectors in chunks ─────────────────────────────────────
+    print(f"      [Plasmod HTTP] ingesting {indexed_n} vectors (dim={dim})")
+    t_build = time.time()
+    ingest_batch = min(500_000, indexed_n)
+    for start in range(0, indexed_n, ingest_batch):
+        end = min(start + ingest_batch, indexed_n)
+        batch_n = end - start
+        ok = http.ingest(seg_id, indexed[start * dim : end * dim], batch_n, dim,
+                          index_type=ptype,
+                          nlist=nlist, nprobe=nprobe, m=m, nbits=nbits, sq_type=sq_type)
+        if not ok:
+            raise RuntimeError(f"ingest failed at batch {start}-{end}")
+        print(f"      [Plasmod HTTP]   ingested {end}/{indexed_n}")
+
+    # Register object IDs so the warm path works
+    http.register_warm(seg_id, indexed_n)
+    build_ms = (time.time() - t_build) * 1000
+    print(f"      [Plasmod HTTP] build={build_ms:.1f}ms")
+
+    # Warm-up: one serial request to prime the segment
+    http.query_serial(seg_id, queries[:dim], dim, topk)
+
+    # ── 3. True serial latency: nq individual HTTP requests (nq=1 each) ─────────
+    print(f"      [Plasmod HTTP] serial search {query_n} queries...")
+    serial_latencies = []
+    errors = 0
+    all_ids = []
+    for i in range(query_n):
+        query = [queries[i * dim + j] for j in range(dim)]
+        ok, code, lat = http.query_serial(seg_id, query, dim, topk)
+        serial_latencies.append(lat)
+        if ok and len(serial_latencies) == 1:
+            # parse ids from response for recall
+            pass  # single query response has string ids, skip for now
+        if not ok:
+            errors += 1
+    serial_ms = sum(serial_latencies)
+    serial_qps = query_n / (serial_ms / 1000) if serial_ms > 0 else 0
+    sl = sorted(serial_latencies)
+    p50 = sl[int(len(sl) * 0.50)]
+    p95 = sl[int(len(sl) * 0.95)]
+    p99 = sl[int(len(sl) * 0.99)]
+    mean = serial_ms / query_n if query_n else 0
+    print(f"      [Plasmod HTTP] serial done: QPS={serial_qps:.1f} "
+          f"mean={mean:.3f}ms p50={p50:.3f}ms p95={p95:.3f}ms p99={p99:.3f}ms")
+
+    # ── 4. Batch latency: one HTTP request with all queries ─────────────────────
+    print(f"      [Plasmod HTTP] batch search {query_n} queries...")
+    batch_ok, _, batch_ms, batch_ids, _ = http.query_batch(
+        seg_id, queries, query_n, dim, topk)
+    if batch_ok:
+        batch_qps = query_n / (batch_ms / 1000) if batch_ms > 0 else 0
+        all_ids = batch_ids
+        print(f"      [Plasmod HTTP] batch done: {batch_ms:.1f}ms QPS={batch_qps:.1f}")
+    else:
+        batch_ms = 0
+        batch_qps = 0
+        print(f"      [Plasmod HTTP] batch FAILED")
+
+    # ── 5. Recall (batch IDs are already collected) ─────────────────────────────
+    recall = _plasmod_recall(all_ids, indexed, indexed_n, dim, queries, query_n, topk)
+
+    # ── 6. Memory of plasmod process ────────────────────────────────────────────
+    mem_val = 0.0
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "bin/plasmod"], text=True, timeout=5)
+        pid = int(out.strip().split()[0])
+        mem_val = mem_mb(pid)
+    except Exception:
+        pass
+
+    # ── 7. Unload ──────────────────────────────────────────────────────────────
+    http.unload(seg_id)
+
+    return Result(
+        db="Plasmod", index_type=idx_type.upper().replace("_", "-"),
+        n_indexed=indexed_n, n_queries=query_n, dim=dim, topk=topk,
+        build_ms=build_ms,
+        batch_ms=batch_ms, batch_qps=batch_qps,
+        serial_ms=serial_ms, serial_qps=serial_qps,
+        p50_ms=p50, p95_ms=p95, p99_ms=p99,
+        recall=recall, memory_mb=mem_val,
+    )
 
 
 # ─── Recall ───────────────────────────────────────────────────────────────────
@@ -719,7 +939,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="nfcorpus", choices=["nfcorpus", "deep10M"])
     ap.add_argument("--index", default="all",
-                   help="flat | ivf_flat | ivf_pq | all")
+                   help="flat | ivf_flat | ivf_pq | ivf_sq8 | hnsw | all")
+    ap.add_argument("--db", default="all",
+                   help="all | qdrant | milvus | lancedb | plasmod")
     ap.add_argument("--index-count", type=int, default=0,
                    help="0=all loaded vectors")
     ap.add_argument("--queries", type=int, default=100)
@@ -757,47 +979,51 @@ def main():
         print(f"\n{'='*60}\n  Index: {idx_label}\n{'='*60}")
 
         # Qdrant
-        print("  [Qdrant]")
-        try:
-            r = benchmark_qdrant(indexed, n_idx, dim, queries, n_q, args.topk, idx)
-            all_results.append(r)
-            r.save(out_dir)
-            db_stores.setdefault("Qdrant", []).append((idx_label, indexed, queries, n_q, args.topk))
-        except Exception as e:
-            print(f"  Qdrant FAILED: {e}")
+        if args.db in ("all", "qdrant"):
+            print("  [Qdrant]")
+            try:
+                r = benchmark_qdrant(indexed, n_idx, dim, queries, n_q, args.topk, idx)
+                all_results.append(r)
+                r.save(out_dir)
+                db_stores.setdefault("Qdrant", []).append((idx_label, indexed, queries, n_q, args.topk))
+            except Exception as e:
+                print(f"  Qdrant FAILED: {e}")
 
         # Milvus
-        print("  [Milvus]")
-        try:
-            r = benchmark_milvus(indexed, n_idx, dim, queries, n_q, args.topk, idx)
-            all_results.append(r)
-            r.save(out_dir)
-            db_stores.setdefault("Milvus", []).append((idx_label, indexed, queries, n_q, args.topk))
-        except Exception as e:
-            print(f"  Milvus FAILED: {e}")
+        if args.db in ("all", "milvus"):
+            print("  [Milvus]")
+            try:
+                r = benchmark_milvus(indexed, n_idx, dim, queries, n_q, args.topk, idx)
+                all_results.append(r)
+                r.save(out_dir)
+                db_stores.setdefault("Milvus", []).append((idx_label, indexed, queries, n_q, args.topk))
+            except Exception as e:
+                print(f"  Milvus FAILED: {e}")
 
         # LanceDB (skips nothing — all types map to a LanceDB equivalent)
-        if idx not in lance_skip:
-            print("  [LanceDB]")
-            try:
-                r = benchmark_lancedb(indexed, n_idx, dim, queries, n_q, args.topk, idx)
-                all_results.append(r)
-                r.save(out_dir)
-                db_stores.setdefault("LanceDB", []).append((idx_label, indexed, queries, n_q, args.topk))
-            except Exception as e:
-                print(f"  LanceDB FAILED: {e}")
-        else:
-            print(f"  [LanceDB] SKIPPED (no {idx.upper()} support)")
+        if args.db in ("all", "lancedb"):
+            if idx not in lance_skip:
+                print("  [LanceDB]")
+                try:
+                    r = benchmark_lancedb(indexed, n_idx, dim, queries, n_q, args.topk, idx)
+                    all_results.append(r)
+                    r.save(out_dir)
+                    db_stores.setdefault("LanceDB", []).append((idx_label, indexed, queries, n_q, args.topk))
+                except Exception as e:
+                    print(f"  LanceDB FAILED: {e}")
+            else:
+                print(f"  [LanceDB] SKIPPED (no {idx.upper()} support)")
 
-        # Plasmod (HNSW-only DB; flat returns None for non-HNSW types)
-        print("  [Plasmod]")
-        try:
-            r = benchmark_plasmod(indexed, n_idx, dim, queries, n_q, args.topk, idx)
-            if r:
-                all_results.append(r)
-                r.save(out_dir)
-        except Exception as e:
-            print(f"  Plasmod FAILED: {e}")
+        # Plasmod
+        if args.db in ("all", "plasmod"):
+            print("  [Plasmod]")
+            try:
+                r = benchmark_plasmod(indexed, n_idx, dim, queries, n_q, args.topk, idx)
+                if r:
+                    all_results.append(r)
+                    r.save(out_dir)
+            except Exception as e:
+                print(f"  Plasmod FAILED: {e}")
 
     # Compute recall while collections are still alive
     print("\n  Computing Recall@K...")
