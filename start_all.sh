@@ -47,8 +47,8 @@ start_qdrant() {
     QDRANT_DIR="${SCRIPT_DIR}/../qdrant"
     QDRANT_DATA_DIR="${QDRANT_DIR}/storage"
     mkdir -p "${QDRANT_DATA_DIR}"
-    nohup "${QDRANT_DIR}/bin/qdrant" \
-      --storage.storage_path "${QDRANT_DATA_DIR}" \
+    nohup env QDRANT__STORAGE__STORAGE_PATH="${QDRANT_DATA_DIR}" \
+      "${QDRANT_DIR}/bin/qdrant" \
       > /tmp/qdrant.log 2>&1 &
     echo "Qdrant: started (PID: $!)"
     sleep 3
