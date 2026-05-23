@@ -62,7 +62,8 @@ start_plasmod() {
   else
     source "${SCRIPT_DIR}/.env"
     PLASMOD_ROOT="${PLASMOD_ROOT:-${SCRIPT_DIR}/..}"
-    export DYLD_LIBRARY_PATH="${PLASMOD_ROOT}/Plasmod/cpp/build:${DYLD_LIBRARY_PATH:-}"
+    export DYLD_LIBRARY_PATH="${PLASMOD_ROOT}/Plasmod/cpp/build:${PLASMOD_ROOT}/Plasmod/cpp/build/vendor:${DYLD_LIBRARY_PATH:-}"
+    export PLASMOD_BATCH_PLUGIN=1
 
     S3_ENDPOINT="${S3_ENDPOINT:-127.0.0.1:9000}" \
     S3_ACCESS_KEY="${S3_ACCESS_KEY:-minioadmin}" \

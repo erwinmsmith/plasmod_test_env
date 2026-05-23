@@ -39,7 +39,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional
 
-BASE = Path("/Users/erwin/Downloads/codespace/Plasmodexp/plasmod_test_env")
+BASE = Path(__file__).parent.parent.resolve()
 DATA = BASE / "data"
 OUT  = BASE / "results"
 OUT.mkdir(exist_ok=True)
@@ -1959,7 +1959,7 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
         pid = int(out.strip().split()[0])
         # Include mmap'd files in memory calculation for fair comparison
         # (Plasmod uses mmap for vector storage, which doesn't count in RSS)
-        andb_data_dir = Path("/Users/erwin/Downloads/codespace/Plasmodexp/Plasmod/cpp/build/.andb_data")
+        andb_data_dir = BASE.parent / "Plasmod" / "cpp" / "build" / ".andb_data"
         mem_val = mem_mb_with_mmap(pid, andb_data_dir)
     except Exception:
         pass
