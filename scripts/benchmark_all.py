@@ -1869,14 +1869,29 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
     http = _HTTPClient(server_url, timeout=60)
 
     # Map Python idx_type to Plasmod index type + IVF params
-    # For IVF-PQ: nlist=1024, nprobe=1024, m=128 achieves ~0.91 recall per sweep
-    INDEX_TYPE_MAP = {
-        "ivf_flat": ("IVF_FLAT", 0, 0, 0, 0, ""),
-        "ivf_pq":   ("IVF_PQ",   1024, 1024, 128, 8, ""),
-        "ivf_sq8":  ("IVF_SQ8",  0, 0, 0, 0, "INT8"),
-        "hnsw":     ("HNSW",     0, 0, 0, 0, ""),
-        "flat":     ("IVF_FLAT", 0, 0, 0, 0, ""),
-    }
+    # For IVF-PQ: m must divide dim. dim=96: valid m={8,12,16,24,32,48}; dim=384: valid m={8,12,16,24,32,48,64,96,128}
+    # nlist should be < indexed_n, typically indexed_n/4
+    def _valid_m(d: int) -> int:
+        """Find largest valid m that divides dim."""
+        for m in [128, 96, 64, 48, 32, 24, 16, 12, 8]:
+            if d % m == 0:
+                return m
+        return 8  # fallback
+
+    if idx_type == "ivf_pq":
+        m = _valid_m(dim)
+        nlist = min(indexed_n // 4, 256) if indexed_n >= 256 else min(indexed_n // 2, 64)
+        nlist = max(nlist, 4)
+        INDEX_TYPE_MAP = {
+            "ivf_pq": ("IVF_PQ", nlist, nlist, m, 8, ""),
+        }
+    else:
+        INDEX_TYPE_MAP = {
+            "ivf_flat": ("IVF_FLAT", 0, 0, 0, 0, ""),
+            "ivf_sq8":  ("IVF_SQ8",  0, 0, 0, 0, "INT8"),
+            "hnsw":     ("HNSW",     0, 0, 0, 0, ""),
+            "flat":     ("IVF_FLAT", 0, 0, 0, 0, ""),
+        }
     ptype, nlist, nprobe, m, nbits, sq_type = INDEX_TYPE_MAP.get(idx_type, ("HNSW", 0, 0, 0, 0, ""))
     print(f"      [Plasmod HTTP] index_type={ptype} idx_type={idx_type}")
 
