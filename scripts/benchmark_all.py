@@ -996,9 +996,14 @@ def _sweep_chromadb(indexed, indexed_n, dim, queries, query_n, topk, idx_type, p
             coll.add(ids=ids[bs:be], embeddings=vectors[bs:be])
 
         qvecs = [[float(queries[q * dim + d]) for d in range(dim)] for q in range(query_n)]
-        res = coll.query(query_embeddings=qvecs, n_results=topk)
-        ids_list = res.get("ids", [[] for _ in range(query_n)])
-        return [[int(id_.split("_")[1]) for id_ in ids] for ids in ids_list]
+        # Chunk to avoid SQLite "too many SQL variables" on large query_n.
+        out = []
+        for cs in range(0, query_n, 500):
+            ce = min(cs + 500, query_n)
+            sub = coll.query(query_embeddings=qvecs[cs:ce], n_results=topk)
+            for ids in sub.get("ids", [[] for _ in range(ce - cs)]):
+                out.append([int(id_.split("_")[1]) for id_ in ids])
+        return out
     except Exception as e:
         print(f"      ChromaDB sweep error: {e}")
         return []
@@ -1713,15 +1718,22 @@ def benchmark_chromadb(indexed, indexed_n, dim, queries, query_n, topk, idx_type
     build_ms = (time.time() - t0) * 1000
     _log(f"[ChromaDB] build done in {build_ms/1000:.1f}s")
 
-    # Batch search (single call with all queries)
+    # Batch search — chunk into sub-batches to avoid SQLite
+    # "too many SQL variables" error (default limit 999, modern ~32766).
+    # ChromaDB issues a single big SQL with N*topk parameters per call.
     qvecs = [[float(queries[q * dim + d]) for d in range(dim)] for q in range(query_n)]
+    _log(f"[ChromaDB] batch search {query_n} queries (chunked, topk={topk})...")
+    chunk = 500
+    batch_ids = []
     t0 = time.time()
-    res = coll.query(query_embeddings=qvecs, n_results=topk)
+    for cs in range(0, query_n, chunk):
+        ce = min(cs + chunk, query_n)
+        sub = coll.query(query_embeddings=qvecs[cs:ce], n_results=topk)
+        for ids in sub.get("ids", [[] for _ in range(ce - cs)]):
+            batch_ids.append([int(id_.split("_")[1]) for id_ in ids])
     batch_ms = (time.time() - t0) * 1000
     batch_qps = query_n / (batch_ms / 1000) if batch_ms > 0 else 0
-
-    # Parse IDs from batch query result and save for recall
-    batch_ids = [[int(id_.split("_")[1]) for id_ in ids] for ids in res.get("ids", [[] for _ in range(query_n)])]
+    _log(f"[ChromaDB] batch done in {batch_ms/1000:.1f}s QPS={batch_qps:.1f}")
     recall_file = BASE / "chromadb_batch_ids.json"
     with open(recall_file, "w") as f:
         json.dump(batch_ids, f)
