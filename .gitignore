@@ -13,7 +13,13 @@ models/*
 bin/
 logs/
 lancedb_data/
+chromadb_data/
+chromadb_batch_ids.json
 cpp/build/
+
+# Python bytecode
+__pycache__/
+*.pyc
 
 # Runtime files
 .server.pid

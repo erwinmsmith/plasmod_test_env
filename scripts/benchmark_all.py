@@ -39,49 +39,104 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """Allow json.dumps to handle numpy arrays and scalars."""
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        return super().default(obj)
+
+
+def _json_dumps(obj) -> bytes:
+    return json.dumps(obj, cls=_NumpyEncoder).encode()
+
 BASE = Path(__file__).parent.parent.resolve()
 DATA = BASE / "data"
 OUT  = BASE / "results"
 OUT.mkdir(exist_ok=True)
 
+# Force line-buffered stdout so nohup/redirect sees output immediately
+sys.stdout.reconfigure(line_buffering=True)
+
+# Override builtin print so all calls flush by default (visible through tee/nohup).
+import builtins as _builtins
+_orig_print = _builtins.print
+def _flushing_print(*args, **kwargs):
+    kwargs.setdefault("flush", True)
+    return _orig_print(*args, **kwargs)
+_builtins.print = _flushing_print
+
+def _log(msg: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
 
 # ─── Data loading ──────────────────────────────────────────────────────────────
 
 def load_fbin(path: str, limit: int = 0):
-    """Read float32 .fbin: [n(uint32), dim(uint32), vectors...]"""
+    """Read float32 .fbin using numpy (memory-efficient, ~8x less RAM than list)."""
+    t0 = time.time()
+    file_size = os.path.getsize(path)
     with open(path, "rb") as f:
         n   = struct.unpack("<I", f.read(4))[0]
         dim = struct.unpack("<I", f.read(4))[0]
-        avail = (os.path.getsize(path) - 8) // (dim * 4)
+        avail = (file_size - 8) // (dim * 4)
         n = min(n, avail, limit) if limit else min(n, avail)
-        data = f.read(n * dim * 4)
-    vecs = list(struct.unpack(f"<{n*dim}f", data))
-    return vecs, n, dim
+        size_gb = n * dim * 4 / 1e9
+        _log(f"load_fbin: reading {n:,} × dim={dim} from {Path(path).name} ({size_gb:.2f} GB)...")
+        arr = np.frombuffer(f.read(n * dim * 4), dtype=np.float32).copy()
+    _log(f"load_fbin: done in {time.time()-t0:.1f}s  RAM≈{arr.nbytes/1e9:.2f} GB")
+    return arr, n, dim
 
 
 def load_ibin(path: str, nq: int, topk: int):
-    """Read int32 .ibin: [nq(uint32), topk(uint32), ids[nq*topk*4bytes]"""
+    """Read int32 .ibin ground-truth: [nq(uint32), topk(uint32), ids...]"""
     with open(path, "rb") as f:
-        f.read(8)
-        data = f.read(nq * topk * 4)
-    ids = list(struct.unpack(f"<{nq*topk}i", data))
-    return ids
+        f_nq  = struct.unpack("<I", f.read(4))[0]
+        f_top = struct.unpack("<I", f.read(4))[0]
+        read_nq  = min(nq,  f_nq)
+        read_top = min(topk, f_top)
+        # Read only the rows we need
+        ids = np.frombuffer(f.read(f_nq * f_top * 4), dtype=np.int32)
+        ids = ids.reshape(f_nq, f_top)[:read_nq, :read_top]
+    return ids  # shape (nq, topk)
 
 
-def brute_force_search(indexed: List[float], indexed_n: int, dim: int,
-                       queries: List[float], q_n: int, topk: int):
-    """Compute ground truth via brute force (cosine similarity)."""
+def brute_force_search(indexed, indexed_n: int, dim: int,
+                       queries, q_n: int, topk: int):
+    """Compute ground truth via vectorized cosine similarity (numpy)."""
+    idx_mat = np.asarray(indexed[:indexed_n * dim], dtype=np.float32).reshape(indexed_n, dim)
+    q_mat   = np.asarray(queries[:q_n * dim],       dtype=np.float32).reshape(q_n, dim)
+
+    # L2-normalize rows
+    idx_norms = np.linalg.norm(idx_mat, axis=1, keepdims=True)
+    idx_norms[idx_norms == 0] = 1.0
+    idx_normed = idx_mat / idx_norms
+
+    q_norms = np.linalg.norm(q_mat, axis=1, keepdims=True)
+    q_norms[q_norms == 0] = 1.0
+    q_normed = q_mat / q_norms
+
     results = []
-    for qi in range(q_n):
-        q = queries[qi * dim:(qi + 1) * dim]
-        q_norm = sum(x*x for x in q) ** 0.5 or 1
-        scores = []
-        for i in range(indexed_n):
-            v = indexed[i * dim:(i + 1) * dim]
-            score = sum(qj * vj for qj, vj in zip(q, v)) / (q_norm * (sum(x*x for x in v) ** 0.5) + 1e-9)
-            scores.append((score, i))
-        scores.sort(reverse=True)
-        results.append([i for _, i in scores[:topk]])
+    BATCH = 256  # process queries in chunks to cap peak RAM
+    for qi_start in range(0, q_n, BATCH):
+        qi_end = min(qi_start + BATCH, q_n)
+        sims = q_normed[qi_start:qi_end] @ idx_normed.T  # (batch, indexed_n)
+        # argpartition is O(n) vs argsort O(n log n)
+        part = np.argpartition(sims, -topk, axis=1)[:, -topk:]
+        for bi in range(qi_end - qi_start):
+            top = part[bi]
+            top_sorted = top[np.argsort(sims[bi, top])[::-1]]
+            results.append(top_sorted.tolist())
+        if qi_start % 1000 == 0 and qi_start > 0:
+            _log(f"brute_force_search: {qi_start}/{q_n} queries done")
     return results
 
 
@@ -467,7 +522,7 @@ def _sweep_rebuild_qdrant(indexed, indexed_n, dim, idx_type):
             batch_end = min(batch_start + 500, indexed_n)
             points = [{"id": i + 1, "vector": indexed[i * dim:(i + 1) * dim]}
                       for i in range(batch_start, batch_end)]
-            body = json.dumps({"points": points}).encode()
+            body = _json_dumps({"points": points})
             urllib.request.urlopen(
                 urllib.request.Request(f"{base}/collections/{coll}/points", data=body,
                                       headers={"Content-Type": "application/json"}, method="PUT"),
@@ -685,7 +740,7 @@ def _sweep_qdrant(indexed, indexed_n, dim, queries, query_n, topk, idx_type, par
             ]}
             r = urllib.request.urlopen(
                 urllib.request.Request(f"{base}/collections/{coll}/points/search/batch",
-                                     data=json.dumps(payload).encode(),
+                                     data=_json_dumps(payload),
                                      headers={"Content-Type": "application/json"}, method="POST"),
                 timeout=120)
             d = json.loads(r.read())
@@ -726,7 +781,7 @@ def _sweep_qdrant_ivf(indexed, indexed_n, dim, queries, query_n, topk, nprobe):
             batch_end = min(batch_start + 500, indexed_n)
             points = [{"id": i + 1, "vector": indexed[i * dim:(i + 1) * dim]}
                       for i in range(batch_start, batch_end)]
-            body = json.dumps({"points": points}).encode()
+            body = _json_dumps({"points": points})
             urllib.request.urlopen(
                 urllib.request.Request(f"{base}/collections/{coll}/points", data=body,
                                       headers={"Content-Type": "application/json"}, method="PUT"),
@@ -745,7 +800,7 @@ def _sweep_qdrant_ivf(indexed, indexed_n, dim, queries, query_n, topk, nprobe):
         ]}
         r = urllib.request.urlopen(
             urllib.request.Request(f"{base}/collections/{coll}/points/search/batch",
-                                 data=json.dumps(payload).encode(),
+                                 data=_json_dumps(payload),
                                  headers={"Content-Type": "application/json"}, method="POST"),
             timeout=120)
         d = json.loads(r.read())
@@ -957,7 +1012,7 @@ def serial_ms_for_param(db_name, indexed_n, dim, queries, query_n, topk, idx_typ
         latencies = []
         for q in range(query_n):
             try:
-                body = json.dumps({"vector": queries[q * dim:(q + 1) * dim], "top": topk}).encode()
+                body = _json_dumps({"vector": queries[q * dim:(q + 1) * dim], "top": topk})
                 t0 = time.time()
                 urllib.request.urlopen(
                     urllib.request.Request(f"{base}/collections/{coll}/points/search",
@@ -1042,8 +1097,10 @@ def serial_ms_for_param(db_name, indexed_n, dim, queries, query_n, topk, idx_typ
 # ─── Qdrant ───────────────────────────────────────────────────────────────────
 
 def benchmark_qdrant(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
+    _log(f"[Qdrant] starting {idx_type} | indexed={indexed_n:,} dim={dim} queries={query_n} topk={topk}")
     base = "http://127.0.0.1:6333"
     coll = "bench_test"
+    _t_start = time.time()
 
     # Cleanup
     try:
@@ -1093,24 +1150,31 @@ def benchmark_qdrant(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
         timeout=30).read()
 
     # Ingest
+    _log(f"[Qdrant] ingesting {indexed_n:,} vectors...")
     t0 = time.time()
+    _next_report = max(5000, indexed_n // 10)
     for batch_start in range(0, indexed_n, 500):
         batch_end = min(batch_start + 500, indexed_n)
         points = [{"id": i + 1,
                    "vector": indexed[i * dim:(i + 1) * dim]}
                   for i in range(batch_start, batch_end)]
-        body = json.dumps({"points": points}).encode()
+        body = _json_dumps({"points": points})
         urllib.request.urlopen(
             urllib.request.Request(f"{base}/collections/{coll}/points", data=body,
                                   headers={"Content-Type": "application/json"}, method="PUT"),
             timeout=60)
+        if batch_end >= _next_report:
+            _log(f"[Qdrant]   {batch_end:,}/{indexed_n:,} ingested ({batch_end*100//indexed_n}%) elapsed={time.time()-t0:.1f}s")
+            _next_report += max(5000, indexed_n // 10)
 
     # Flush / wait index
+    _log(f"[Qdrant] flushing & waiting for index...")
     try:
         urllib.request.urlopen(f"{base}/collections/{coll}/flush", timeout=30)
     except Exception:
         pass
     build_ms = (time.time() - t0) * 1000
+    _log(f"[Qdrant] build done in {build_ms/1000:.1f}s")
 
     # Build search params - for quantized indexes, force using quantized vectors
     search_params = {}
@@ -1136,7 +1200,7 @@ def benchmark_qdrant(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
     t0 = time.time()
     r = urllib.request.urlopen(
         urllib.request.Request(f"{base}/collections/{coll}/points/search/batch",
-                             data=json.dumps(batch_payload).encode(),
+                             data=_json_dumps(batch_payload),
                              headers={"Content-Type": "application/json"}, method="POST"),
         timeout=120)
     batch_data = json.loads(r.read())
@@ -1153,11 +1217,11 @@ def benchmark_qdrant(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
     # Serial search
     latencies = []
     for q in range(query_n):
-        body = json.dumps({
+        body = _json_dumps({
             "vector": queries[q * dim:(q + 1) * dim],
             "top": topk,
             "params": search_params,
-        }).encode()
+        })
         t = time.time()
         try:
             urllib.request.urlopen(
@@ -1284,7 +1348,7 @@ def gather_db_results(db, indexed_n, dim, queries, query_n, topk, idx_type=None)
             ]}
             r = urllib.request.urlopen(
                 urllib.request.Request(f"{base}/collections/{coll}/points/search/batch",
-                                     data=json.dumps(payload).encode(),
+                                     data=_json_dumps(payload),
                                      headers={"Content-Type": "application/json"}, method="POST"),
                 timeout=120)
             d = json.loads(r.read())
@@ -1361,6 +1425,8 @@ def gather_db_results(db, indexed_n, dim, queries, query_n, topk, idx_type=None)
 
 
 def benchmark_milvus(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
+    _log(f"[Milvus] starting {idx_type} | indexed={indexed_n:,} dim={dim} queries={query_n} topk={topk}")
+    _t_start = time.time()
     from pymilvus import MilvusClient
     from pymilvus.milvus_client.index import IndexParams
 
@@ -1401,14 +1467,21 @@ def benchmark_milvus(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
     client.flush(coll)
 
     # Insert
+    _log(f"[Milvus] ingesting {indexed_n:,} vectors...")
     t0 = time.time()
+    _next_report = max(5000, indexed_n // 10)
     for batch_start in range(0, indexed_n, 500):
         batch_end = min(batch_start + 500, indexed_n)
         rows = [{"id": i, "vector": indexed[i * dim:(i + 1) * dim]}
                 for i in range(batch_start, batch_end)]
         client.insert(coll, rows)
+        if batch_end >= _next_report:
+            _log(f"[Milvus]   {batch_end:,}/{indexed_n:,} ingested ({batch_end*100//indexed_n}%) elapsed={time.time()-t0:.1f}s")
+            _next_report += max(5000, indexed_n // 10)
+    _log(f"[Milvus] flushing...")
     client.flush(coll)
     build_ms = (time.time() - t0) * 1000
+    _log(f"[Milvus] build done in {build_ms/1000:.1f}s")
 
     # Search params: HNSW uses ef, IVF uses nprobe
     if idx_type == "hnsw":
@@ -1473,6 +1546,8 @@ def benchmark_milvus(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
 # ─── LanceDB ───────────────────────────────────────────────────────────────────
 
 def benchmark_lancedb(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
+    _log(f"[LanceDB] starting {idx_type} | indexed={indexed_n:,} dim={dim} queries={query_n} topk={topk}")
+    _t_start = time.time()
     import lancedb, pyarrow as pa
 
     db = lancedb.connect(str(BASE / "lancedb_data"))
@@ -1491,7 +1566,9 @@ def benchmark_lancedb(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
         ("vector", pa.list_(pa.float32(), dim)),
     ])
 
+    _log(f"[LanceDB] ingesting {indexed_n:,} vectors...")
     t0 = time.time()
+    _next_report = max(5000, indexed_n // 10)
     for bs in range(0, indexed_n, 500):
         be = min(bs + 500, indexed_n)
         tbl = pa.table({"id": ids[bs:be], "vector": vectors[bs:be]}, schema=schema)
@@ -1499,6 +1576,10 @@ def benchmark_lancedb(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
             db.create_table(table, data=tbl)
         else:
             db.open_table(table).add(tbl)
+        if be >= _next_report:
+            _log(f"[LanceDB]   {be:,}/{indexed_n:,} ingested ({be*100//indexed_n}%) elapsed={time.time()-t0:.1f}s")
+            _next_report += max(5000, indexed_n // 10)
+    _log(f"[LanceDB] ingest done in {time.time()-t0:.1f}s, building index...")
 
     tbl_ref = db.open_table(table)
 
@@ -1597,6 +1678,8 @@ def benchmark_lancedb(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
 # ─── ChromaDB ─────────────────────────────────────────────────────────────────
 
 def benchmark_chromadb(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
+    _log(f"[ChromaDB] starting {idx_type} | indexed={indexed_n:,} dim={dim} queries={query_n} topk={topk}")
+    _t_start = time.time()
     import chromadb
     import json
 
@@ -1617,12 +1700,18 @@ def benchmark_chromadb(indexed, indexed_n, dim, queries, query_n, topk, idx_type
         metadata={"hnsw:space": "cosine"}
     )
 
+    _log(f"[ChromaDB] ingesting {indexed_n:,} vectors...")
     t0 = time.time()
+    _next_report = max(5000, indexed_n // 10)
     for bs in range(0, indexed_n, 500):
         be = min(bs + 500, indexed_n)
         coll.add(ids=ids[bs:be], embeddings=vectors[bs:be])
+        if be >= _next_report:
+            _log(f"[ChromaDB]   {be:,}/{indexed_n:,} ingested ({be*100//indexed_n}%) elapsed={time.time()-t0:.1f}s")
+            _next_report += max(5000, indexed_n // 10)
 
     build_ms = (time.time() - t0) * 1000
+    _log(f"[ChromaDB] build done in {build_ms/1000:.1f}s")
 
     # Batch search (single call with all queries)
     qvecs = [[float(queries[q * dim + d]) for d in range(dim)] for q in range(query_n)]
@@ -2019,7 +2108,7 @@ def _gather_got_ids(db, indexed_n, dim, queries, query_n, topk, idx_type=None):
             }
             r = urllib.request.urlopen(
                 urllib.request.Request(f"{base}/collections/{coll}/points/search/batch",
-                                      data=json.dumps(batch_payload).encode(),
+                                      data=_json_dumps(batch_payload),
                                       headers={"Content-Type": "application/json"}, method="POST"),
                 timeout=120)
             d = json.loads(r.read())
@@ -2106,6 +2195,9 @@ def main():
                    help="Compute QPS at different recall levels (0.5-1.0)")
     args = ap.parse_args()
 
+    _log(f"Starting benchmark: dataset={args.dataset} index={args.index} db={args.db} "
+         f"queries={args.queries} topk={args.topk}")
+
     # Load data
     if args.dataset == "nfcorpus":
         base = DATA / "nfcorpus"
@@ -2121,12 +2213,14 @@ def main():
     indexed = indexed[:n_idx * dim]
     queries = queries[:n_q * dim]
 
-    print(f"\n=== Dataset: {args.dataset} | Indexed: {n_idx} | Queries: {n_q} | dim={dim} | topk={args.topk} ===")
+    _log(f"Data loaded: {n_idx:,} indexed vectors, {n_q} queries, dim={dim}, topk={args.topk}")
 
     out_dir = OUT / f"{args.dataset}_n{n_idx}_q{n_q}_k{args.topk}"
     out_dir.mkdir(exist_ok=True)
 
     indices = ["ivf_flat", "ivf_pq", "ivf_sq8", "hnsw"] if args.index == "all" else [args.index]
+    total_combos = len(indices) * sum(1 for d in ["qdrant","milvus","lancedb","chromadb","plasmod"] if args.db in ("all", d))
+    combo_done = 0
     all_results = []
     db_stores = {}   # db_name -> list of (idx_label, indexed, queries, query_n, topk)
     # LanceDB VectorIndexType: IVF_FLAT, IVF_SQ, IVF_PQ, IVF_HNSW_SQ, IVF_HNSW_PQ, IVF_RQ
@@ -2134,68 +2228,83 @@ def main():
     lance_skip = set()  # nothing skipped — all types map to a LanceDB equivalent
     for idx in indices:
         idx_label = idx.upper().replace("_", "-")
-        print(f"\n{'='*60}\n  Index: {idx_label}\n{'='*60}")
+        _log(f"\n{'='*60}\n  Index: {idx_label}\n{'='*60}")
 
         # Qdrant
         if args.db in ("all", "qdrant"):
-            print("  [Qdrant]")
+            combo_done += 1
+            _log(f"  [{combo_done}/{total_combos}] [Qdrant] {idx_label} starting...")
             try:
+                t_start = time.time()
                 r = benchmark_qdrant(indexed, n_idx, dim, queries, n_q, args.topk, idx)
                 all_results.append(r)
                 r.save(out_dir)
                 db_stores.setdefault("Qdrant", []).append((idx_label, indexed, queries, n_q, args.topk))
+                _log(f"  [Qdrant] {idx_label} done in {time.time()-t_start:.1f}s")
             except Exception as e:
-                print(f"  Qdrant FAILED: {e}")
+                _log(f"  Qdrant FAILED: {e}")
 
         # Milvus
         if args.db in ("all", "milvus"):
-            print("  [Milvus]")
+            combo_done += 1
+            _log(f"  [{combo_done}/{total_combos}] [Milvus] {idx_label} starting...")
             try:
+                t_start = time.time()
                 r = benchmark_milvus(indexed, n_idx, dim, queries, n_q, args.topk, idx)
                 all_results.append(r)
                 r.save(out_dir)
                 db_stores.setdefault("Milvus", []).append((idx_label, indexed, queries, n_q, args.topk))
+                _log(f"  [Milvus] {idx_label} done in {time.time()-t_start:.1f}s")
             except Exception as e:
-                print(f"  Milvus FAILED: {e}")
+                _log(f"  Milvus FAILED: {e}")
 
         # LanceDB (skips nothing — all types map to a LanceDB equivalent)
         if args.db in ("all", "lancedb"):
             if idx not in lance_skip:
-                print("  [LanceDB]")
+                combo_done += 1
+                _log(f"  [{combo_done}/{total_combos}] [LanceDB] {idx_label} starting...")
                 try:
+                    t_start = time.time()
                     r = benchmark_lancedb(indexed, n_idx, dim, queries, n_q, args.topk, idx)
                     all_results.append(r)
                     r.save(out_dir)
                     db_stores.setdefault("LanceDB", []).append((idx_label, indexed, queries, n_q, args.topk))
+                    _log(f"  [LanceDB] {idx_label} done in {time.time()-t_start:.1f}s")
                 except Exception as e:
-                    print(f"  LanceDB FAILED: {e}")
+                    _log(f"  LanceDB FAILED: {e}")
             else:
-                print(f"  [LanceDB] SKIPPED (no {idx.upper()} support)")
+                _log(f"  [LanceDB] SKIPPED (no {idx.upper()} support)")
 
         # ChromaDB
         if args.db in ("all", "chromadb"):
-            print("  [ChromaDB]")
+            combo_done += 1
+            _log(f"  [{combo_done}/{total_combos}] [ChromaDB] {idx_label} starting...")
             try:
+                t_start = time.time()
                 r = benchmark_chromadb(indexed, n_idx, dim, queries, n_q, args.topk, idx)
                 all_results.append(r)
                 r.save(out_dir)
                 db_stores.setdefault("ChromaDB", []).append((idx_label, indexed, queries, n_q, args.topk))
+                _log(f"  [ChromaDB] {idx_label} done in {time.time()-t_start:.1f}s")
             except Exception as e:
-                print(f"  ChromaDB FAILED: {e}")
+                _log(f"  ChromaDB FAILED: {e}")
 
         # Plasmod
         if args.db in ("all", "plasmod"):
-            print("  [Plasmod]")
+            combo_done += 1
+            _log(f"  [{combo_done}/{total_combos}] [Plasmod] {idx_label} starting...")
             try:
+                t_start = time.time()
                 r = benchmark_plasmod(indexed, n_idx, dim, queries, n_q, args.topk, idx)
                 if r:
                     all_results.append(r)
                     r.save(out_dir)
+                _log(f"  [Plasmod] {idx_label} done in {time.time()-t_start:.1f}s")
             except Exception as e:
-                print(f"  Plasmod FAILED: {e}")
+                _log(f"  Plasmod FAILED: {e}")
 
     # Compute recall while collections are still alive
-    print("\n  Computing Recall@K...")
+    _log("Computing Recall@K...")
     for db_name, runs in db_stores.items():
         for idx_label, idxd, q, nq, tk in runs:
             # Extract idx_type from idx_label (e.g., "IVF-FLAT" -> "ivf_flat")
@@ -2204,7 +2313,7 @@ def main():
             for r in all_results:
                 if r.db == db_name and r.index_type == idx_label:
                     if r.recall > 0.0:
-                        print(f"    {db_name} {idx_label}: Recall@{tk}={r.recall:.4f} (computed in benchmark)")
+                        _log(f"  {db_name} {idx_label}: Recall@{tk}={r.recall:.4f} (computed in benchmark)")
                     else:
                         # Fallback: try to gather from collection
                         got_ids = gather_db_results(db_name, n_idx, dim, q, nq, tk, idx_type)
@@ -2212,7 +2321,7 @@ def main():
                             gt = brute_force_search(idxd, n_idx, dim, q, nq, tk)
                             rec = recall_at_k(got_ids, gt, tk)
                             r.recall = rec
-                            print(f"    {db_name} {idx_label}: Recall@{tk}={rec:.4f}")
+                            _log(f"  {db_name} {idx_label}: Recall@{tk}={rec:.4f}")
                     break
 
     # Re-save all results now that recall has been computed
@@ -2277,7 +2386,7 @@ def main():
             print(f"\n  Sweep results saved to {out_dir}/sweep_recall_qps.json")
 
     # Cleanup collections
-    print("\n  Cleaning up...")
+    _log("Cleaning up collections...")
     cleanup_all()
 
     # Summary table
@@ -2290,7 +2399,7 @@ def main():
             "n_queries": n_q, "topk": args.topk,
             "results": [asdict(r) for r in all_results],
         }, f, indent=2)
-    print(f"\nResults: {out_dir}/")
+    _log(f"Done. Results: {out_dir}/")
 
 
 if __name__ == "__main__":
