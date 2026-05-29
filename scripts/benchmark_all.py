@@ -357,19 +357,13 @@ def _sweep_rebuild_plasmod(indexed, indexed_n, dim, idx_type):
 
     try:
         http = _HTTPClient(server_url, timeout=120)
-        # Ingest in chunks
-        ingest_batch = min(500_000, indexed_n)
-        for start in range(0, indexed_n, ingest_batch):
-            end = min(start + ingest_batch, indexed_n)
-            batch_n = end - start
-            ok, _ = http.ingest(seg_id, indexed[start * dim : end * dim], batch_n, dim,
-                                index_type=ptype, nlist=nlist, nprobe=nprobe,
-                                m=m, nbits=nbits, sq_type=sq_type)
-            if not ok:
-                raise RuntimeError(f"ingest failed at batch {start}-{end}")
+        # Single ingest call — BuildSegment is a full rebuild, not append.
+        ok, _ = http.ingest(seg_id, indexed[:indexed_n * dim], indexed_n, dim,
+                            index_type=ptype, nlist=nlist, nprobe=nprobe,
+                            m=m, nbits=nbits, sq_type=sq_type)
+        if not ok:
+            raise RuntimeError("ingest failed")
 
-        # Register warm
-        http.register_warm(seg_id, indexed_n)
         return True
     except Exception as e:
         print(f"      Plasmod rebuild error: {e}")
@@ -690,24 +684,17 @@ def _sweep_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type, pa
     else:
         return []
 
-    # Rebuild with different params
+    # Rebuild with different params — single ingest (BuildSegment is full rebuild, not append)
     http = _HTTPClient(server_url, timeout=120)
     try:
-        for start in range(0, indexed_n, min(500_000, indexed_n)):
-            end = min(start + 500_000, indexed_n)
-            batch_n = end - start
-            vec_slice = indexed[start * dim : end * dim]
-            if not vec_slice:
-                print(f"      Plasmod sweep error: empty vector slice at start={start}, end={end}")
-                return []
-            ok, _ = http.ingest(seg_id, list(vec_slice), batch_n, dim,
-                                index_type=ptype, nlist=nlist, nprobe=nprobe,
-                                m=m, nbits=nbits, sq_type=sq_type,
-                                ef_construction=ef_construction)
-            if not ok:
-                print(f"      Plasmod sweep error: ingest failed")
-                return []
-        http.register_warm(seg_id, indexed_n)
+        vec_slice = indexed[:indexed_n * dim]
+        ok, _ = http.ingest(seg_id, vec_slice, indexed_n, dim,
+                            index_type=ptype, nlist=nlist, nprobe=nprobe,
+                            m=m, nbits=nbits, sq_type=sq_type,
+                            ef_construction=ef_construction)
+        if not ok:
+            print(f"      Plasmod sweep error: ingest failed")
+            return []
     except Exception as e:
         print(f"      Plasmod sweep error: {e}")
         return []
@@ -1912,21 +1899,24 @@ class _HTTPClient:
         return code == 200, 0.0
 
     def query_serial(self, seg_id: str, query: list[float], dim: int,
-                     topk: int) -> tuple[bool, int, int]:
-        """Send single query (nq=1). Returns (ok, status_code, latency_ms)."""
-        payload = _build_serial_query_payload(seg_id, query, dim, topk)
+                     topk: int) -> tuple[bool, int, int, list[int]]:
+        """Send single query via batch_raw (nq=1). Returns (ok, status_code, latency_ms, ids).
+        Uses query_warm_batch_raw so no register_warm is needed."""
+        payload = _build_batch_query_payload(seg_id, query, 1, dim, topk)
         t0 = time.time()
-        code, body = self._post_binary("/v1/internal/rpc/query_warm", payload)
+        code, body = self._post_binary("/v1/internal/rpc/query_warm_batch_raw", payload)
         lat_ms = (time.time() - t0) * 1000
-        ok = code == 200
-        return ok, code, lat_ms
+        if code == 200:
+            ids, _ = _parse_batch_response(body, 1, topk)
+            return True, code, lat_ms, ids
+        return False, code, lat_ms, []
 
     def query_batch(self, seg_id: str, queries: list[float], nq: int,
                     dim: int, topk: int) -> tuple[bool, int, float, list[int], list[float]]:
-        """Send batch query. Returns (ok, status_code, latency_ms, ids, dists)."""
+        """Send batch query via batch_raw. Returns (ok, status_code, latency_ms, ids, dists)."""
         payload = _build_batch_query_payload(seg_id, queries, nq, dim, topk)
         t0 = time.time()
-        code, body = self._post_binary("/v1/internal/rpc/query_warm_batch", payload)
+        code, body = self._post_binary("/v1/internal/rpc/query_warm_batch_raw", payload)
         lat_ms = (time.time() - t0) * 1000
         if code == 200:
             ids, dists = _parse_batch_response(body, nq, topk)
@@ -1937,18 +1927,6 @@ class _HTTPClient:
         data = json.dumps({"segment_id": seg_id}).encode()
         req = urllib.request.Request(
             f"{self.base}/v1/internal/rpc/unload_segment",
-            data=data, headers={"Content-Type": "application/json"}, method="POST",
-        )
-        try:
-            urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass
-
-    def register_warm(self, seg_id: str, n: int) -> None:
-        obj_ids = [f"bench-p{i:06d}" for i in range(n)]
-        data = json.dumps({"segment_id": seg_id, "object_ids": obj_ids}).encode()
-        req = urllib.request.Request(
-            f"{self.base}/v1/internal/rpc/register_warm",
             data=data, headers={"Content-Type": "application/json"}, method="POST",
         )
         try:
@@ -2001,46 +1979,39 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
     http.unload(seg_id)
     time.sleep(1)
 
-    # ── 2. Ingest indexed vectors in chunks ─────────────────────────────────────
+    # ── 2. Ingest all vectors in a single call ──────────────────────────────────
+    # BuildSegment is a full rebuild, not append — splitting into batches would
+    # cause the second batch to overwrite the first, leaving only half the data.
     print(f"      [Plasmod HTTP] ingesting {indexed_n} vectors (dim={dim})")
     t_build = time.time()
-    server_build_ms = 0.0
-    ingest_batch = min(500_000, indexed_n)
-    for start in range(0, indexed_n, ingest_batch):
-        t_batch = time.time()
-        end = min(start + ingest_batch, indexed_n)
-        batch_n = end - start
-        ok, elapsed = http.ingest(seg_id, indexed[start * dim : end * dim], batch_n, dim,
-                          index_type=ptype,
-                          nlist=nlist, nprobe=nprobe, m=m, nbits=nbits, sq_type=sq_type)
-        server_build_ms += elapsed
-        if not ok:
-            raise RuntimeError(f"ingest failed at batch {start}-{end}")
-        print(f"      [Plasmod HTTP]   ingested {end}/{indexed_n}")
+    ok, server_build_ms = http.ingest(seg_id, indexed[:indexed_n * dim], indexed_n, dim,
+                                      index_type=ptype,
+                                      nlist=nlist, nprobe=nprobe, m=m, nbits=nbits, sq_type=sq_type)
+    if not ok:
+        raise RuntimeError("ingest failed")
+    print(f"      [Plasmod HTTP]   ingested {indexed_n}/{indexed_n}")
 
-    # Register object IDs so the warm path works
-    http.register_warm(seg_id, indexed_n)
     client_build_ms = (time.time() - t_build) * 1000
-    build_ms = client_build_ms  # Keep as build_ms for Result
-    print(f"      [Plasmod HTTP] build={build_ms:.1f}ms (server={server_build_ms:.1f}ms, overhead={client_build_ms - server_build_ms:.1f}ms)")
+    build_ms = server_build_ms
+    print(f"      [Plasmod HTTP] build={build_ms:.1f}ms (client_wall={client_build_ms:.1f}ms)")
 
-    # Warm-up: one serial request to prime the segment
+    # Warm-up: one request to prime the segment (no register_warm needed)
     http.query_serial(seg_id, queries[:dim], dim, topk)
 
     # ── 3. True serial latency: nq individual HTTP requests (nq=1 each) ─────────
     print(f"      [Plasmod HTTP] serial search {query_n} queries...")
     serial_latencies = []
     errors = 0
-    all_ids = []
+    serial_ids = []  # collect IDs from serial queries for recall
     for i in range(query_n):
-        query = [queries[i * dim + j] for j in range(dim)]
-        ok, code, lat = http.query_serial(seg_id, query, dim, topk)
+        q_vec = queries[i * dim : (i + 1) * dim]
+        ok, code, lat, ids = http.query_serial(seg_id, q_vec, dim, topk)
         serial_latencies.append(lat)
-        if ok and len(serial_latencies) == 1:
-            # parse ids from response for recall
-            pass  # single query response has string ids, skip for now
-        if not ok:
+        if ok:
+            serial_ids.extend(ids)
+        else:
             errors += 1
+            serial_ids.extend([-1] * topk)
     serial_ms = sum(serial_latencies)
     serial_qps = query_n / (serial_ms / 1000) if serial_ms > 0 else 0
     sl = sorted(serial_latencies)
@@ -2048,7 +2019,7 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
     p95 = sl[int(len(sl) * 0.95)]
     p99 = sl[int(len(sl) * 0.99)]
     mean = serial_ms / query_n if query_n else 0
-    print(f"      [Plasmod HTTP] serial done: QPS={serial_qps:.1f} "
+    print(f"      [Plasmod HTTP] serial done: QPS={serial_qps:.1f} errors={errors} "
           f"mean={mean:.3f}ms p50={p50:.3f}ms p95={p95:.3f}ms p99={p99:.3f}ms")
 
     # ── 4. Batch latency: one HTTP request with all queries ─────────────────────
@@ -2062,9 +2033,10 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
     else:
         batch_ms = 0
         batch_qps = 0
-        print(f"      [Plasmod HTTP] batch FAILED")
+        all_ids = serial_ids  # fall back to serial IDs for recall
+        print(f"      [Plasmod HTTP] batch FAILED, using serial IDs for recall")
 
-    # ── 5. Recall (batch IDs are already collected) ─────────────────────────────
+    # ── 5. Recall ──────────────────────────────────────────────────────────────
     recall = _plasmod_recall(all_ids, indexed, indexed_n, dim, queries, query_n, topk)
 
     # ── 6. Memory of plasmod process (RSS + mmap'd file sizes) ─────────────────
@@ -2073,10 +2045,9 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
         out = subprocess.check_output(
             ["pgrep", "-f", "bin/plasmod"], text=True, timeout=5)
         pid = int(out.strip().split()[0])
-        # Include mmap'd files in memory calculation for fair comparison
-        # (Plasmod uses mmap for vector storage, which doesn't count in RSS)
-        andb_data_dir = BASE.parent / "Plasmod" / "cpp" / "build" / ".andb_data"
-        mem_val = mem_mb_with_mmap(pid, andb_data_dir)
+        # RSS of the plasmod process. CGO vector data lives in C heap (counted in RSS),
+        # not in mmap'd files — .andb_data only holds Badger WAL/value-logs, not vectors.
+        mem_val = mem_mb(pid)
     except Exception:
         pass
 
