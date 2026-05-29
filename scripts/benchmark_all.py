@@ -1825,8 +1825,8 @@ def _build_batch_query_payload(seg_id: str, queries: list[float], nq: int,
     buf = _MAGIC_QUERY_B + struct.pack("B", _WIRE_VERSION)
     buf += _pack_u16(len(seg_id)) + seg_id.encode()
     buf += _pack_u32(topk) + _pack_u32(nq) + _pack_u32(dim)
-    # Pack all queries in one struct.pack call (much faster than nested loops)
-    buf += struct.pack(f"<{nq * dim}f", *queries[:nq * dim])
+    arr = np.asarray(queries[:nq * dim], dtype=np.float32)
+    buf += arr.tobytes()
     return buf
 
 def _parse_batch_response(body: bytes, nq: int, topk: int) -> tuple[list[int], list[float]]:
@@ -1916,10 +1916,11 @@ class _HTTPClient:
 
     def query_batch(self, seg_id: str, queries: list[float], nq: int,
                     dim: int, topk: int) -> tuple[bool, int, float, list[int], list[float]]:
-        """Send batch query via batch_raw. Returns (ok, status_code, latency_ms, ids, dists)."""
+        """Send batch query via query_warm_batch (L2NormSort plugin + chunked).
+        Returns (ok, status_code, latency_ms, ids, dists)."""
         payload = _build_batch_query_payload(seg_id, queries, nq, dim, topk)
         t0 = time.time()
-        code, body = self._post_binary("/v1/internal/rpc/query_warm_batch_raw", payload)
+        code, body = self._post_binary("/v1/internal/rpc/query_warm_batch", payload)
         lat_ms = (time.time() - t0) * 1000
         if code == 200:
             ids, dists = _parse_batch_response(body, nq, topk)
@@ -1948,7 +1949,9 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
     """
     seg_id = "bench.layer1"
     server_url = "http://127.0.0.1:8080"
-    http = _HTTPClient(server_url, timeout=60)
+    # HNSW build for 1M+ vectors can take many minutes; use a large timeout.
+    ingest_timeout = 3600 if idx_type == "hnsw" else 120
+    http = _HTTPClient(server_url, timeout=ingest_timeout)
 
     # Map Python idx_type to Plasmod index type + IVF params
     # For IVF-PQ: m must divide dim. dim=96: valid m={8,12,16,24,32,48}; dim=384: valid m={8,12,16,24,32,48,64,96,128}
@@ -1964,8 +1967,11 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
         m = _valid_m(dim)
         nlist = min(indexed_n // 4, 256) if indexed_n >= 256 else min(indexed_n // 2, 64)
         nlist = max(nlist, 4)
+        # nprobe should be a small fraction of nlist, not equal to it.
+        # nprobe=nlist means full scan — defeats the purpose of IVF.
+        nprobe = max(nlist // 16, 4)
         INDEX_TYPE_MAP = {
-            "ivf_pq": ("IVF_PQ", nlist, nlist, m, 8, ""),
+            "ivf_pq": ("IVF_PQ", nlist, nprobe, m, 8, ""),
         }
     else:
         INDEX_TYPE_MAP = {
@@ -1975,7 +1981,7 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
             "flat":     ("IVF_FLAT", 0, 0, 0, 0, ""),
         }
     ptype, nlist, nprobe, m, nbits, sq_type = INDEX_TYPE_MAP.get(idx_type, ("HNSW", 0, 0, 0, 0, ""))
-    print(f"      [Plasmod HTTP] index_type={ptype} idx_type={idx_type}")
+    print(f"      [Plasmod HTTP] index_type={ptype} idx_type={idx_type} nlist={nlist} nprobe={nprobe}")
 
     # ── 1. Unload any stale segment ────────────────────────────────────────────
     print(f"      [Plasmod HTTP] unloading segment={seg_id}")
