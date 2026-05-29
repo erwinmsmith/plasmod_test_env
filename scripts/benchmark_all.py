@@ -1777,7 +1777,7 @@ def _unpack_u64(b: bytes) -> int: return struct.unpack("<Q", b)[0]
 
 _WIRE_VERSION   = 3  # wire v3: index_type + IVF params
 
-def _build_ingest_payload(seg_id: str, vectors: list[float], n: int, dim: int,
+def _build_ingest_payload(seg_id: str, vectors, n: int, dim: int,
                           index_type: str = "",
                           nlist: int = 0, nprobe: int = 0,
                           m: int = 0, nbits: int = 0,
@@ -1788,12 +1788,15 @@ def _build_ingest_payload(seg_id: str, vectors: list[float], n: int, dim: int,
     buf = _MAGIC_INGEST + struct.pack("B", _WIRE_VERSION)
     buf += _pack_u16(len(seg_id)) + seg_id.encode()
     buf += _pack_u32(n) + _pack_u32(dim)
-    # Pack all vectors in one struct.pack call (much faster than nested loops)
-    buf += struct.pack(f"<{n * dim}f", *vectors[:n * dim])
-    # Object IDs
+    # Use numpy tobytes() — orders of magnitude faster than struct.pack(*array) for large n
+    arr = np.asarray(vectors[:n * dim], dtype=np.float32)
+    buf += arr.tobytes()
+    # Object IDs — build as one contiguous bytes block to avoid 1M string allocs
+    id_buf = bytearray()
     for i in range(n):
         oid = f"bench-p{i:06d}"
-        buf += _pack_u16(len(oid)) + oid.encode()
+        id_buf += struct.pack("<H", len(oid)) + oid.encode()
+    buf += bytes(id_buf)
     # v3 fields: index_type + IVF params
     idx_bytes = index_type.encode()
     buf += _pack_u32(len(idx_bytes)) + idx_bytes
