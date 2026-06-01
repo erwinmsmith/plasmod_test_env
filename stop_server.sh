@@ -13,7 +13,12 @@ if [ -f "$PID_FILE" ]; then
         echo "Server not running (stale PID file)"
     fi
     rm -f "$PID_FILE"
-else
-    echo "No PID file found, attempting to kill by port..."
-    pkill -f "plasmod\|andb" 2>/dev/null || true
+fi
+
+PORT_PID=$(lsof -nP -tiTCP:8080 -sTCP:LISTEN 2>/dev/null | head -1 || true)
+if [ -n "$PORT_PID" ]; then
+    kill "$PORT_PID" 2>/dev/null || true
+    echo "Server listener on 8080 (PID: $PORT_PID) stopped"
+elif [ ! -f "$PID_FILE" ]; then
+    echo "No Plasmod listener found on 8080"
 fi
