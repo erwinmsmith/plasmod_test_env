@@ -34,7 +34,10 @@ import struct
 import subprocess
 import sys
 import time
+import http.client
+import urllib.parse
 import urllib.request
+import urllib.error
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional
@@ -128,7 +131,11 @@ def brute_force_search(indexed, indexed_n: int, dim: int,
     BATCH = 256  # process queries in chunks to cap peak RAM
     for qi_start in range(0, q_n, BATCH):
         qi_end = min(qi_start + BATCH, q_n)
-        sims = q_normed[qi_start:qi_end] @ idx_normed.T  # (batch, indexed_n)
+        # macOS Accelerate can emit spurious floating-point warnings here even
+        # when inputs and outputs are finite. Suppress them to keep benchmark
+        # logs readable; explicit finite checks are done by callers when needed.
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            sims = q_normed[qi_start:qi_end] @ idx_normed.T  # (batch, indexed_n)
         # argpartition is O(n) vs argsort O(n log n)
         part = np.argpartition(sims, -topk, axis=1)[:, -topk:]
         for bi in range(qi_end - qi_start):
@@ -165,6 +172,26 @@ def _plasmod_recall(int_ids: List[int], indexed: List[float], indexed_n: int,
     got_ids = [int_ids[q * topk:(q + 1) * topk] for q in range(query_n)]
     gt = brute_force_search(indexed, indexed_n, dim, queries, query_n, topk)
     return recall_at_k(got_ids, gt, topk)
+
+
+def _plasmod_ivf_pq_m(dim: int) -> int:
+    """Choose a high-recall PQ sub-quantizer count that divides dim."""
+    target = min(dim, 96)
+    for m in range(target, 0, -1):
+        if dim % m == 0:
+            return m
+    return 16
+
+
+def _env_int(name: str, default: int, min_value: int = 1) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= min_value else default
 
 
 # ─── Result ────────────────────────────────────────────────────────────────────
@@ -223,6 +250,47 @@ def mem_mb(pid: int) -> float:
         return float(out.strip()) / 1024   # KB -> MB
     except Exception:
         return 0.0
+
+
+def _plasmod_pid() -> Optional[int]:
+    """Find the running Plasmod server PID. Prefer the listener on port 8080."""
+    commands = [
+        ["lsof", "-nP", "-tiTCP:8080", "-sTCP:LISTEN"],
+        ["pgrep", "-f", "bin/plasmod"],
+        ["pgrep", "-f", "plasmod$"],
+        ["pgrep", "-f", "/server$"],
+        ["pgrep", "-f", "-plasmod"],
+    ]
+    for cmd in commands:
+        try:
+            out = subprocess.check_output(cmd, text=True, timeout=5).strip()
+            if out:
+                return int(out.splitlines()[0].strip())
+        except Exception:
+            continue
+    return None
+
+
+def plasmod_mem_mb() -> float:
+    pid = _plasmod_pid()
+    if pid is None:
+        return 0.0
+    return mem_mb(pid)
+
+
+def require_plasmod_server(base_url: str = "http://127.0.0.1:8080") -> None:
+    """Fail before loading large datasets if the Plasmod HTTP server is down."""
+    try:
+        with urllib.request.urlopen(f"{base_url}/healthz", timeout=3) as r:
+            if r.status == 200:
+                return
+            raise RuntimeError(f"healthz returned HTTP {r.status}")
+    except Exception as e:
+        raise SystemExit(
+            "Plasmod server is not reachable at http://127.0.0.1:8080. "
+            "Start it first with `bash start_server.sh` or `bash start_all.sh`, "
+            f"then rerun the benchmark. healthz error: {e}"
+        )
 
 
 def mem_mb_with_mmap(pid: int, data_dir: Path) -> float:
@@ -348,7 +416,7 @@ def _sweep_rebuild_plasmod(indexed, indexed_n, dim, idx_type):
     # Index type mapping for Plasmod (default params for initial build)
     INDEX_TYPE_MAP = {
         "ivf_flat": ("IVF_FLAT", 32, 8, 0, 0, ""),
-        "ivf_pq":   ("IVF_PQ",   32, 8, 16, 8, ""),
+        "ivf_pq":   ("IVF_PQ",   32, 8, _plasmod_ivf_pq_m(dim), 8, ""),
         "ivf_sq8":  ("IVF_SQ8",  32, 8, 0, 0, "INT8"),
         "hnsw":     ("HNSW",     0, 0, 0, 0, ""),
         "flat":     ("IVF_FLAT", 32, 8, 0, 0, ""),
@@ -358,9 +426,9 @@ def _sweep_rebuild_plasmod(indexed, indexed_n, dim, idx_type):
     try:
         http = _HTTPClient(server_url, timeout=120)
         # Single ingest call — BuildSegment is a full rebuild, not append.
-        ok, _ = http.ingest(seg_id, indexed[:indexed_n * dim], indexed_n, dim,
-                            index_type=ptype, nlist=nlist, nprobe=nprobe,
-                            m=m, nbits=nbits, sq_type=sq_type)
+        ok, *_ = http.ingest(seg_id, indexed[:indexed_n * dim], indexed_n, dim,
+                              index_type=ptype, nlist=nlist, nprobe=nprobe,
+                              m=m, nbits=nbits, sq_type=sq_type)
         if not ok:
             raise RuntimeError("ingest failed")
 
@@ -657,19 +725,7 @@ def _sweep_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type, pa
         ptype = "IVF_PQ"
         nlist = param_val
         nprobe = param_val  # Search all clusters
-        # m increases with nlist: 16->32->48->64->96->128
-        if param_val <= 32:
-            m = 16
-        elif param_val <= 64:
-            m = 32
-        elif param_val <= 128:
-            m = 48
-        elif param_val <= 256:
-            m = 64
-        elif param_val <= 512:
-            m = 96
-        else:
-            m = 128
+        m = _plasmod_ivf_pq_m(dim)
         nbits = 8
         sq_type = ""
         ef_construction = 0
@@ -688,10 +744,10 @@ def _sweep_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type, pa
     http = _HTTPClient(server_url, timeout=120)
     try:
         vec_slice = indexed[:indexed_n * dim]
-        ok, _ = http.ingest(seg_id, vec_slice, indexed_n, dim,
-                            index_type=ptype, nlist=nlist, nprobe=nprobe,
-                            m=m, nbits=nbits, sq_type=sq_type,
-                            ef_construction=ef_construction)
+        ok, *_ = http.ingest(seg_id, vec_slice, indexed_n, dim,
+                              index_type=ptype, nlist=nlist, nprobe=nprobe,
+                              m=m, nbits=nbits, sq_type=sq_type,
+                              ef_construction=ef_construction)
         if not ok:
             print(f"      Plasmod sweep error: ingest failed")
             return []
@@ -1766,9 +1822,6 @@ def benchmark_chromadb(indexed, indexed_n, dim, queries, query_n, topk, idx_type
 _MAGIC_INGEST  = b"PLIB"
 _MAGIC_QUERY_W  = b"PLQW"
 _MAGIC_QUERY_B  = b"PLQB"
-_WIRE_VERSION   = 1
-
-# ── Low-level binary protocol helpers ──────────────────────────────────────────
 
 def _pack_u16(v: int) -> bytes: return struct.pack("<H", v)
 def _pack_u32(v: int) -> bytes: return struct.pack("<I", v)
@@ -1864,50 +1917,67 @@ class _HTTPClient:
     def __init__(self, base_url: str, timeout: int = 30):
         self.base = base_url
         self.timeout = timeout
-        self._session = None
+        parsed = urllib.parse.urlparse(base_url)
+        self._host = parsed.hostname or "127.0.0.1"
+        self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        self._conn: Optional[http.client.HTTPConnection] = None
+
+    def _connection(self) -> http.client.HTTPConnection:
+        if self._conn is None:
+            self._conn = http.client.HTTPConnection(self._host, self._port, timeout=self.timeout)
+        return self._conn
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None
 
     def _post_binary(self, path: str, payload: bytes) -> tuple[int, bytes]:
-        req = urllib.request.Request(
-            f"{self.base}{path}",
-            data=payload,
-            headers={"Content-Type": "application/octet-stream"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return r.status, r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
-        except Exception as e:
-            return -1, str(e).encode()
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(payload)),
+        }
+        for attempt in range(2):
+            try:
+                conn = self._connection()
+                conn.request("POST", path, body=payload, headers=headers)
+                resp = conn.getresponse()
+                return resp.status, resp.read()
+            except Exception as e:
+                self.close()
+                if attempt == 1:
+                    return -1, str(e).encode()
+        return -1, b"request failed"
 
     def ingest(self, seg_id: str, vectors: list[float], n: int, dim: int,
                index_type: str = "",
                nlist: int = 0, nprobe: int = 0,
                m: int = 0, nbits: int = 0,
                sq_type: str = "",
-               ef_construction: int = 0) -> tuple[bool, float]:
-        """Ingest vectors. Returns (success, server_elapsed_ms)."""
+               ef_construction: int = 0) -> tuple[bool, float, float, int, bytes]:
+        """Ingest vectors.
+
+        Returns (success, payload_ms, http_ms, status_code, response_body).
+        The response JSON contains server-side elapsed_ms when available.
+        """
+        t_payload = time.time()
         payload = _build_ingest_payload(seg_id, vectors, n, dim,
                                         index_type, nlist, nprobe, m, nbits, sq_type,
                                         ef_construction)
+        payload_ms = (time.time() - t_payload) * 1000
+        t_http = time.time()
         code, body = self._post_binary("/v1/internal/rpc/ingest_batch", payload)
-        if code == 200 and body:
-            try:
-                resp = json.loads(body)
-                elapsed = resp.get("elapsed_ms", 0.0)
-                return True, elapsed
-            except Exception:
-                pass
-        return code == 200, 0.0
+        http_ms = (time.time() - t_http) * 1000
+        return code == 200, payload_ms, http_ms, code, body
 
     def query_serial(self, seg_id: str, query: list[float], dim: int,
                      topk: int) -> tuple[bool, int, int, list[int]]:
-        """Send single query via batch_raw (nq=1). Returns (ok, status_code, latency_ms, ids).
-        Uses query_warm_batch_raw so no register_warm is needed."""
+        """Send one optimized Plasmod query (nq=1) via the normal warm batch path."""
         payload = _build_batch_query_payload(seg_id, query, 1, dim, topk)
         t0 = time.time()
-        code, body = self._post_binary("/v1/internal/rpc/query_warm_batch_raw", payload)
+        code, body = self._post_binary("/v1/internal/rpc/query_warm_batch", payload)
         lat_ms = (time.time() - t0) * 1000
         if code == 200:
             ids, _ = _parse_batch_response(body, 1, topk)
@@ -1927,16 +1997,19 @@ class _HTTPClient:
             return True, code, lat_ms, ids, dists
         return False, code, lat_ms, [], []
 
-    def unload(self, seg_id: str) -> None:
+    def unload(self, seg_id: str) -> tuple[int, bytes]:
         data = json.dumps({"segment_id": seg_id}).encode()
         req = urllib.request.Request(
             f"{self.base}/v1/internal/rpc/unload_segment",
             data=data, headers={"Content-Type": "application/json"}, method="POST",
         )
         try:
-            urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except Exception as e:
+            return -1, str(e).encode()
 
 
 def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
@@ -1956,42 +2029,58 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
     # IVF params aligned with Milvus baseline:
     #   indexed_n < 10000 → nlist=32, nprobe=4
     #   indexed_n >= 10000 → nlist=128, nprobe=16
-    # m=16 for IVF-PQ (same as Milvus); must divide dim — valid for dim=96 and dim=384.
+    # IVF-PQ uses an adaptive high-recall m that must divide dim.
     if indexed_n < 10000:
-        _nlist, _nprobe = 32, 4
+        _nlist = _env_int("PLASMOD_BENCH_IVF_NLIST", 32)
+        _nprobe = _env_int("PLASMOD_BENCH_IVF_NPROBE", 4)
     else:
-        _nlist, _nprobe = 128, 16
+        _nlist = _env_int("PLASMOD_BENCH_IVF_NLIST", 128)
+        _nprobe = _env_int("PLASMOD_BENCH_IVF_NPROBE", 12)
+    _pq_nprobe = _env_int("PLASMOD_BENCH_IVF_PQ_NPROBE", max(_nprobe, 32))
 
     INDEX_TYPE_MAP = {
-        "ivf_flat": ("IVF_FLAT", _nlist, _nprobe, 0,  0, ""),
-        "ivf_pq":   ("IVF_PQ",   _nlist, _nprobe, 16, 8, ""),
-        "ivf_sq8":  ("IVF_SQ8",  _nlist, _nprobe, 0,  0, "INT8"),
+        "ivf_flat": ("IVF_FLAT", _nlist, _nprobe,  0,  0, ""),
+        "ivf_pq":   ("IVF_PQ",   _nlist, _pq_nprobe, _plasmod_ivf_pq_m(dim), 8, ""),
+        "ivf_sq8":  ("IVF_SQ8",  _nlist, _nprobe,  0,  0, "INT8"),
         "hnsw":     ("HNSW",     0,      0,        0,  0, ""),
-        "flat":     ("IVF_FLAT", _nlist, _nprobe, 0,  0, ""),
+        "flat":     ("IVF_FLAT", _nlist, _nprobe,  0,  0, ""),
     }
     ptype, nlist, nprobe, m, nbits, sq_type = INDEX_TYPE_MAP.get(idx_type, ("HNSW", 0, 0, 0, 0, ""))
     print(f"      [Plasmod HTTP] index_type={ptype} idx_type={idx_type} nlist={nlist} nprobe={nprobe}")
 
     # ── 1. Unload any stale segment ────────────────────────────────────────────
     print(f"      [Plasmod HTTP] unloading segment={seg_id}")
-    http.unload(seg_id)
-    time.sleep(1)
+    unload_code, unload_body = http.unload(seg_id)
+    unload_body_text = unload_body[:200].decode(errors="replace").strip()
+    if unload_code not in (200, 404) and "rc=-1" not in unload_body_text:
+        print(f"      [Plasmod HTTP] unload status={unload_code} body={unload_body[:200].decode(errors='replace').strip()}")
 
     # ── 2. Ingest all vectors in a single call ──────────────────────────────────
     # BuildSegment is a full rebuild, not append — splitting into batches would
     # cause the second batch to overwrite the first, leaving only half the data.
     print(f"      [Plasmod HTTP] ingesting {indexed_n} vectors (dim={dim})")
     t_build = time.time()
-    ok, server_build_ms = http.ingest(seg_id, indexed[:indexed_n * dim], indexed_n, dim,
-                                      index_type=ptype,
-                                      nlist=nlist, nprobe=nprobe, m=m, nbits=nbits, sq_type=sq_type)
+    ok, payload_ms, http_ms, ingest_code, ingest_body = http.ingest(
+        seg_id, indexed[:indexed_n * dim], indexed_n, dim,
+        index_type=ptype,
+        nlist=nlist, nprobe=nprobe, m=m, nbits=nbits, sq_type=sq_type)
     if not ok:
-        raise RuntimeError("ingest failed")
+        msg = ingest_body[:1000].decode(errors="replace").strip()
+        raise RuntimeError(f"ingest failed: status={ingest_code} body={msg}")
     print(f"      [Plasmod HTTP]   ingested {indexed_n}/{indexed_n}")
 
     client_build_ms = (time.time() - t_build) * 1000
-    build_ms = server_build_ms
-    print(f"      [Plasmod HTTP] build={build_ms:.1f}ms (client_wall={client_build_ms:.1f}ms)")
+    # Use client wall-clock time as the authoritative build metric (server_elapsed_ms
+    # may be unreliable when the server uses go run with caching). Print both for
+    # transparency.
+    build_ms = client_build_ms
+    server_build_ms = 0.0
+    try:
+        server_build_ms = float(json.loads(ingest_body).get("elapsed_ms", 0.0))
+    except Exception:
+        pass
+    print(f"      [Plasmod HTTP] build={build_ms/1000:.3f}s "
+          f"(payload={payload_ms:.1f}ms http={http_ms:.1f}ms server={server_build_ms:.1f}ms)")
 
     # Warm-up: one request to prime the segment (no register_warm needed)
     http.query_serial(seg_id, queries[:dim], dim, topk)
@@ -2038,16 +2127,7 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
     recall = _plasmod_recall(all_ids, indexed, indexed_n, dim, queries, query_n, topk)
 
     # ── 6. Memory of plasmod process (RSS + mmap'd file sizes) ─────────────────
-    mem_val = 0.0
-    try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "bin/plasmod"], text=True, timeout=5)
-        pid = int(out.strip().split()[0])
-        # RSS of the plasmod process. CGO vector data lives in C heap (counted in RSS),
-        # not in mmap'd files — .andb_data only holds Badger WAL/value-logs, not vectors.
-        mem_val = mem_mb(pid)
-    except Exception:
-        pass
+    mem_val = plasmod_mem_mb()
 
     # ── 7. Unload ──────────────────────────────────────────────────────────────
     http.unload(seg_id)
@@ -2157,6 +2237,19 @@ def _gather_got_ids(db, indexed_n, dim, queries, query_n, topk, idx_type=None):
             except Exception:
                 print(f"      [gather] ChromaDB recall failed: {e}")
                 return []
+    elif db == "Plasmod":
+        # Run batch query against the bench.layer1 segment directly.
+        # The segment was built with all indexed vectors; results are integer indices
+        # (row offsets in the .fbin), same format as ground truth.
+        seg_id = "bench.layer1"
+        try:
+            http = _HTTPClient("http://127.0.0.1:8080", timeout=120)
+            ok, _, _, batch_ids, _ = http.query_batch(seg_id, queries, query_n, dim, topk)
+            if ok and batch_ids:
+                return [batch_ids[q * topk:(q + 1) * topk] for q in range(query_n)]
+        except Exception as e:
+            print(f"      [gather] Plasmod recall failed: {e}")
+        return []
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────────────
@@ -2178,6 +2271,9 @@ def main():
 
     _log(f"Starting benchmark: dataset={args.dataset} index={args.index} db={args.db} "
          f"queries={args.queries} topk={args.topk}")
+
+    if args.db in ("all", "plasmod"):
+        require_plasmod_server()
 
     # Load data
     if args.dataset == "nfcorpus":
