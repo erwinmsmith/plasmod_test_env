@@ -95,6 +95,13 @@ def iter_query_chunks(queries, n_q: int, dim: int, chunk_size: int):
         yield start, end, queries[start * dim : end * dim]
 
 
+def qdrant_search_params(search_ef: int) -> dict[str, Any]:
+    return {
+        "hnsw_ef": search_ef,
+        "exact": False,
+    }
+
+
 def build_qdrant(indexed, n_idx: int, dim: int, m: int, ef_construct: int, coll: str) -> float:
     base = "http://127.0.0.1:6333"
     try:
@@ -162,7 +169,7 @@ def search_qdrant(queries, n_q: int, dim: int, topk: int, search_ef: int, coll: 
                     "vector": qchunk[i * dim : (i + 1) * dim],
                     "top": topk,
                     "with_vectors": False,
-                    "params": {"hnsw": {"ef": search_ef, "exact": False}},
+                    "params": qdrant_search_params(search_ef),
                 }
                 for i in range(chunk_n)
             ]
@@ -192,7 +199,7 @@ def serial_qps_qdrant(queries, n_q: int, dim: int, topk: int, search_ef: int, co
             "vector": queries[q * dim : (q + 1) * dim],
             "top": topk,
             "with_vectors": False,
-            "params": {"hnsw": {"ef": search_ef, "exact": False}},
+            "params": qdrant_search_params(search_ef),
         })
         t0 = time.time()
         urllib.request.urlopen(
