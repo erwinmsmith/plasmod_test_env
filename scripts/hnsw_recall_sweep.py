@@ -34,7 +34,7 @@ import benchmark_all as bench  # noqa: E402
 
 DEFAULT_TARGETS = "0.8,0.85,0.9,0.95,1.0"
 DEFAULT_EF_VALUES = "12,16,24,32,48,64,96,128,192,256,384,512"
-DEFAULT_DBS = "qdrant,milvus,plasmod"
+DEFAULT_DBS = "qdrant,milvus,plasmod,chromadb,lancedb"
 
 
 @dataclass
@@ -535,7 +535,234 @@ def run_plasmod(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
     return points
 
 
-def best_points_by_target(points: list[SweepPoint], targets: list[float], metric: str):
+def build_chromadb(indexed, n_idx: int, dim: int, ef_construction: int, ef_search: int, coll_name: str):
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(BASE / "chromadb_hnsw_sweep_data"))
+    try:
+        client.delete_collection(coll_name)
+    except Exception:
+        pass
+    time.sleep(1.0)
+    coll = client.create_collection(
+        coll_name,
+        configuration={
+            "hnsw": {
+                "space": "cosine",
+                "ef_construction": ef_construction,
+                "ef_search": ef_search,
+                "max_neighbors": 16,
+            }
+        },
+    )
+
+    _log(f"[ChromaDB] ingesting {n_idx:,} vectors...")
+    t0 = time.time()
+    report_step = max(5000, n_idx // 10)
+    next_report = report_step
+    for start in range(0, n_idx, 500):
+        end = min(start + 500, n_idx)
+        ids = [f"vec_{i}" for i in range(start, end)]
+        vectors = [
+            [float(indexed[i * dim + d]) for d in range(dim)]
+            for i in range(start, end)
+        ]
+        coll.add(ids=ids, embeddings=vectors)
+        if end >= next_report:
+            _log(f"[ChromaDB]   {end:,}/{n_idx:,} ingested")
+            next_report += report_step
+    return client, coll, (time.time() - t0) * 1000
+
+
+def _query_chromadb(coll, queries, n_q: int, dim: int, topk: int, chunk_size: int):
+    got_ids: list[list[int]] = []
+    t0 = time.time()
+    for start, end, qchunk in iter_query_chunks(queries, n_q, dim, chunk_size):
+        qvecs = [
+            [float(qchunk[i * dim + d]) for d in range(dim)]
+            for i in range(end - start)
+        ]
+        res = coll.query(query_embeddings=qvecs, n_results=topk, include=[])
+        got_ids.extend([[int(id_.split("_", 1)[1]) for id_ in row] for row in res.get("ids", [])])
+    return got_ids, (time.time() - t0) * 1000
+
+
+def _serial_stats_chromadb(coll, queries, n_q: int, dim: int, topk: int, sample_n: int):
+    if sample_n <= 0:
+        return None, None, None, None, None
+    sample_n = min(sample_n, n_q)
+    latencies: list[float] = []
+    for q in range(sample_n):
+        qvec = [float(queries[q * dim + d]) for d in range(dim)]
+        t0 = time.time()
+        coll.query(query_embeddings=[qvec], n_results=topk, include=[])
+        latencies.append((time.time() - t0) * 1000)
+    serial_ms = (sum(latencies) / sample_n) * n_q
+    p50, p95, p99 = _percentiles(latencies)
+    return serial_ms, n_q / (serial_ms / 1000), p50, p95, p99
+
+
+def run_chromadb(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
+                 gt: list[list[int]], ef_values: list[int], ef_construction: int,
+                 chunk_size: int, serial_samples: int) -> list[SweepPoint]:
+    coll_name = "bench_hnsw_recall_sweep"
+    _, coll, build_ms = build_chromadb(indexed, n_idx, dim, ef_construction, ef_values[0], coll_name)
+    points: list[SweepPoint] = []
+    for ef in ef_values:
+        _log(f"[ChromaDB] search ef={ef}")
+        try:
+            coll.modify(configuration={"hnsw": {"ef_search": ef}})
+            time.sleep(0.2)
+        except Exception as e:
+            _log(f"[ChromaDB] ef_search modify failed for ef={ef}: {e}; continuing with collection default")
+        got_ids, batch_ms = _query_chromadb(coll, queries, n_q, dim, topk, chunk_size)
+        recall = bench.recall_at_k(got_ids, gt, topk)
+        serial_ms, serial_qps, p50, p95, p99 = _serial_stats_chromadb(
+            coll, queries, n_q, dim, topk, serial_samples
+        )
+        points.append(SweepPoint(
+            method="ChromaDB HNSW",
+            db="ChromaDB",
+            sweep_param="collection_ef_search",
+            sweep_value=ef,
+            recall=recall,
+            batch_ms=batch_ms,
+            batch_qps=n_q / (batch_ms / 1000) if batch_ms > 0 else 0.0,
+            serial_ms=serial_ms,
+            serial_qps=serial_qps,
+            p50_ms=p50,
+            p95_ms=p95,
+            p99_ms=p99,
+            n_indexed=n_idx,
+            n_queries=n_q,
+            dim=dim,
+            topk=topk,
+            build_ms=build_ms,
+            notes="ChromaDB HNSW ef_search is collection configuration, not per-query search params",
+        ))
+    return points
+
+
+def build_lancedb(indexed, n_idx: int, dim: int, ef_construction: int, coll_name: str):
+    import lancedb
+    import pyarrow as pa
+
+    db = lancedb.connect(str(BASE / "lancedb_hnsw_sweep_data"))
+    try:
+        db.drop_table(coll_name)
+    except Exception:
+        pass
+
+    schema = pa.schema([
+        ("id", pa.int64()),
+        ("vector", pa.list_(pa.float32(), dim)),
+    ])
+    _log(f"[LanceDB] ingesting {n_idx:,} vectors...")
+    t0 = time.time()
+    report_step = max(5000, n_idx // 10)
+    next_report = report_step
+    table = None
+    for start in range(0, n_idx, 500):
+        end = min(start + 500, n_idx)
+        ids = list(range(start, end))
+        vectors = [
+            [float(indexed[i * dim + d]) for d in range(dim)]
+            for i in range(start, end)
+        ]
+        batch = pa.table({"id": ids, "vector": vectors}, schema=schema)
+        if table is None:
+            table = db.create_table(coll_name, data=batch)
+        else:
+            table.add(batch)
+        if end >= next_report:
+            _log(f"[LanceDB]   {end:,}/{n_idx:,} ingested")
+            next_report += report_step
+    table = db.open_table(coll_name)
+    _log("[LanceDB] building HNSW index...")
+    table.create_index(
+        metric="cosine",
+        vector_column_name="vector",
+        index_type="IVF_HNSW_PQ",
+        replace=True,
+        num_partitions=1,
+        num_sub_vectors=min(dim, 96),
+        m=16,
+        ef_construction=ef_construction,
+    )
+    try:
+        table.wait_for_index()
+    except Exception:
+        pass
+    return table, (time.time() - t0) * 1000
+
+
+def _query_lancedb(table, queries, n_q: int, dim: int, topk: int, ef: int):
+    got_ids: list[list[int]] = []
+    t0 = time.time()
+    for q in range(n_q):
+        qvec = [float(queries[q * dim + d]) for d in range(dim)]
+        rows = table.search(qvec).ef(ef).limit(topk).to_list()
+        got_ids.append([int(row["id"]) for row in rows])
+    return got_ids, (time.time() - t0) * 1000
+
+
+def _serial_stats_lancedb(table, queries, n_q: int, dim: int, topk: int, ef: int, sample_n: int):
+    if sample_n <= 0:
+        return None, None, None, None, None
+    sample_n = min(sample_n, n_q)
+    latencies: list[float] = []
+    for q in range(sample_n):
+        qvec = [float(queries[q * dim + d]) for d in range(dim)]
+        t0 = time.time()
+        table.search(qvec).ef(ef).limit(topk).to_list()
+        latencies.append((time.time() - t0) * 1000)
+    serial_ms = (sum(latencies) / sample_n) * n_q
+    p50, p95, p99 = _percentiles(latencies)
+    return serial_ms, n_q / (serial_ms / 1000), p50, p95, p99
+
+
+def run_lancedb(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
+                gt: list[list[int]], ef_values: list[int], ef_construction: int,
+                serial_samples: int) -> list[SweepPoint]:
+    coll_name = "bench_hnsw_recall_sweep"
+    table, build_ms = build_lancedb(indexed, n_idx, dim, ef_construction, coll_name)
+    points: list[SweepPoint] = []
+    for ef in ef_values:
+        _log(f"[LanceDB] search ef={ef}")
+        got_ids, batch_ms = _query_lancedb(table, queries, n_q, dim, topk, ef)
+        recall = bench.recall_at_k(got_ids, gt, topk)
+        serial_ms, serial_qps, p50, p95, p99 = _serial_stats_lancedb(
+            table, queries, n_q, dim, topk, ef, serial_samples
+        )
+        points.append(SweepPoint(
+            method="LanceDB IVF_HNSW_PQ",
+            db="LanceDB",
+            sweep_param="query_ef",
+            sweep_value=ef,
+            recall=recall,
+            batch_ms=batch_ms,
+            batch_qps=n_q / (batch_ms / 1000) if batch_ms > 0 else 0.0,
+            serial_ms=serial_ms,
+            serial_qps=serial_qps,
+            p50_ms=p50,
+            p95_ms=p95,
+            p99_ms=p99,
+            n_indexed=n_idx,
+            n_queries=n_q,
+            dim=dim,
+            topk=topk,
+            build_ms=build_ms,
+            notes="LanceDB uses IVF_HNSW_PQ as its HNSW-family vector index",
+        ))
+    return points
+
+
+def _metric_value(point: SweepPoint, metric: str) -> float:
+    value = getattr(point, metric)
+    return float(value) if value is not None else -1.0
+
+
+def best_points_by_target(points: list[SweepPoint], targets: list[float], metric: str, policy: str):
     grouped: dict[str, list[SweepPoint]] = {}
     for point in points:
         grouped.setdefault(point.method, []).append(point)
@@ -546,16 +773,13 @@ def best_points_by_target(points: list[SweepPoint], targets: list[float], metric
             qualifying = [p for p in method_points if p.recall >= target]
             achieved = bool(qualifying)
 
-            def key(p: SweepPoint):
-                metric_value = getattr(p, metric)
-                if metric_value is None:
-                    metric_value = -1.0
-                return (metric_value, p.recall)
-
             if achieved:
-                best = max(qualifying, key=key)
+                if policy == "max_qps":
+                    best = max(qualifying, key=lambda p: (_metric_value(p, metric), p.recall))
+                else:
+                    best = min(qualifying, key=lambda p: (p.recall, -_metric_value(p, metric)))
             else:
-                best = max(method_points, key=lambda p: (p.recall, getattr(p, metric) or -1.0))
+                best = max(method_points, key=lambda p: (p.recall, _metric_value(p, metric)))
             rows.append({
                 "method": method,
                 "target_recall": target,
@@ -566,6 +790,7 @@ def best_points_by_target(points: list[SweepPoint], targets: list[float], metric
                 "batch_qps": best.batch_qps,
                 "serial_qps": best.serial_qps,
                 "selection_metric": metric,
+                "selection_policy": policy,
                 "fallback_reason": "" if achieved else "target not reached; selected best available point",
             })
     return rows
@@ -626,14 +851,16 @@ def main() -> None:
     ap.add_argument("--serial-samples", type=int, default=1000,
                     help="nq=1 latency sample size per point; 0 disables serial stats.")
     ap.add_argument("--select-by", default="batch_qps", choices=["batch_qps", "serial_qps"],
-                    help="Metric used to pick the best point for each recall target.")
+                    help="Metric used to break ties for each recall target.")
+    ap.add_argument("--selection-policy", default="closest_above", choices=["closest_above", "max_qps"],
+                    help="closest_above selects the lowest recall point above target; max_qps selects fastest above target.")
     ap.add_argument("--output-dir", default="",
                     help="Default: results/hnsw_recall_sweep_<dataset>_n<N>_q<Q>_k<K>_<timestamp>")
     ap.add_argument("--groundtruth-cache", default="",
                     help="Default: results/groundtruth_<dataset>_n<N>_q<Q>_k<K>.npy")
     ap.add_argument("--restart-plasmod-per-ef", action="store_true",
                     help="Restart Plasmod with PLASMOD_HNSW_EF_SEARCH for each ef value.")
-    ap.add_argument("--plasmod-modes", default="optimized,raw",
+    ap.add_argument("--plasmod-modes", default="optimized",
                     help="Comma-separated Plasmod modes: optimized,raw")
     args = ap.parse_args()
 
@@ -678,10 +905,18 @@ def main() -> None:
             args.ef_construction, args.batch_chunk_size, args.serial_samples,
             plasmod_modes, args.restart_plasmod_per_ef,
         ))
-    if "chromadb" in dbs or "lancedb" in dbs:
-        _log("ChromaDB/LanceDB requested but skipped: they do not expose a comparable per-query HNSW ef sweep here.")
+    if "chromadb" in dbs:
+        all_points.extend(run_chromadb(
+            indexed, n_idx, dim, queries, n_q, args.topk, gt, ef_values,
+            args.ef_construction, args.batch_chunk_size, args.serial_samples,
+        ))
+    if "lancedb" in dbs:
+        all_points.extend(run_lancedb(
+            indexed, n_idx, dim, queries, n_q, args.topk, gt, ef_values,
+            args.ef_construction, args.serial_samples,
+        ))
 
-    target_rows = best_points_by_target(all_points, targets, args.select_by)
+    target_rows = best_points_by_target(all_points, targets, args.select_by, args.selection_policy)
     metadata = {
         "dataset": args.dataset,
         "n_indexed": n_idx,
@@ -693,6 +928,7 @@ def main() -> None:
         "ef_construction": args.ef_construction,
         "dbs": dbs,
         "select_by": args.select_by,
+        "selection_policy": args.selection_policy,
         "serial_samples": args.serial_samples,
         "batch_chunk_size": args.batch_chunk_size,
         "plasmod_restart_per_ef": args.restart_plasmod_per_ef,
