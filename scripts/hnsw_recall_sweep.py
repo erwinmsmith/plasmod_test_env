@@ -507,7 +507,7 @@ def run_plasmod(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
                             http, seg_id, queries, n_q, dim, topk, serial_samples
                         )
                     points.append(SweepPoint(
-                        method=f"Plasmod HNSW {mode}",
+                        method="Plasmod HNSW" if mode == "optimized" else f"Plasmod HNSW {mode}",
                         db="Plasmod",
                         sweep_param="process_ef_search",
                         sweep_value=ef,
