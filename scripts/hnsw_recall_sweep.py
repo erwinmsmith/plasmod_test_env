@@ -540,7 +540,6 @@ def best_points_by_target(points: list[SweepPoint], targets: list[float], metric
         for target in targets:
             qualifying = [p for p in method_points if p.recall >= target]
             achieved = bool(qualifying)
-            candidates = qualifying if qualifying else method_points
 
             def key(p: SweepPoint):
                 metric_value = getattr(p, metric)
@@ -548,7 +547,10 @@ def best_points_by_target(points: list[SweepPoint], targets: list[float], metric
                     metric_value = -1.0
                 return (metric_value, p.recall)
 
-            best = max(candidates, key=key)
+            if achieved:
+                best = max(qualifying, key=key)
+            else:
+                best = max(method_points, key=lambda p: (p.recall, getattr(p, metric) or -1.0))
             rows.append({
                 "method": method,
                 "target_recall": target,
