@@ -9,7 +9,7 @@ import time
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASE = SCRIPT_DIR.parent
@@ -211,7 +211,8 @@ def serial_qps_qdrant(queries, n_q: int, dim: int, topk: int, search_ef: int, co
 
 def run_qdrant(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
                gt, m_values: list[int], build_efs: list[int], search_efs: list[int],
-               chunk_size: int, serial_samples: int) -> list[GridPoint]:
+               chunk_size: int, serial_samples: int,
+               on_point: Callable[[GridPoint], None] | None = None) -> list[GridPoint]:
     coll = "bench_hnsw_grid"
     out: list[GridPoint] = []
     for m in m_values:
@@ -226,7 +227,7 @@ def run_qdrant(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
                 ids, batch_ms = search_qdrant(queries, n_q, dim, topk, ef, coll, chunk_size)
                 recall = bench.recall_at_k(ids, gt, topk)
                 serial_ms, serial_qps = serial_qps_qdrant(queries, n_q, dim, topk, ef, coll, serial_samples)
-                out.append(GridPoint(
+                point = GridPoint(
                     method="Qdrant HNSW",
                     db="Qdrant",
                     build_m=m,
@@ -242,21 +243,28 @@ def run_qdrant(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
                     dim=dim,
                     topk=topk,
                     build_ms=build_ms,
-                ))
+                )
+                out.append(point)
+                if on_point:
+                    on_point(point)
     return out
 
 
 def build_milvus(indexed, n_idx: int, dim: int, m: int, ef_construct: int, coll: str):
     from pymilvus import MilvusClient
-    from pymilvus.milvus_client.index import IndexParams
 
     client = MilvusClient(uri="http://127.0.0.1:19530")
     try:
         client.drop_collection(coll)
     except Exception:
         pass
-    ip = IndexParams()
-    ip.add_index("vector", "HNSW", m=m, efConstruction=ef_construct)
+    ip = client.prepare_index_params()
+    ip.add_index(
+        field_name="vector",
+        index_type="HNSW",
+        metric_type="COSINE",
+        params={"M": m, "efConstruction": ef_construct},
+    )
     client.create_collection(coll, dimension=dim, index_params=ip, auto_id=False)
     client.flush(coll)
     _log(f"[Milvus] ingesting {n_idx:,} vectors m={m} efc={ef_construct}")
@@ -278,12 +286,19 @@ def build_milvus(indexed, n_idx: int, dim: int, m: int, ef_construct: int, coll:
     return client, (time.time() - t0) * 1000
 
 
+def milvus_search_params(search_ef: int) -> dict[str, Any]:
+    return {
+        "metric_type": "COSINE",
+        "params": {"ef": search_ef},
+    }
+
+
 def search_milvus(client, coll: str, qvecs, topk: int, search_ef: int, chunk_size: int):
     ids: list[list[int]] = []
     t0 = time.time()
     for start in range(0, len(qvecs), chunk_size):
         end = min(start + chunk_size, len(qvecs))
-        res = client.search(coll, qvecs[start:end], limit=topk, search_params={"ef": search_ef})
+        res = client.search(coll, qvecs[start:end], limit=topk, search_params=milvus_search_params(search_ef))
         ids.extend([[int(hit["id"]) for hit in row] for row in res])
     return ids, (time.time() - t0) * 1000
 
@@ -295,7 +310,7 @@ def serial_qps_milvus(client, coll: str, qvecs, topk: int, search_ef: int, n_q: 
     lat = []
     for qvec in qvecs[:sample_n]:
         t0 = time.time()
-        client.search(coll, [qvec], limit=topk, search_params={"ef": search_ef})
+        client.search(coll, [qvec], limit=topk, search_params=milvus_search_params(search_ef))
         lat.append((time.time() - t0) * 1000)
     serial_ms = (sum(lat) / sample_n) * n_q
     return serial_ms, n_q / (serial_ms / 1000)
@@ -303,7 +318,8 @@ def serial_qps_milvus(client, coll: str, qvecs, topk: int, search_ef: int, n_q: 
 
 def run_milvus(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
                gt, m_values: list[int], build_efs: list[int], search_efs: list[int],
-               chunk_size: int, serial_samples: int) -> list[GridPoint]:
+               chunk_size: int, serial_samples: int,
+               on_point: Callable[[GridPoint], None] | None = None) -> list[GridPoint]:
     coll = "bench_hnsw_grid"
     out: list[GridPoint] = []
     qvecs = [queries[q * dim : (q + 1) * dim] for q in range(n_q)]
@@ -323,7 +339,7 @@ def run_milvus(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
                 except Exception as e:
                     _log(f"[Milvus] search failed m={m} efc={efc} ef={ef}: {e}")
                     continue
-                out.append(GridPoint(
+                point = GridPoint(
                     method="Milvus HNSW",
                     db="Milvus",
                     build_m=m,
@@ -339,7 +355,10 @@ def run_milvus(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
                     dim=dim,
                     topk=topk,
                     build_ms=build_ms,
-                ))
+                )
+                out.append(point)
+                if on_point:
+                    on_point(point)
     return out
 
 
@@ -435,14 +454,6 @@ def main():
     gt = load_ground_truth(Path(args.groundtruth_cache), indexed, n_idx, dim, queries, n_q, args.topk)
 
     points: list[GridPoint] = []
-    if "qdrant" in dbs:
-        points.extend(run_qdrant(indexed, n_idx, dim, queries, n_q, args.topk, gt,
-                                 m_values, build_efs, search_efs, args.batch_chunk_size, args.serial_samples))
-    if "milvus" in dbs:
-        points.extend(run_milvus(indexed, n_idx, dim, queries, n_q, args.topk, gt,
-                                 m_values, build_efs, search_efs, args.batch_chunk_size, args.serial_samples))
-
-    summary = closest_above_summary(points, targets)
     metadata = {
         "dataset": "deep10M",
         "n_indexed": n_idx,
@@ -458,8 +469,24 @@ def main():
         "notes": [
             "Target rows select the lowest measured recall >= target.",
             "If target is unreachable, the highest measured recall point is selected.",
+            "Outputs are checkpointed after every measured grid point.",
         ],
     }
+
+    def checkpoint(point: GridPoint) -> None:
+        points.append(point)
+        write_outputs(out_dir, points, closest_above_summary(points, targets), metadata)
+
+    if "qdrant" in dbs:
+        run_qdrant(indexed, n_idx, dim, queries, n_q, args.topk, gt,
+                   m_values, build_efs, search_efs, args.batch_chunk_size, args.serial_samples,
+                   checkpoint)
+    if "milvus" in dbs:
+        run_milvus(indexed, n_idx, dim, queries, n_q, args.topk, gt,
+                   m_values, build_efs, search_efs, args.batch_chunk_size, args.serial_samples,
+                   checkpoint)
+
+    summary = closest_above_summary(points, targets)
     write_outputs(out_dir, points, summary, metadata)
     print_summary(summary)
     _log(f"Saved results to {out_dir}")
