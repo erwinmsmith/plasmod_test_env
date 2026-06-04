@@ -450,7 +450,7 @@ def main():
     dbs = [d.strip().lower() for d in args.db.split(",") if d.strip()]
     m_values = parse_ints(args.m_values)
     build_efs = parse_ints(args.build_ef_values)
-    search_efs = [ef for ef in parse_ints(args.search_ef_values) if ef > args.topk]
+    search_efs = [ef for ef in parse_ints(args.search_ef_values) if ef >= args.topk]
     targets = parse_floats(args.targets)
     out_dir = Path(args.output_dir) if args.output_dir else (
         bench.OUT / f"qdrant_milvus_hnsw_grid_deep10M_n{args.index_count}_q{args.queries}_k{args.topk}_{time.strftime('%Y%m%d_%H%M%S')}"
