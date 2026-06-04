@@ -33,7 +33,7 @@ import benchmark_all as bench  # noqa: E402
 
 
 DEFAULT_TARGETS = "0.8,0.85,0.9,0.95,1.0"
-DEFAULT_EF_VALUES = "8,16,24,32,48,64,96,128,192,256,384,512"
+DEFAULT_EF_VALUES = "12,16,24,32,48,64,96,128,192,256,384,512"
 DEFAULT_DBS = "qdrant,milvus,plasmod"
 
 
@@ -100,6 +100,16 @@ def parse_dbs(raw: str) -> list[str]:
     if not out:
         raise ValueError("empty db list")
     return out
+
+
+def valid_ef_values(raw_values: list[int], topk: int) -> list[int]:
+    values = [ef for ef in raw_values if ef > topk]
+    skipped = [ef for ef in raw_values if ef <= topk]
+    if skipped:
+        _log(f"Skipping HNSW ef values <= topk ({topk}): {skipped}")
+    if not values:
+        raise ValueError(f"no valid HNSW ef values; ef must be > topk ({topk})")
+    return values
 
 
 def rows_to_jsonable(points: Iterable[SweepPoint]) -> list[dict[str, Any]]:
@@ -622,7 +632,7 @@ def main() -> None:
 
     dbs = parse_dbs(args.db)
     targets = parse_floats(args.targets)
-    ef_values = parse_ints(args.ef_search_values)
+    ef_values = valid_ef_values(parse_ints(args.ef_search_values), args.topk)
     plasmod_modes = [m.strip().lower() for m in args.plasmod_modes.split(",") if m.strip()]
     for mode in plasmod_modes:
         if mode not in {"optimized", "raw"}:
