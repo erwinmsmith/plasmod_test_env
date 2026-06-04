@@ -471,8 +471,9 @@ def run_plasmod(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
                 gt: list[list[int]], ef_values: list[int], ef_construction: int,
                 chunk_size: int, serial_samples: int, modes: list[str],
                 restart_per_ef: bool) -> list[SweepPoint]:
+    original_ef = int(os.getenv("PLASMOD_HNSW_EF_SEARCH", "96"))
     if not restart_per_ef:
-        current_ef = int(os.getenv("PLASMOD_HNSW_EF_SEARCH", "96"))
+        current_ef = original_ef
         if current_ef not in ef_values:
             _log(f"[Plasmod] adding current process ef assumption {current_ef} to sweep")
         ef_values = [current_ef]
@@ -485,48 +486,52 @@ def run_plasmod(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
         notes = "Plasmod server restarted per ef; index rebuilt per point"
 
     points: list[SweepPoint] = []
-    for ef in ef_values:
-        if restart_per_ef:
-            restart_plasmod_for_ef(ef)
-        _log(f"[Plasmod] build HNSW and search ef={ef}")
-        seg_id = "bench.hnsw_recall_sweep"
-        http, build_ms, payload_ms, http_ms = build_plasmod(indexed, n_idx, dim, ef_construction, seg_id)
-        try:
-            for mode in modes:
-                raw = mode == "raw"
-                got_ids, batch_ms = _query_plasmod_chunks(
-                    http, seg_id, queries, n_q, dim, topk, chunk_size, raw=raw
-                )
-                recall = bench.recall_at_k(got_ids, gt, topk)
-                if raw:
-                    serial_ms = serial_qps = p50 = p95 = p99 = None
-                else:
-                    serial_ms, serial_qps, p50, p95, p99 = _serial_stats_plasmod(
-                        http, seg_id, queries, n_q, dim, topk, serial_samples
+    try:
+        for ef in ef_values:
+            if restart_per_ef:
+                restart_plasmod_for_ef(ef)
+            _log(f"[Plasmod] build HNSW and search ef={ef}")
+            seg_id = "bench.hnsw_recall_sweep"
+            http, build_ms, payload_ms, http_ms = build_plasmod(indexed, n_idx, dim, ef_construction, seg_id)
+            try:
+                for mode in modes:
+                    raw = mode == "raw"
+                    got_ids, batch_ms = _query_plasmod_chunks(
+                        http, seg_id, queries, n_q, dim, topk, chunk_size, raw=raw
                     )
-                points.append(SweepPoint(
-                    method=f"Plasmod HNSW {mode}",
-                    db="Plasmod",
-                    sweep_param="process_ef_search",
-                    sweep_value=ef,
-                    recall=recall,
-                    batch_ms=batch_ms,
-                    batch_qps=n_q / (batch_ms / 1000) if batch_ms > 0 else 0.0,
-                    serial_ms=serial_ms,
-                    serial_qps=serial_qps,
-                    p50_ms=p50,
-                    p95_ms=p95,
-                    p99_ms=p99,
-                    n_indexed=n_idx,
-                    n_queries=n_q,
-                    dim=dim,
-                    topk=topk,
-                    build_ms=build_ms,
-                    notes=f"{notes}; ingest_payload_ms={payload_ms:.1f}; ingest_http_ms={http_ms:.1f}",
-                ))
-        finally:
-            http.unload(seg_id)
-            http.close()
+                    recall = bench.recall_at_k(got_ids, gt, topk)
+                    if raw:
+                        serial_ms = serial_qps = p50 = p95 = p99 = None
+                    else:
+                        serial_ms, serial_qps, p50, p95, p99 = _serial_stats_plasmod(
+                            http, seg_id, queries, n_q, dim, topk, serial_samples
+                        )
+                    points.append(SweepPoint(
+                        method=f"Plasmod HNSW {mode}",
+                        db="Plasmod",
+                        sweep_param="process_ef_search",
+                        sweep_value=ef,
+                        recall=recall,
+                        batch_ms=batch_ms,
+                        batch_qps=n_q / (batch_ms / 1000) if batch_ms > 0 else 0.0,
+                        serial_ms=serial_ms,
+                        serial_qps=serial_qps,
+                        p50_ms=p50,
+                        p95_ms=p95,
+                        p99_ms=p99,
+                        n_indexed=n_idx,
+                        n_queries=n_q,
+                        dim=dim,
+                        topk=topk,
+                        build_ms=build_ms,
+                        notes=f"{notes}; ingest_payload_ms={payload_ms:.1f}; ingest_http_ms={http_ms:.1f}",
+                    ))
+            finally:
+                http.unload(seg_id)
+                http.close()
+    finally:
+        if restart_per_ef:
+            restart_plasmod_for_ef(original_ef)
     return points
 
 
