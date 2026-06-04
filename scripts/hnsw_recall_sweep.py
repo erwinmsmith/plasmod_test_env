@@ -606,15 +606,10 @@ def run_chromadb(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
                  gt: list[list[int]], ef_values: list[int], ef_construction: int,
                  chunk_size: int, serial_samples: int) -> list[SweepPoint]:
     coll_name = "bench_hnsw_recall_sweep"
-    _, coll, build_ms = build_chromadb(indexed, n_idx, dim, ef_construction, ef_values[0], coll_name)
     points: list[SweepPoint] = []
     for ef in ef_values:
-        _log(f"[ChromaDB] search ef={ef}")
-        try:
-            coll.modify(configuration={"hnsw": {"ef_search": ef}})
-            time.sleep(0.2)
-        except Exception as e:
-            _log(f"[ChromaDB] ef_search modify failed for ef={ef}: {e}; continuing with collection default")
+        _log(f"[ChromaDB] rebuild and search ef={ef}")
+        _, coll, build_ms = build_chromadb(indexed, n_idx, dim, ef_construction, ef, coll_name)
         got_ids, batch_ms = _query_chromadb(coll, queries, n_q, dim, topk, chunk_size)
         recall = bench.recall_at_k(got_ids, gt, topk)
         serial_ms, serial_qps, p50, p95, p99 = _serial_stats_chromadb(
@@ -638,7 +633,7 @@ def run_chromadb(indexed, n_idx: int, dim: int, queries, n_q: int, topk: int,
             dim=dim,
             topk=topk,
             build_ms=build_ms,
-            notes="ChromaDB HNSW ef_search is collection configuration, not per-query search params",
+            notes="ChromaDB HNSW ef_search is collection configuration; collection rebuilt per ef",
         ))
     return points
 
