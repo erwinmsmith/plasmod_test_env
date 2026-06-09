@@ -44,6 +44,15 @@ from typing import List, Optional
 
 import numpy as np
 
+try:
+    import grpc  # type: ignore
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory  # type: ignore
+except Exception:
+    grpc = None
+    descriptor_pb2 = None
+    descriptor_pool = None
+    message_factory = None
+
 
 class _NumpyEncoder(json.JSONEncoder):
     """Allow json.dumps to handle numpy arrays and scalars."""
@@ -175,8 +184,16 @@ def _plasmod_recall(int_ids: List[int], indexed: List[float], indexed_n: int,
 
 
 def _plasmod_ivf_pq_m(dim: int) -> int:
-    """Choose a high-recall PQ sub-quantizer count that divides dim."""
-    target = min(dim, 96)
+    """Choose compact PQ code size for Plasmod's raw-vector refined IVF-PQ."""
+    override = os.getenv("PLASMOD_BENCH_IVF_PQ_M")
+    if override:
+        try:
+            m = int(override)
+            if m > 0 and dim % m == 0:
+                return m
+        except ValueError:
+            pass
+    target = min(dim, 24)
     for m in range(target, 0, -1):
         if dim % m == 0:
             return m
@@ -192,6 +209,14 @@ def _env_int(name: str, default: int, min_value: int = 1) -> int:
     except ValueError:
         return default
     return value if value >= min_value else default
+
+
+def _percentiles_ms(latencies: List[float]) -> tuple[float, float, float]:
+    if not latencies:
+        return 0.0, 0.0, 0.0
+    arr = np.asarray(latencies, dtype=np.float64)
+    p50, p95, p99 = np.percentile(arr, [50, 95, 99], method="nearest")
+    return float(p50), float(p95), float(p99)
 
 
 # ─── Result ────────────────────────────────────────────────────────────────────
@@ -216,10 +241,13 @@ class Result:
     memory_mb: float       # Resident memory in MB
     # QPS at different recall levels
     qps_at_recall: dict = None  # {0.5: qps, 0.6: qps, ...}
+    metadata: dict = None
 
     def __post_init__(self):
         if self.qps_at_recall is None:
             self.qps_at_recall = {}
+        if self.metadata is None:
+            self.metadata = {}
 
     def save(self, out_dir: Path):
         p = out_dir / f"{self.db}_{self.index_type}.json"
@@ -1984,6 +2012,18 @@ class _HTTPClient:
             return True, code, lat_ms, ids
         return False, code, lat_ms, []
 
+    def query_serial_batch(self, seg_id: str, queries: list[float], nq: int,
+                           dim: int, topk: int) -> tuple[bool, int, float, list[int], list[float]]:
+        """Send many queries once, but execute them server-side as nq=1 serial calls."""
+        payload = _build_batch_query_payload(seg_id, queries, nq, dim, topk)
+        t0 = time.time()
+        code, body = self._post_binary("/v1/internal/rpc/query_warm_serial_batch", payload)
+        lat_ms = (time.time() - t0) * 1000
+        if code == 200:
+            ids, dists = _parse_batch_response(body, nq, topk)
+            return True, code, lat_ms, ids, dists
+        return False, code, lat_ms, [], []
+
     def query_batch(self, seg_id: str, queries: list[float], nq: int,
                     dim: int, topk: int) -> tuple[bool, int, float, list[int], list[float]]:
         """Send batch query via query_warm_batch (L2NormSort plugin + chunked).
@@ -1991,6 +2031,18 @@ class _HTTPClient:
         payload = _build_batch_query_payload(seg_id, queries, nq, dim, topk)
         t0 = time.time()
         code, body = self._post_binary("/v1/internal/rpc/query_warm_batch", payload)
+        lat_ms = (time.time() - t0) * 1000
+        if code == 200:
+            ids, dists = _parse_batch_response(body, nq, topk)
+            return True, code, lat_ms, ids, dists
+        return False, code, lat_ms, [], []
+
+    def query_batch_raw(self, seg_id: str, queries: list[float], nq: int,
+                        dim: int, topk: int) -> tuple[bool, int, float, list[int], list[float]]:
+        """Send batch query via query_warm_batch_raw (standard Knowhere path)."""
+        payload = _build_batch_query_payload(seg_id, queries, nq, dim, topk)
+        t0 = time.time()
+        code, body = self._post_binary("/v1/internal/rpc/query_warm_batch_raw", payload)
         lat_ms = (time.time() - t0) * 1000
         if code == 200:
             ids, dists = _parse_batch_response(body, nq, topk)
@@ -2012,6 +2064,154 @@ class _HTTPClient:
             return -1, str(e).encode()
 
 
+_GRPC_TYPES = None
+
+def _grpc_message_types():
+    """Build the tiny subset of plasmod.v1 descriptors needed by the benchmark.
+
+    This avoids requiring generated Python protobuf files or grpc_tools in the
+    test environment while still exercising the real gRPC service methods.
+    """
+    global _GRPC_TYPES
+    if _GRPC_TYPES is not None:
+        return _GRPC_TYPES
+    if descriptor_pb2 is None or descriptor_pool is None or message_factory is None:
+        raise RuntimeError("grpc/protobuf Python packages are not available")
+
+    fd = descriptor_pb2.FileDescriptorProto()
+    fd.name = "plasmod/v1/plasmod_bench_dynamic.proto"
+    fd.package = "plasmod.v1"
+    fd.syntax = "proto3"
+
+    def add_msg(name: str, fields: list[tuple[str, int, int, int]]) -> None:
+        msg = fd.message_type.add()
+        msg.name = name
+        for fname, number, ftype, label in fields:
+            field = msg.field.add()
+            field.name = fname
+            field.number = number
+            field.type = ftype
+            field.label = label
+
+    F = descriptor_pb2.FieldDescriptorProto
+    add_msg("HealthRequest", [])
+    add_msg("HealthResponse", [
+        ("status", 1, F.TYPE_STRING, F.LABEL_OPTIONAL),
+        ("transport", 2, F.TYPE_STRING, F.LABEL_OPTIONAL),
+    ])
+    add_msg("QueryBatchFlatRequest", [
+        ("warm_segment_id", 1, F.TYPE_STRING, F.LABEL_OPTIONAL),
+        ("top_k", 2, F.TYPE_INT32, F.LABEL_OPTIONAL),
+        ("nq", 3, F.TYPE_INT32, F.LABEL_OPTIONAL),
+        ("dim", 4, F.TYPE_INT32, F.LABEL_OPTIONAL),
+        ("queries_le", 5, F.TYPE_BYTES, F.LABEL_OPTIONAL),
+        ("search_raw", 6, F.TYPE_BOOL, F.LABEL_OPTIONAL),
+        ("serial", 7, F.TYPE_BOOL, F.LABEL_OPTIONAL),
+    ])
+    add_msg("QueryBatchFlatResponse", [
+        ("status", 1, F.TYPE_STRING, F.LABEL_OPTIONAL),
+        ("warm_segment_id", 2, F.TYPE_STRING, F.LABEL_OPTIONAL),
+        ("nq", 3, F.TYPE_INT32, F.LABEL_OPTIONAL),
+        ("top_k", 4, F.TYPE_INT32, F.LABEL_OPTIONAL),
+        ("dim", 5, F.TYPE_INT32, F.LABEL_OPTIONAL),
+        ("ids_le", 6, F.TYPE_BYTES, F.LABEL_OPTIONAL),
+        ("distances_le", 7, F.TYPE_BYTES, F.LABEL_OPTIONAL),
+    ])
+
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(fd)
+
+    def cls(name: str):
+        desc = pool.FindMessageTypeByName(f"plasmod.v1.{name}")
+        if hasattr(message_factory, "GetMessageClass"):
+            return message_factory.GetMessageClass(desc)
+        return message_factory.MessageFactory(pool).GetPrototype(desc)
+
+    _GRPC_TYPES = {
+        "HealthRequest": cls("HealthRequest"),
+        "HealthResponse": cls("HealthResponse"),
+        "QueryBatchFlatRequest": cls("QueryBatchFlatRequest"),
+        "QueryBatchFlatResponse": cls("QueryBatchFlatResponse"),
+    }
+    return _GRPC_TYPES
+
+
+class _GRPCFlatQueryClient:
+    def __init__(self, target: str, timeout: int = 3600, max_message_bytes: int = 1024 * 1024 * 1024):
+        if grpc is None:
+            raise RuntimeError("grpc Python package is not available")
+        self.target = target
+        self.timeout = timeout
+        types = _grpc_message_types()
+        self._HealthRequest = types["HealthRequest"]
+        self._HealthResponse = types["HealthResponse"]
+        self._QueryBatchFlatRequest = types["QueryBatchFlatRequest"]
+        self._QueryBatchFlatResponse = types["QueryBatchFlatResponse"]
+        opts = [
+            ("grpc.max_send_message_length", max_message_bytes),
+            ("grpc.max_receive_message_length", max_message_bytes),
+        ]
+        self._channel = grpc.insecure_channel(target, options=opts)
+        self._health = self._channel.unary_unary(
+            "/plasmod.v1.PlasmodAPIService/Health",
+            request_serializer=self._HealthRequest.SerializeToString,
+            response_deserializer=self._HealthResponse.FromString,
+        )
+        self._query = self._channel.unary_unary(
+            "/plasmod.v1.PlasmodAPIService/QueryBatchFlat",
+            request_serializer=self._QueryBatchFlatRequest.SerializeToString,
+            response_deserializer=self._QueryBatchFlatResponse.FromString,
+        )
+
+    def close(self) -> None:
+        self._channel.close()
+
+    def health(self) -> bool:
+        resp = self._health(self._HealthRequest(), timeout=5)
+        return getattr(resp, "status", "") == "ok"
+
+    def _query_flat(self, seg_id: str, queries: list[float], nq: int,
+                    dim: int, topk: int, *, serial: bool = False,
+                    search_raw: bool = False) -> tuple[bool, int, float, list[int], list[float]]:
+        arr = np.asarray(queries[:nq * dim], dtype=np.float32)
+        req = self._QueryBatchFlatRequest(
+            warm_segment_id=seg_id,
+            top_k=topk,
+            nq=nq,
+            dim=dim,
+            queries_le=arr.tobytes(),
+            serial=serial,
+            search_raw=search_raw,
+        )
+        t0 = time.time()
+        try:
+            resp = self._query(req, timeout=self.timeout)
+        except Exception:
+            return False, -1, (time.time() - t0) * 1000, [], []
+        lat_ms = (time.time() - t0) * 1000
+        total = int(getattr(resp, "nq", nq)) * int(getattr(resp, "top_k", topk))
+        ids = np.frombuffer(resp.ids_le, dtype="<i8", count=total).astype(np.int64, copy=True).tolist()
+        dists = np.frombuffer(resp.distances_le, dtype="<f4", count=total).astype(np.float32, copy=True).tolist()
+        return True, 0, lat_ms, ids, dists
+
+    def query_serial(self, seg_id: str, query: list[float], dim: int,
+                     topk: int) -> tuple[bool, int, int, list[int]]:
+        ok, code, lat_ms, ids, _ = self._query_flat(seg_id, query, 1, dim, topk, serial=False)
+        return ok, code, lat_ms, ids
+
+    def query_serial_batch(self, seg_id: str, queries: list[float], nq: int,
+                           dim: int, topk: int) -> tuple[bool, int, float, list[int], list[float]]:
+        return self._query_flat(seg_id, queries, nq, dim, topk, serial=True)
+
+    def query_batch(self, seg_id: str, queries: list[float], nq: int,
+                    dim: int, topk: int) -> tuple[bool, int, float, list[int], list[float]]:
+        return self._query_flat(seg_id, queries, nq, dim, topk)
+
+    def query_batch_raw(self, seg_id: str, queries: list[float], nq: int,
+                        dim: int, topk: int) -> tuple[bool, int, float, list[int], list[float]]:
+        return self._query_flat(seg_id, queries, nq, dim, topk, search_raw=True)
+
+
 def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type):
     """
     Pure-HTTP Plasmod benchmark — no Go binary, no CGO.
@@ -2025,6 +2225,25 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
     # HNSW build for 1M+ vectors can take many minutes; use a large timeout.
     ingest_timeout = 3600 if idx_type == "hnsw" else 120
     http = _HTTPClient(server_url, timeout=ingest_timeout)
+    query_client = http
+    query_label = "HTTP binary"
+    requested_transport = os.getenv("PLASMOD_BENCH_QUERY_TRANSPORT", "grpc").strip().lower()
+    if requested_transport in {"grpc", "rgpc"}:
+        grpc_target = os.getenv("PLASMOD_GRPC_ADDR", "127.0.0.1:19531").strip()
+        if grpc_target.startswith("0.0.0.0:"):
+            grpc_target = "127.0.0.1:" + grpc_target.split(":", 1)[1]
+        max_msg = _env_int("PLASMOD_GRPC_MAX_MESSAGE_BYTES", 1024 * 1024 * 1024)
+        try:
+            grpc_client = _GRPCFlatQueryClient(grpc_target, timeout=ingest_timeout, max_message_bytes=max_msg)
+            grpc_client.health()
+            query_client = grpc_client
+            query_label = f"gRPC flat ({grpc_target})"
+        except Exception as e:
+            print(f"      [Plasmod query:gRPC] unavailable ({e}); falling back to HTTP binary")
+            query_client = http
+            query_label = "HTTP binary fallback"
+    elif requested_transport not in {"http", "http_binary", "binary"}:
+        print(f"      [Plasmod query] unknown PLASMOD_BENCH_QUERY_TRANSPORT={requested_transport!r}; using HTTP binary")
 
     # IVF params aligned with Milvus baseline:
     #   indexed_n < 10000 → nlist=32, nprobe=4
@@ -2046,19 +2265,20 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
         "flat":     ("IVF_FLAT", _nlist, _nprobe,  0,  0, ""),
     }
     ptype, nlist, nprobe, m, nbits, sq_type = INDEX_TYPE_MAP.get(idx_type, ("HNSW", 0, 0, 0, 0, ""))
-    print(f"      [Plasmod HTTP] index_type={ptype} idx_type={idx_type} nlist={nlist} nprobe={nprobe}")
+    print(f"      [Plasmod build:HTTP binary | query:{query_label}] "
+          f"index_type={ptype} idx_type={idx_type} nlist={nlist} nprobe={nprobe}")
 
     # ── 1. Unload any stale segment ────────────────────────────────────────────
-    print(f"      [Plasmod HTTP] unloading segment={seg_id}")
+    print(f"      [Plasmod build:HTTP binary] unloading segment={seg_id}")
     unload_code, unload_body = http.unload(seg_id)
     unload_body_text = unload_body[:200].decode(errors="replace").strip()
     if unload_code not in (200, 404) and "rc=-1" not in unload_body_text:
-        print(f"      [Plasmod HTTP] unload status={unload_code} body={unload_body[:200].decode(errors='replace').strip()}")
+        print(f"      [Plasmod build:HTTP binary] unload status={unload_code} body={unload_body[:200].decode(errors='replace').strip()}")
 
     # ── 2. Ingest all vectors in a single call ──────────────────────────────────
     # BuildSegment is a full rebuild, not append — splitting into batches would
     # cause the second batch to overwrite the first, leaving only half the data.
-    print(f"      [Plasmod HTTP] ingesting {indexed_n} vectors (dim={dim})")
+    print(f"      [Plasmod build:HTTP binary] ingesting {indexed_n} vectors (dim={dim})")
     t_build = time.time()
     ok, payload_ms, http_ms, ingest_code, ingest_body = http.ingest(
         seg_id, indexed[:indexed_n * dim], indexed_n, dim,
@@ -2067,7 +2287,7 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
     if not ok:
         msg = ingest_body[:1000].decode(errors="replace").strip()
         raise RuntimeError(f"ingest failed: status={ingest_code} body={msg}")
-    print(f"      [Plasmod HTTP]   ingested {indexed_n}/{indexed_n}")
+    print(f"      [Plasmod build:HTTP binary]   ingested {indexed_n}/{indexed_n}")
 
     client_build_ms = (time.time() - t_build) * 1000
     # Use client wall-clock time as the authoritative build metric (server_elapsed_ms
@@ -2079,52 +2299,100 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
         server_build_ms = float(json.loads(ingest_body).get("elapsed_ms", 0.0))
     except Exception:
         pass
-    print(f"      [Plasmod HTTP] build={build_ms/1000:.3f}s "
+    print(f"      [Plasmod build:HTTP binary] build={build_ms/1000:.3f}s "
           f"(payload={payload_ms:.1f}ms http={http_ms:.1f}ms server={server_build_ms:.1f}ms)")
 
     # Warm-up: one request to prime the segment (no register_warm needed)
-    http.query_serial(seg_id, queries[:dim], dim, topk)
+    query_client.query_serial(seg_id, queries[:dim], dim, topk)
 
-    # ── 3. True serial latency: nq individual HTTP requests (nq=1 each) ─────────
-    print(f"      [Plasmod HTTP] serial search {query_n} queries...")
-    serial_latencies = []
-    errors = 0
-    serial_ids = []  # collect IDs from serial queries for recall
-    for i in range(query_n):
-        q_vec = queries[i * dim : (i + 1) * dim]
-        ok, code, lat, ids = http.query_serial(seg_id, q_vec, dim, topk)
-        serial_latencies.append(lat)
-        if ok:
-            serial_ids.extend(ids)
+    # ── 3. Serial latency ─────────────────────────────────────────────────────
+    # Modes:
+    #   hybrid (default): server-side serial for IDs/fallback recall, nq=1 pass
+    #                     for true per-query QPS and p50/p95/p99.
+    #   server:           server-side serial only; optional latency sample pass.
+    #   legacy:           nq individual HTTP requests; QPS and pXX from same pass.
+    serial_mode = os.getenv("PLASMOD_BENCH_SERIAL_MODE", "").strip().lower()
+    if not serial_mode:
+        serial_mode = "legacy" if os.getenv("PLASMOD_BENCH_LEGACY_SERIAL", "0") == "1" else "hybrid"
+    if serial_mode not in {"hybrid", "server", "legacy"}:
+        serial_mode = "hybrid"
+
+    def run_legacy_latency_pass(sample_n: int, collect_ids: bool) -> tuple[float, list[float], int, list[int]]:
+        latencies: list[float] = []
+        ids_out: list[int] = []
+        err_count = 0
+        for i in range(sample_n):
+            q_vec = queries[i * dim : (i + 1) * dim]
+            ok, code, lat, ids = query_client.query_serial(seg_id, q_vec, dim, topk)
+            latencies.append(lat)
+            if collect_ids:
+                if ok:
+                    ids_out.extend(ids)
+                else:
+                    ids_out.extend([-1] * topk)
+            if not ok:
+                err_count += 1
+        return sum(latencies), latencies, err_count, ids_out
+
+    if serial_mode == "legacy":
+        print(f"      [Plasmod query:{query_label}] legacy serial search {query_n} nq=1 requests...")
+        serial_latencies = []
+        serial_ms, serial_latencies, errors, serial_ids = run_legacy_latency_pass(query_n, True)
+        p50, p95, p99 = _percentiles_ms(serial_latencies)
+    else:
+        print(f"      [Plasmod query:{query_label}] server-side serial search {query_n} queries...")
+        ok, code, serial_ms, serial_ids, _ = query_client.query_serial_batch(
+            seg_id, queries, query_n, dim, topk)
+        errors = 0 if ok else query_n
+        if not ok:
+            serial_ids = [-1] * (query_n * topk)
+
+        sample_default = query_n if serial_mode == "hybrid" else min(query_n, 1000)
+        sample_n = min(query_n, _env_int("PLASMOD_BENCH_SERIAL_LATENCY_SAMPLES", sample_default))
+        if sample_n > 0:
+            print(f"      [Plasmod query:{query_label}] nq=1 latency sample {sample_n} queries...")
+            sample_serial_ms, serial_latencies, sample_errors, _ = run_legacy_latency_pass(sample_n, False)
+            errors += sample_errors
+            p50, p95, p99 = _percentiles_ms(serial_latencies)
+            if serial_mode == "hybrid":
+                # Report true nq=1 serial QPS. The server-side serial_batch call
+                # above is intentionally amortized and can use internal batch
+                # fast paths, so it is not comparable with one-shot batch search.
+                serial_ms = (sample_serial_ms / sample_n) * query_n
         else:
-            errors += 1
-            serial_ids.extend([-1] * topk)
-    serial_ms = sum(serial_latencies)
+            mean = serial_ms / query_n if query_n else 0
+            p50 = mean
+            p95 = mean
+            p99 = mean
     serial_qps = query_n / (serial_ms / 1000) if serial_ms > 0 else 0
-    sl = sorted(serial_latencies)
-    p50 = sl[int(len(sl) * 0.50)]
-    p95 = sl[int(len(sl) * 0.95)]
-    p99 = sl[int(len(sl) * 0.99)]
     mean = serial_ms / query_n if query_n else 0
-    print(f"      [Plasmod HTTP] serial done: QPS={serial_qps:.1f} errors={errors} "
+    print(f"      [Plasmod query:{query_label}] serial done: QPS={serial_qps:.1f} errors={errors} "
           f"mean={mean:.3f}ms p50={p50:.3f}ms p95={p95:.3f}ms p99={p99:.3f}ms")
 
     # ── 4. Batch latency: one HTTP request with all queries ─────────────────────
-    print(f"      [Plasmod HTTP] batch search {query_n} queries...")
-    batch_ok, _, batch_ms, batch_ids, _ = http.query_batch(
+    print(f"      [Plasmod query:{query_label}] batch search {query_n} queries...")
+    batch_ok, _, batch_ms, batch_ids, _ = query_client.query_batch(
         seg_id, queries, query_n, dim, topk)
+    if idx_type == "hnsw" and os.getenv("PLASMOD_BENCH_COMPARE_RAW_BATCH", "0") == "1":
+        raw_ok, _, raw_ms, _, _ = query_client.query_batch_raw(seg_id, queries, query_n, dim, topk)
+        if raw_ok:
+            raw_qps = query_n / (raw_ms / 1000) if raw_ms > 0 else 0
+            print(f"      [Plasmod query:{query_label}] raw batch comparison: {raw_ms:.1f}ms QPS={raw_qps:.1f}")
     if batch_ok:
         batch_qps = query_n / (batch_ms / 1000) if batch_ms > 0 else 0
         all_ids = batch_ids
-        print(f"      [Plasmod HTTP] batch done: {batch_ms:.1f}ms QPS={batch_qps:.1f}")
+        print(f"      [Plasmod query:{query_label}] batch done: {batch_ms:.1f}ms QPS={batch_qps:.1f}")
     else:
         batch_ms = 0
         batch_qps = 0
         all_ids = serial_ids  # fall back to serial IDs for recall
-        print(f"      [Plasmod HTTP] batch FAILED, using serial IDs for recall")
+        print(f"      [Plasmod query:{query_label}] batch FAILED, using serial IDs for recall")
 
     # ── 5. Recall ──────────────────────────────────────────────────────────────
     recall = _plasmod_recall(all_ids, indexed, indexed_n, dim, queries, query_n, topk)
+
+    if query_client is not http:
+        query_client.close()
 
     # ── 6. Memory of plasmod process (RSS + mmap'd file sizes) ─────────────────
     mem_val = plasmod_mem_mb()
@@ -2140,6 +2408,23 @@ def benchmark_plasmod(indexed, indexed_n, dim, queries, query_n, topk, idx_type)
         serial_ms=serial_ms, serial_qps=serial_qps,
         p50_ms=p50, p95_ms=p95, p99_ms=p99,
         recall=recall, memory_mb=mem_val,
+        metadata={
+            "build_transport": "http_binary",
+            "query_transport": query_label,
+            "index_type": ptype,
+            "idx_type": idx_type,
+            "serial_mode": serial_mode,
+            "serial_qps_source": "nq1_latency_pass" if serial_mode == "hybrid" else serial_mode,
+            "nlist": nlist,
+            "nprobe": nprobe,
+            "pq_m": m,
+            "pq_nbits": nbits,
+            "sq_type": sq_type,
+            "ivf_batch_direct": os.getenv("PLASMOD_IVF_BATCH_DIRECT", "auto"),
+            "ivf_flat_list_major_batch": os.getenv("PLASMOD_IVF_FLAT_LIST_MAJOR_BATCH", "1"),
+            "hnsw_batch_direct": os.getenv("PLASMOD_HNSW_BATCH_DIRECT", "1"),
+            "grpc_max_message_bytes": os.getenv("PLASMOD_GRPC_MAX_MESSAGE_BYTES", str(1024 * 1024 * 1024)),
+        },
     )
 
 
