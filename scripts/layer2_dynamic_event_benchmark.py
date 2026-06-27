@@ -715,9 +715,10 @@ class QueryResult:
 
 
 class HTTPJSONClient:
-    def __init__(self, base_url: str, timeout: float = 30.0):
+    def __init__(self, base_url: str, timeout: float = 30.0, retries: int = 3):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.retries = max(0, retries)
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         url = self.base_url + path
@@ -726,13 +727,23 @@ class HTTPJSONClient:
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read()
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"{method} {path} failed: HTTP {exc.code}: {detail}") from exc
+        last_error: BaseException | None = None
+        for attempt in range(self.retries + 1):
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read()
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"{method} {path} failed: HTTP {exc.code}: {detail}") from exc
+            except (TimeoutError, urllib.error.URLError, OSError) as exc:
+                last_error = exc
+                if attempt >= self.retries:
+                    raise
+                time.sleep(min(0.25 * (2 ** attempt), 2.0))
+        else:
+            raise RuntimeError(f"{method} {path} failed: {last_error}")
         if not raw:
             return {}
         try:
