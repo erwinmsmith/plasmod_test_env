@@ -826,6 +826,13 @@ def milvus_string_list(values: list[str]) -> str:
     return "[" + ", ".join(f'"{milvus_escape(v)}"' for v in values) + "]"
 
 
+def truncate_utf8(value: str, max_bytes: int) -> str:
+    raw = (value or "").encode("utf-8")
+    if len(raw) <= max_bytes:
+        return value or ""
+    return raw[:max_bytes].decode("utf-8", errors="ignore")
+
+
 def milvus_hit_entity(hit: Any) -> dict[str, Any]:
     if isinstance(hit, dict):
         entity = hit.get("entity")
@@ -928,19 +935,19 @@ class MilvusAdapter(SystemAdapter):
         oid = object_id(ev)
         payload_json = json.dumps(ev, ensure_ascii=False, sort_keys=True)
         return {
-            "pk": (eid or oid or hashlib.sha1(payload_json.encode("utf-8")).hexdigest())[:256],
+            "pk": truncate_utf8(eid or oid or hashlib.sha1(payload_json.encode("utf-8")).hexdigest(), 256),
             "vector": vector,
-            "event_id": eid[:512],
-            "object_id": oid[:512],
-            "session_id": session_id(ev)[:512],
-            "agent_id": agent_id(ev)[:256],
-            "workspace_id": workspace_id(ev)[:256],
-            "tenant_id": tenant_id(ev)[:256],
-            "event_type": event_type(ev)[:128],
-            "object_type": object_type(ev)[:128],
+            "event_id": truncate_utf8(eid, 512),
+            "object_id": truncate_utf8(oid, 512),
+            "session_id": truncate_utf8(session_id(ev), 512),
+            "agent_id": truncate_utf8(agent_id(ev), 256),
+            "workspace_id": truncate_utf8(workspace_id(ev), 256),
+            "tenant_id": truncate_utf8(tenant_id(ev), 256),
+            "event_type": truncate_utf8(event_type(ev), 128),
+            "object_type": truncate_utf8(object_type(ev), 128),
             "version": int(event_version(ev)),
-            "text": payload_text(ev)[:8192],
-            "payload_json": payload_json[:65535],
+            "text": truncate_utf8(payload_text(ev), 8192),
+            "payload_json": truncate_utf8(payload_json, 65535),
         }
 
     def ingest(self, ev: dict[str, Any]) -> IngestResult:
