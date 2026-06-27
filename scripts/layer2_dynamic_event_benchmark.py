@@ -250,6 +250,47 @@ class MiniLMEmbedder:
         return pooled.astype("float32").tolist()
 
 
+class HashEmbedder:
+    """Deterministic vectors for Layer 2 visibility experiments.
+
+    The dynamic-event tables query by agent object ids, not ANN semantic recall.
+    This embedder keeps Milvus' vector schema realistic without charging MiniLM
+    inference to the database write path.
+    """
+
+    def embed_one(self, text: str) -> list[float]:
+        return self.embed_many([text])[0]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        import numpy as np
+
+        vectors: list[list[float]] = []
+        for text in texts:
+            seed = (text or "").encode("utf-8")
+            raw = bytearray()
+            counter = 0
+            while len(raw) < EMBEDDING_DIM * 4:
+                raw.extend(hashlib.sha256(seed + counter.to_bytes(4, "little")).digest())
+                counter += 1
+            ints = np.frombuffer(bytes(raw[: EMBEDDING_DIM * 4]), dtype=np.uint32).astype(np.float32)
+            vec = (ints / np.float32(4294967295.0)) * np.float32(2.0) - np.float32(1.0)
+            norm = float(np.linalg.norm(vec))
+            if norm > 0:
+                vec = vec / np.float32(norm)
+            vectors.append(vec.astype("float32").tolist())
+        return vectors
+
+    def prewarm_texts(self, texts: Iterable[str]) -> dict[str, Any]:
+        unique = len([text for text in dict.fromkeys((t or "") for t in texts) if text])
+        return {
+            "embedding_provider": "hash",
+            "texts": unique,
+            "new_embeddings": 0,
+            "cached_embeddings": 0,
+            "elapsed_s": 0.0,
+        }
+
+
 def embedding_model_signature(model_path: Path, vocab_path: Path) -> str:
     h = hashlib.sha256()
     for path in [model_path, vocab_path]:
@@ -1219,13 +1260,19 @@ def make_adapter(
     embedder_vocab: Path = DEFAULT_EMBEDDER_VOCAB,
     embedding_cache: Path | None = DEFAULT_EMBEDDING_CACHE,
     embedding_batch_size: int = 64,
+    embedding_provider: str = "minilm",
     milvus_visibility_policy: str = "flush_on_ack",
 ) -> SystemAdapter:
     if system == "plasmod":
         return PlasmodAdapter(base_url, timeout=timeout)
     if system in {"milvus", "vector_metadata", "baseline"}:
-        embedder = MiniLMEmbedder(embedder_model, embedder_vocab)
-        if embedding_cache is not None:
+        if embedding_provider == "hash":
+            embedder = HashEmbedder()
+        elif embedding_provider == "minilm":
+            embedder = MiniLMEmbedder(embedder_model, embedder_vocab)
+        else:
+            raise ValueError(f"unknown embedding provider: {embedding_provider}")
+        if embedding_provider == "minilm" and embedding_cache is not None:
             embedder = CachedEmbedder(
                 embedder,
                 embedding_cache,
@@ -1568,6 +1615,7 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedder_vocab,
             embedding_cache_arg(args),
             args.embedding_batch_size,
+            args.embedding_provider,
             args.milvus_visibility_policy,
         )
         if system == "plasmod":
@@ -1684,6 +1732,7 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedder_vocab,
             embedding_cache_arg(args),
             args.embedding_batch_size,
+            args.embedding_provider,
             args.milvus_visibility_policy,
         )
         if system == "plasmod":
@@ -1799,6 +1848,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedder_vocab,
             embedding_cache_arg(args),
             args.embedding_batch_size,
+            args.embedding_provider,
             args.milvus_visibility_policy,
         )
         run_id = f"{args.run_id}_t6_milvus_best_effort"
@@ -1926,6 +1976,7 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedder_vocab,
             embedding_cache_arg(args),
             args.embedding_batch_size,
+            args.embedding_provider,
             args.milvus_visibility_policy,
         )
         prewarm_adapter_embeddings(baseline, events)
@@ -2006,6 +2057,7 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedder_vocab,
             embedding_cache_arg(args),
             args.embedding_batch_size,
+            args.embedding_provider,
             args.milvus_visibility_policy,
         )
         if system == "plasmod":
@@ -2084,13 +2136,18 @@ def run_prepare_embeddings(args: argparse.Namespace) -> None:
     )
     texts = [payload_text(ev) for ev in synthetic]
     texts.extend(payload_text(ev) for ev in replay)
-    embedder = CachedEmbedder(
-        MiniLMEmbedder(args.embedder_model, args.embedder_vocab),
-        args.embedding_cache,
-        args.embedder_model,
-        args.embedder_vocab,
-        batch_size=args.embedding_batch_size,
-    )
+    if args.embedding_provider == "hash":
+        embedder = HashEmbedder()
+    elif args.embedding_provider == "minilm":
+        embedder = CachedEmbedder(
+            MiniLMEmbedder(args.embedder_model, args.embedder_vocab),
+            args.embedding_cache,
+            args.embedder_model,
+            args.embedder_vocab,
+            batch_size=args.embedding_batch_size,
+        )
+    else:
+        raise ValueError(f"unknown embedding provider: {args.embedding_provider}")
     summary = embedder.prewarm_texts(texts)
     summary.update({
         "synthetic_events": len(synthetic),
@@ -2167,6 +2224,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     def add_embedding_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("--embedder-model", type=Path, default=DEFAULT_EMBEDDER_MODEL)
         p.add_argument("--embedder-vocab", type=Path, default=DEFAULT_EMBEDDER_VOCAB)
+        p.add_argument(
+            "--embedding-provider",
+            choices=["minilm", "hash"],
+            default="minilm",
+            help="Milvus vector source. minilm uses cached ONNX embeddings; hash uses deterministic vectors for Layer 2 object-visibility experiments.",
+        )
         p.add_argument("--embedding-cache", type=Path, default=DEFAULT_EMBEDDING_CACHE)
         p.add_argument("--embedding-batch-size", type=int, default=64)
         p.add_argument("--no-embedding-cache", action="store_true", help="Disable reusable embedding cache; useful only for debugging.")
