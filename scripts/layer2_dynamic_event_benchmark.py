@@ -624,6 +624,7 @@ class QuerySpec:
     workspace_id: str
     tenant_id: str
     object_types: list[str]
+    target_object_ids: set[str]
     expected_ids: set[str]
     expected_version: int
     source_event_type: str
@@ -792,6 +793,7 @@ class PlasmodAdapter(SystemAdapter):
             "tenant_id": q.tenant_id,
             "top_k": top_k,
             "object_types": q.object_types,
+            "target_object_ids": sorted(q.target_object_ids),
             "response_mode": "objects_only",
         }
         body = {k: v for k, v in body.items() if v not in ("", [], None)}
@@ -982,18 +984,30 @@ class MilvusAdapter(SystemAdapter):
             if q.object_types:
                 values = milvus_string_list(q.object_types)
                 clauses.append(f"(object_type in {values} or event_type in {values})")
+            if q.target_object_ids:
+                target_values = milvus_string_list(sorted(q.target_object_ids))
+                clauses.append(f"(event_id in {target_values} or object_id in {target_values} or pk in {target_values})")
             expr = " and ".join(clauses) if clauses else ""
-            vector = self.embedder.embed_one(q.query_text or "latest")
             with self.mu:
-                rows = self.client.search(
-                    self.collection_name,
-                    [vector],
-                    limit=10,
-                    filter=expr,
-                    output_fields=["event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
-                    search_params={"ef": 64},
-                    timeout=self.timeout,
-                )
+                if q.target_object_ids:
+                    rows = self.client.query(
+                        self.collection_name,
+                        filter=expr,
+                        output_fields=["pk", "event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
+                        timeout=self.timeout,
+                    )
+                    rows = [rows]
+                else:
+                    vector = self.embedder.embed_one(q.query_text or "latest")
+                    rows = self.client.search(
+                        self.collection_name,
+                        [vector],
+                        limit=10,
+                        filter=expr,
+                        output_fields=["event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
+                        search_params={"ef": 64},
+                        timeout=self.timeout,
+                    )
             ids: set[str] = set()
             objects: list[dict[str, Any]] = []
             for hit in rows[0] if rows else []:
@@ -1246,6 +1260,7 @@ def query_for_event(ev: dict[str, Any], run_id: str, query_id: str) -> QuerySpec
         "observation": ["event", "memory"],
     }.get(et, [ot] if ot else [])
     expected = {event_id(ev), object_id(ev)}
+    expected = {x for x in expected if x}
     return QuerySpec(
         query_id=query_id,
         query_type=qtype,
@@ -1255,7 +1270,8 @@ def query_for_event(ev: dict[str, Any], run_id: str, query_id: str) -> QuerySpec
         workspace_id=workspace_id(ev),
         tenant_id=tenant_id(ev),
         object_types=[x for x in object_types if x],
-        expected_ids={x for x in expected if x},
+        target_object_ids=set(expected),
+        expected_ids=set(expected),
         expected_version=event_version(ev),
         source_event_type=et,
     )
@@ -1299,6 +1315,7 @@ def wait_until_visible(
 ) -> QueryResult:
     query = query_for_event(ev, run_id, "visibility_" + (ingest_result.event_id or "unknown"))
     query.expected_ids |= ingest_result.expected_ids
+    query.target_object_ids |= ingest_result.expected_ids
     deadline = now_ms() + timeout_ms
     last: QueryResult | None = None
     while now_ms() <= deadline:
@@ -1513,6 +1530,7 @@ def run_freshness_trial(
                 ev, res = item
                 q = query_for_event(ev, run_id, f"q_{idx}")
                 q.expected_ids |= res.expected_ids
+                q.target_object_ids |= res.expected_ids
                 qr, _ = adapter.query(q)
                 if qr.ok and qr.visible and res.first_visible_ms is None:
                     t = now_ms()
@@ -1840,6 +1858,7 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 continue
             q = query_for_event(ev, run_id, "state_correctness_" + (event_id(ev) or object_id(ev)))
             q.expected_ids |= res.expected_ids
+            q.target_object_ids |= res.expected_ids
             qr, _ = adapter.query(q)
             queries.append(qr)
         correct = sum(1 for q in queries if q.visible)
