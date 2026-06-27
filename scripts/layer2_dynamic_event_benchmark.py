@@ -18,13 +18,13 @@ black-box service through the public HTTP API.
 from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import hashlib
 import json
 import os
 import random
 import re
+import shutil
 import sqlite3
 import statistics
 import sys
@@ -457,6 +457,21 @@ def set_path(doc: dict[str, Any], path: str, value: Any) -> None:
     cur[parts[-1]] = value
 
 
+def set_path_copy(doc: dict[str, Any], path: str, value: Any) -> dict[str, Any]:
+    copied = dict(doc)
+    cur_dst: dict[str, Any] = copied
+    cur_src: Any = doc
+    parts = path.split(".")
+    for part in parts[:-1]:
+        src_child = cur_src.get(part) if isinstance(cur_src, dict) else None
+        dst_child = dict(src_child) if isinstance(src_child, dict) else {}
+        cur_dst[part] = dst_child
+        cur_dst = dst_child
+        cur_src = src_child
+    cur_dst[parts[-1]] = value
+    return copied
+
+
 def event_type(doc: dict[str, Any]) -> str:
     value = get_path(doc, "event.event_type") or doc.get("event_type") or get_path(doc, "event.eventType")
     value = str(value or "").strip()
@@ -575,6 +590,90 @@ def list_jsonl_inputs(path: Path) -> list[Path]:
     return sorted(p for p in path.rglob("*.jsonl") if p.is_file())
 
 
+def event_type_cache_dir(input_path: Path) -> Path:
+    resolved = str(input_path.resolve())
+    digest = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:16]
+    return OUT / "event_type_cache" / digest
+
+
+def event_type_cache_fingerprint(input_path: Path, files: list[Path]) -> dict[str, Any]:
+    total_size = 0
+    newest_mtime_ns = 0
+    for p in files:
+        st = p.stat()
+        total_size += st.st_size
+        newest_mtime_ns = max(newest_mtime_ns, st.st_mtime_ns)
+    return {
+        "input_path": str(input_path.resolve()),
+        "file_count": len(files),
+        "total_size": total_size,
+        "newest_mtime_ns": newest_mtime_ns,
+    }
+
+
+def ensure_event_type_cache(input_path: Path, files: list[Path]) -> Path:
+    cache_dir = event_type_cache_dir(input_path)
+    manifest_path = cache_dir / "manifest.json"
+    fingerprint = event_type_cache_fingerprint(input_path, files)
+    if manifest_path.exists():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            if manifest.get("fingerprint") == fingerprint:
+                return cache_dir
+        except Exception:
+            pass
+
+    tmp_dir = cache_dir.with_name(cache_dir.name + ".tmp")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    handles: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    started = time.perf_counter()
+    next_progress = started + 30.0
+    scanned = 0
+    try:
+        for path in files:
+            for ev in iter_jsonl(path):
+                scanned += 1
+                et = event_type(ev) or "unknown"
+                safe_et = sanitize_collection_name(et)
+                handle = handles.get(safe_et)
+                if handle is None:
+                    handle = (tmp_dir / f"{safe_et}.jsonl").open("w", encoding="utf-8")
+                    handles[safe_et] = handle
+                handle.write(json.dumps(ev, ensure_ascii=False, sort_keys=True))
+                handle.write("\n")
+                counts[et] = counts.get(et, 0) + 1
+                now = time.perf_counter()
+                if now >= next_progress:
+                    elapsed = max(now - started, 1e-9)
+                    print(
+                        f"[cache] indexed {scanned} events from {len(files)} files "
+                        f"({scanned / elapsed:.1f} events/s)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    next_progress = now + 30.0
+        for handle in handles.values():
+            handle.close()
+        handles.clear()
+        write_json(tmp_dir / "manifest.json", {"fingerprint": fingerprint, "counts": counts})
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+        tmp_dir.rename(cache_dir)
+        print(
+            f"[cache] built event-type cache at {cache_dir} counts={counts}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return cache_dir
+    finally:
+        for handle in handles.values():
+            handle.close()
+
+
 def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, 1):
@@ -600,6 +699,14 @@ def load_events(
     files = list_jsonl_inputs(input_path)
     if max_files > 0:
         files = files[:max_files]
+    if input_path.is_dir() and event_types and len(event_types) == 1 and max_files == 0:
+        cache_dir = ensure_event_type_cache(input_path, files)
+        only_type = next(iter(event_types))
+        cache_file = cache_dir / f"{sanitize_collection_name(only_type)}.jsonl"
+        if not cache_file.exists():
+            return []
+        files = [cache_file]
+        event_types = None
     out: list[dict[str, Any]] = []
     for path in files:
         for ev in iter_jsonl(path):
@@ -617,6 +724,52 @@ def load_events(
     return out
 
 
+def iter_events(
+    input_path: Path,
+    limit: int = 0,
+    event_types: set[str] | None = None,
+    max_files: int = 0,
+) -> Iterable[dict[str, Any]]:
+    files = list_jsonl_inputs(input_path)
+    if max_files > 0:
+        files = files[:max_files]
+    if input_path.is_dir() and event_types and len(event_types) == 1 and max_files == 0:
+        cache_dir = ensure_event_type_cache(input_path, files)
+        only_type = next(iter(event_types))
+        cache_file = cache_dir / f"{sanitize_collection_name(only_type)}.jsonl"
+        files = [cache_file] if cache_file.exists() else []
+        event_types = None
+    emitted = 0
+    for path in files:
+        for ev in iter_jsonl(path):
+            et = event_type(ev)
+            if event_types and et not in event_types:
+                continue
+            yield ev
+            emitted += 1
+            if limit > 0 and emitted >= limit:
+                return
+
+
+def count_events(
+    input_path: Path,
+    limit: int = 0,
+    event_types: set[str] | None = None,
+    max_files: int = 0,
+) -> int:
+    if input_path.is_dir() and event_types and len(event_types) == 1 and max_files == 0:
+        files = list_jsonl_inputs(input_path)
+        cache_dir = ensure_event_type_cache(input_path, files)
+        manifest_path = cache_dir / "manifest.json"
+        if manifest_path.exists():
+            with manifest_path.open("r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            counts = manifest.get("counts") or {}
+            total = int(counts.get(next(iter(event_types)), 0))
+            return min(total, limit) if limit > 0 else total
+    return sum(1 for _ in iter_events(input_path, limit=limit, event_types=event_types, max_files=max_files))
+
+
 def prefix_string(value: Any, run_id: str) -> Any:
     if not isinstance(value, str) or not value:
         return value
@@ -626,7 +779,7 @@ def prefix_string(value: Any, run_id: str) -> Any:
 
 
 def namespace_event(ev: dict[str, Any], run_id: str, mode: str | None = None) -> dict[str, Any]:
-    doc = copy.deepcopy(ev)
+    doc = dict(ev)
     for path in [
         "identity.event_id",
         "object.object_id",
@@ -637,21 +790,21 @@ def namespace_event(ev: dict[str, Any], run_id: str, mode: str | None = None) ->
     ]:
         value = get_path(doc, path)
         if isinstance(value, str) and value:
-            set_path(doc, path, prefix_string(value, run_id))
+            doc = set_path_copy(doc, path, prefix_string(value, run_id))
 
     for path in ["causality.causal_refs", "causality.provenance_refs", "causality.source_object_ids", "causality.target_object_ids", "materialization.planned_object_ids"]:
         value = get_path(doc, path)
         if isinstance(value, list):
-            set_path(doc, path, [prefix_string(v, run_id) if isinstance(v, str) else v for v in value])
+            doc = set_path_copy(doc, path, [prefix_string(v, run_id) if isinstance(v, str) else v for v in value])
 
     for path in ["actor.session_id", "retrieval.retrieval_namespace", "identity.import_batch_id"]:
         value = get_path(doc, path)
         if isinstance(value, str) and value:
-            set_path(doc, path, prefix_string(value, run_id))
+            doc = set_path_copy(doc, path, prefix_string(value, run_id))
 
     if mode:
-        set_path(doc, "access.consistency", mode)
-    set_path(doc, "runtime.t_write_start_ms", wall_ms())
+        doc = set_path_copy(doc, "access.consistency", mode)
+    doc = set_path_copy(doc, "runtime.t_write_start_ms", wall_ms())
     return doc
 
 
@@ -1356,21 +1509,61 @@ def query_for_event(ev: dict[str, Any], run_id: str, query_id: str) -> QuerySpec
 
 def ingest_with_rate(
     adapter: SystemAdapter,
-    events: list[dict[str, Any]],
+    events: Iterable[dict[str, Any]],
     rate_eps: float,
     workers: int,
     on_complete: Callable[[dict[str, Any], IngestResult], None] | None = None,
+    progress_label: str = "",
+    total_events: int | None = None,
 ) -> list[IngestResult]:
-    if not events:
-        return []
+    if total_events is None:
+        try:
+            total_events = len(events)  # type: ignore[arg-type]
+        except TypeError:
+            total_events = None
     interval = 0.0 if rate_eps <= 0 else 1.0 / rate_eps
     start = time.perf_counter()
-    futures: list[tuple[dict[str, Any], Future[IngestResult]]] = []
+    pending: list[tuple[int, dict[str, Any], Future[IngestResult]]] = []
+    results: list[IngestResult | None] = [None] * total_events if total_events is not None else []
+    unordered_results: dict[int, IngestResult] = {}
     effective_workers = max(1, workers)
     if adapter.name == "Milvus" and getattr(adapter, "visibility_policy", "") == "flush_on_ack":
         effective_workers = 1
+    max_pending = max(effective_workers * 8, effective_workers)
+    completed = 0
+    submitted = 0
+    next_progress = start + 30.0
+
+    def collect_one(block: bool = True) -> bool:
+        nonlocal completed, next_progress
+        if not pending:
+            return False
+        idx, _ev, fut = pending[0]
+        if not block and not fut.done():
+            return False
+        pending.pop(0)
+        res = fut.result()
+        if total_events is not None:
+            results[idx] = res
+        else:
+            unordered_results[idx] = res
+        completed += 1
+        now = time.perf_counter()
+        if progress_label and now >= next_progress:
+            elapsed = max(now - start, 1e-9)
+            denominator = str(total_events) if total_events is not None else str(submitted)
+            print(
+                f"[progress] {progress_label}: {completed}/{denominator} ingests completed "
+                f"({completed / elapsed:.1f} events/s observed)",
+                file=sys.stderr,
+                flush=True,
+            )
+            next_progress = now + 30.0
+        return True
+
     with ThreadPoolExecutor(max_workers=effective_workers) as pool:
         for idx, ev in enumerate(events):
+            submitted = idx + 1
             target = start + idx * interval
             delay = target - time.perf_counter()
             if delay > 0:
@@ -1378,22 +1571,25 @@ def ingest_with_rate(
             fut = pool.submit(adapter.ingest, ev)
             if on_complete is not None:
                 fut.add_done_callback(lambda done, event=ev: on_complete(event, done.result()))
-            futures.append((ev, fut))
-        results: list[IngestResult] = []
-        for _, fut in futures:
-            res = fut.result()
-            results.append(res)
-    return results
+            pending.append((idx, ev, fut))
+            while len(pending) >= max_pending:
+                collect_one(block=True)
+        while pending:
+            collect_one(block=True)
+    if total_events is not None:
+        return [r for r in results[:submitted] if r is not None]
+    return [unordered_results[idx] for idx in sorted(unordered_results)]
 
 
 def ingest_with_visibility_probe(
     adapter: SystemAdapter,
-    events: list[dict[str, Any]],
+    events: Iterable[dict[str, Any]],
     run_id: str,
     rate_eps: float,
     workers: int,
     timeout_ms: float,
     poll_ms: float,
+    total_events: int | None = None,
 ) -> tuple[list[IngestResult], list[QueryResult]]:
     visibility_futures: list[Future[QueryResult]] = []
     visibility_mu = threading.Lock()
@@ -1408,7 +1604,15 @@ def ingest_with_visibility_probe(
             )
 
     try:
-        ingests = ingest_with_rate(adapter, events, rate_eps, workers, on_complete=on_complete)
+        ingests = ingest_with_rate(
+            adapter,
+            events,
+            rate_eps,
+            workers,
+            on_complete=on_complete,
+            progress_label=f"{run_id}/{adapter.name}",
+            total_events=total_events,
+        )
         with visibility_mu:
             pending = list(visibility_futures)
         queries = [future.result() for future in pending]
@@ -1633,10 +1837,29 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             adapter.health()
         types = TABLE4_PLASMOD_TYPES if system == "plasmod" else TABLE4_BASELINE_TYPES
         for et in types:
-            raw = load_events(args.synthetic_input, limit=args.events_per_type, event_types={et}, shuffle=args.shuffle, seed=args.seed)
             run_id = f"{args.run_id}_t4_{system}_{et}"
-            events = [namespace_event(ev, run_id) for ev in raw]
-            prewarm_adapter_embeddings(adapter, events)
+            event_count = count_events(args.synthetic_input, limit=args.events_per_type, event_types={et})
+            print(
+                f"[table4] start system={system} event_type={et} events={event_count}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if args.shuffle:
+                raw = load_events(
+                    args.synthetic_input,
+                    limit=args.events_per_type,
+                    event_types={et},
+                    shuffle=args.shuffle,
+                    seed=args.seed,
+                )
+                events: Iterable[dict[str, Any]] = [namespace_event(ev, run_id) for ev in raw]
+            else:
+                events = (
+                    namespace_event(ev, run_id)
+                    for ev in iter_events(args.synthetic_input, limit=args.events_per_type, event_types={et})
+                )
+            if args.shuffle:
+                prewarm_adapter_embeddings(adapter, events)  # type: ignore[arg-type]
             if args.reset_between_runs:
                 adapter.reset()
             ingests, queries = ingest_with_visibility_probe(
@@ -1647,11 +1870,21 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 args.workers,
                 args.visible_timeout_ms,
                 args.visible_poll_ms,
+                total_events=event_count,
             )
             validate_measurements_or_raise(args, "table4", f"{system}/{et}", ingests, queries)
             row = summarize_ingests(adapter.name, et.replace("state_update", "state"), ingests, queries)
             row.update({"table": "table4", "event_type": et.replace("state_update", "state")})
             rows.append(row)
+            write_csv(run_dir / "table4_event_ingestion_visibility.csv", rows)
+            print(
+                f"[table4] done system={system} event_type={et} "
+                f"write_p95_ms={row['write_p95_ms']:.3f} "
+                f"w2v_p95_ms={row['write_to_visible_p95_ms']:.3f} "
+                f"timeouts={row['visibility_timeouts']} errors={row['write_errors']}",
+                file=sys.stderr,
+                flush=True,
+            )
         adapter.close()
     write_csv(run_dir / "table4_event_ingestion_visibility.csv", rows)
     return rows
