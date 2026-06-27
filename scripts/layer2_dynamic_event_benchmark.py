@@ -1295,13 +1295,14 @@ def ingest_with_rate(
             delay = target - time.perf_counter()
             if delay > 0:
                 time.sleep(delay)
-            futures.append((ev, pool.submit(adapter.ingest, ev)))
+            fut = pool.submit(adapter.ingest, ev)
+            if on_complete is not None:
+                fut.add_done_callback(lambda done, event=ev: on_complete(event, done.result()))
+            futures.append((ev, fut))
         results: list[IngestResult] = []
-        for ev, fut in futures:
+        for _, fut in futures:
             res = fut.result()
             results.append(res)
-            if on_complete is not None:
-                on_complete(ev, res)
     return results
 
 
@@ -1505,17 +1506,26 @@ def run_freshness_trial(
     query_qps: float,
     workers: int,
     query_limit: int,
+    visible_timeout_ms: float,
+    visible_poll_ms: float,
 ) -> tuple[list[IngestResult], list[QueryResult], float]:
     completed: list[tuple[dict[str, Any], IngestResult]] = []
     completed_mu = threading.Lock()
     stop = threading.Event()
     query_results: list[QueryResult] = []
     q_interval = 0.0 if query_qps <= 0 else 1.0 / query_qps
+    visibility_futures: list[Future[QueryResult]] = []
+    visibility_mu = threading.Lock()
+    visibility_pool = ThreadPoolExecutor(max_workers=max(1, workers))
 
     def on_complete(ev: dict[str, Any], res: IngestResult) -> None:
         if res.ok:
             with completed_mu:
                 completed.append((ev, res))
+            with visibility_mu:
+                visibility_futures.append(
+                    visibility_pool.submit(wait_until_visible, adapter, ev, res, run_id, visible_timeout_ms, visible_poll_ms)
+                )
 
     def query_loop() -> None:
         idx = 0
@@ -1549,6 +1559,11 @@ def run_freshness_trial(
     ingests = ingest_with_rate(adapter, events, write_rate, workers, on_complete=on_complete)
     stop.set()
     qt.join(timeout=30)
+    with visibility_mu:
+        pending_visibility = list(visibility_futures)
+    for fut in pending_visibility:
+        fut.result()
+    visibility_pool.shutdown(wait=True)
     elapsed_s = max((now_ms() - t0) / 1000.0, 1e-9)
     return ingests, query_results, elapsed_s
 
@@ -1576,7 +1591,17 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             prewarm_adapter_embeddings(adapter, events)
             if args.reset_between_runs:
                 adapter.reset()
-            ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, rate, args.query_qps, args.workers, args.query_limit)
+            ingests, queries, elapsed_s = run_freshness_trial(
+                adapter,
+                events,
+                run_id,
+                rate,
+                args.query_qps,
+                args.workers,
+                args.query_limit,
+                args.visible_timeout_ms,
+                args.visible_poll_ms,
+            )
             fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
             ingest_row = summarize_ingests(adapter.name, str(rate), ingests, queries)
             query_row = summarize_queries(adapter.name, str(rate), queries)
@@ -1621,7 +1646,17 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             events = [namespace_event(ev, run_id, PLASMOD_MODES[mode]) for ev in raw]
             if args.reset_between_runs:
                 adapter.reset()
-            ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, args.fixed_write_rate, args.query_qps, args.workers, args.query_limit)
+            ingests, queries, elapsed_s = run_freshness_trial(
+                adapter,
+                events,
+                run_id,
+                args.fixed_write_rate,
+                args.query_qps,
+                args.workers,
+                args.query_limit,
+                args.visible_timeout_ms,
+                args.visible_poll_ms,
+            )
             fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
             qrow = summarize_queries(adapter.name, mode, queries)
             irow = summarize_ingests(adapter.name, mode, ingests, queries)
@@ -1664,7 +1699,17 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
         prewarm_adapter_embeddings(adapter, events)
         if args.reset_between_runs:
             adapter.reset()
-        ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, args.fixed_write_rate, args.query_qps, args.workers, args.query_limit)
+        ingests, queries, elapsed_s = run_freshness_trial(
+            adapter,
+            events,
+            run_id,
+            args.fixed_write_rate,
+            args.query_qps,
+            args.workers,
+            args.query_limit,
+            args.visible_timeout_ms,
+            args.visible_poll_ms,
+        )
         fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
         qrow = summarize_queries(adapter.name, "best_effort", queries)
         irow = summarize_ingests(adapter.name, "best_effort", ingests, queries)
