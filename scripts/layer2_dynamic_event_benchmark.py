@@ -1306,6 +1306,37 @@ def ingest_with_rate(
     return results
 
 
+def ingest_with_visibility_probe(
+    adapter: SystemAdapter,
+    events: list[dict[str, Any]],
+    run_id: str,
+    rate_eps: float,
+    workers: int,
+    timeout_ms: float,
+    poll_ms: float,
+) -> tuple[list[IngestResult], list[QueryResult]]:
+    visibility_futures: list[Future[QueryResult]] = []
+    visibility_mu = threading.Lock()
+    visibility_pool = ThreadPoolExecutor(max_workers=max(1, workers))
+
+    def on_complete(ev: dict[str, Any], res: IngestResult) -> None:
+        if not res.ok:
+            return
+        with visibility_mu:
+            visibility_futures.append(
+                visibility_pool.submit(wait_until_visible, adapter, ev, res, run_id, timeout_ms, poll_ms)
+            )
+
+    try:
+        ingests = ingest_with_rate(adapter, events, rate_eps, workers, on_complete=on_complete)
+        with visibility_mu:
+            pending = list(visibility_futures)
+        queries = [future.result() for future in pending]
+        return ingests, queries
+    finally:
+        visibility_pool.shutdown(wait=True)
+
+
 def wait_until_visible(
     adapter: SystemAdapter,
     ev: dict[str, Any],
@@ -1338,6 +1369,31 @@ def wait_until_visible(
     if last is None:
         last = QueryResult(adapter.name, query.query_type, 0.0, False, False, True, "visibility timeout")
     return last
+
+
+def validate_measurements_or_raise(
+    args: argparse.Namespace,
+    table: str,
+    context: str,
+    ingests: list[IngestResult],
+    queries: list[QueryResult] | None = None,
+) -> None:
+    failed_ingests = [r for r in ingests if not r.ok]
+    if failed_ingests and not args.allow_write_errors:
+        first = failed_ingests[0]
+        raise RuntimeError(f"{table} {context}: write failed for event_id={first.event_id}: {first.error}")
+    if queries is not None:
+        failed_queries = [q for q in queries if not q.ok]
+        if failed_queries and not args.allow_query_errors:
+            first_q = failed_queries[0]
+            raise RuntimeError(f"{table} {context}: query failed type={first_q.query_type}: {first_q.error}")
+    visibility_timeouts = [r for r in ingests if r.visibility_censored]
+    if visibility_timeouts and not args.allow_visibility_timeouts:
+        first = visibility_timeouts[0]
+        raise RuntimeError(
+            f"{table} {context}: visibility timeout for event_id={first.event_id}; "
+            "increase --visible-timeout-ms only if timeout-censored metrics are intentional"
+        )
 
 
 def wait_for_visible_batch(
@@ -1488,8 +1544,16 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             prewarm_adapter_embeddings(adapter, events)
             if args.reset_between_runs:
                 adapter.reset()
-            ingests = ingest_with_rate(adapter, events, args.write_rate, args.workers)
-            queries = wait_for_visible_batch(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
+            ingests, queries = ingest_with_visibility_probe(
+                adapter,
+                events,
+                run_id,
+                args.write_rate,
+                args.workers,
+                args.visible_timeout_ms,
+                args.visible_poll_ms,
+            )
+            validate_measurements_or_raise(args, "table4", f"{system}/{et}", ingests, queries)
             row = summarize_ingests(adapter.name, et.replace("state_update", "state"), ingests, queries)
             row.update({"table": "table4", "event_type": et.replace("state_update", "state")})
             rows.append(row)
@@ -1603,6 +1667,7 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 args.visible_poll_ms,
             )
             fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
+            validate_measurements_or_raise(args, "table5", f"{system}/rate={rate}", ingests, queries)
             ingest_row = summarize_ingests(adapter.name, str(rate), ingests, queries)
             query_row = summarize_queries(adapter.name, str(rate), queries)
             row = {
@@ -1658,6 +1723,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 args.visible_poll_ms,
             )
             fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
+            validate_measurements_or_raise(args, "table6", f"plasmod/{mode}", ingests, queries)
             qrow = summarize_queries(adapter.name, mode, queries)
             irow = summarize_ingests(adapter.name, mode, ingests, queries)
             rows.append({
@@ -1711,6 +1777,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.visible_poll_ms,
         )
         fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
+        validate_measurements_or_raise(args, "table6", "milvus/best_effort", ingests, queries)
         qrow = summarize_queries(adapter.name, "best_effort", queries)
         irow = summarize_ingests(adapter.name, "best_effort", ingests, queries)
         rows.append({
@@ -1751,6 +1818,7 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
         if args.reset_between_runs:
             adapter.reset()
         ingests = ingest_with_rate(adapter, events, args.write_rate, args.workers)
+        validate_measurements_or_raise(args, "table7", "plasmod/seed", ingests)
         event_log_size = sum(1 for r in ingests if r.ok)
         failed_ingests = [r for r in ingests if not r.ok]
         for failure_type in ["materialized view reset", "index rebuild", "service restart"]:
@@ -1821,6 +1889,8 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
         prewarm_adapter_embeddings(baseline, events)
         baseline.reset()
         replay_out = baseline.replay_events(events)
+        if replay_out["failed"] and not args.allow_write_errors:
+            raise RuntimeError(f"table7 milvus/service_restart: replay failed for {replay_out['failed']} events")
         rows.append({
             "table": "table7",
             "system": baseline.name,
@@ -1906,6 +1976,7 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             q.target_object_ids |= res.expected_ids
             qr, _ = adapter.query(q)
             queries.append(qr)
+        validate_measurements_or_raise(args, "table8", f"{system}/{selector}", ingests, queries)
         correct = sum(1 for q in queries if q.visible)
         stale = sum(1 for q in queries if q.stale)
         lat = [q.latency_ms for q in queries if q.ok]
@@ -1996,6 +2067,9 @@ def run_tables(args: argparse.Namespace) -> Path:
         "embedder_vocab": str(args.embedder_vocab),
         "embedding_cache": "disabled" if args.no_embedding_cache else str(args.embedding_cache),
         "embedding_batch_size": args.embedding_batch_size,
+        "allow_write_errors": args.allow_write_errors,
+        "allow_query_errors": args.allow_query_errors,
+        "allow_visibility_timeouts": args.allow_visibility_timeouts,
         "write_rates": args.write_rates,
         "query_qps": args.query_qps,
         "created_at_ms": wall_ms(),
@@ -2081,6 +2155,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--http-timeout", type=float, default=30.0)
     run.add_argument("--milvus-uri", default="http://127.0.0.1:19530")
     run.add_argument("--reset-between-runs", action="store_true")
+    run.add_argument("--allow-write-errors", action="store_true", help="Record write failures instead of stopping the run.")
+    run.add_argument("--allow-query-errors", action="store_true", help="Record query failures instead of stopping the run.")
+    run.add_argument("--allow-visibility-timeouts", action="store_true", help="Record timeout-censored visibility metrics instead of stopping the run.")
     return ap.parse_args(argv)
 
 
