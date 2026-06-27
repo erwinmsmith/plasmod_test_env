@@ -190,13 +190,30 @@ bash stop_all.sh && bash start_all.sh
 
 第二层 Dynamic Event Stream and State Visibility 数据放在：
 
-- `data/layer2_dynamic_events/synthetic/`：Synthetic Agent Event Stream
-- `data/layer2_dynamic_events/replay_traces/`：Replayable Agent Execution Trace
-- `data/layer2_dynamic_events/queries/`：查询 workload
-- `data/layer2_dynamic_events/ground_truth/`：可见性、状态、关系和 timing ground truth
-- `data/layer2_dynamic_events/manifests/`：数据版本、生成参数和校验信息
+- `data/layer2_dynamic_events/traces_collected/`：Synthetic Agent Event Stream，来自真实 agent runtime trace 条目的大规模混合事件流
+- `data/layer2_dynamic_events/events.jsonl`：Replayable Agent Execution Trace，用于 replay、state correctness 和因果关系验证
 
 第二层实验数据只放在 `plasmod_test_env`，不要放进 `Plasmod` 核心库。
+
+第二层实验脚本：
+
+```bash
+python3 scripts/layer2_dynamic_event_benchmark.py analyze
+```
+
+小规模 baseline 冒烟：
+
+```bash
+python3 scripts/layer2_dynamic_event_benchmark.py run --tables 4 8 --systems vector_metadata --events-per-type 10 --table8-updates 50 --replay-events 1000 --run-id layer2_smoke_baseline
+```
+
+跑 Table 4-8（需要先 `bash start_all.sh` 启动 Plasmod）：
+
+```bash
+python3 scripts/layer2_dynamic_event_benchmark.py run --tables all --systems vector_metadata plasmod --reset-between-runs --run-id layer2_full
+```
+
+输出位置：`results/layer2_dynamic_events/<run-id>/`，包含各表 CSV、`summary.json` 和 `run_metadata.json`。
 
 ---
 
