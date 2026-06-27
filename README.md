@@ -201,16 +201,16 @@ bash stop_all.sh && bash start_all.sh
 python3 scripts/layer2_dynamic_event_benchmark.py analyze
 ```
 
-小规模 baseline 冒烟：
+小规模 Milvus baseline 冒烟：
 
 ```bash
-python3 scripts/layer2_dynamic_event_benchmark.py run --tables 4 8 --systems vector_metadata --events-per-type 10 --table8-updates 50 --replay-events 1000 --run-id layer2_smoke_baseline
+python3 scripts/layer2_dynamic_event_benchmark.py run --tables 4 8 --systems milvus --events-per-type 10 --table8-updates 50 --replay-events 1000 --run-id layer2_smoke_milvus
 ```
 
-跑 Table 4-8（需要先 `bash start_all.sh` 启动 Plasmod）：
+跑 Table 4-8（需要先 `bash start_all.sh` 启动 Milvus 和 Plasmod）：
 
 ```bash
-python3 scripts/layer2_dynamic_event_benchmark.py run --tables all --systems vector_metadata plasmod --reset-between-runs --run-id layer2_full
+python3 scripts/layer2_dynamic_event_benchmark.py run --tables all --systems milvus plasmod --reset-between-runs --run-id layer2_full
 ```
 
 输出位置：`results/layer2_dynamic_events/<run-id>/`，包含各表 CSV、`summary.json` 和 `run_metadata.json`。

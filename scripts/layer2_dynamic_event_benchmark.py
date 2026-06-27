@@ -20,8 +20,11 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import hashlib
 import json
+import os
 import random
+import re
 import sqlite3
 import statistics
 import sys
@@ -41,6 +44,14 @@ DEFAULT_LAYER2 = BASE / "data" / "layer2_dynamic_events"
 DEFAULT_SYNTHETIC = DEFAULT_LAYER2 / "traces_collected"
 DEFAULT_REPLAY = DEFAULT_LAYER2 / "events.jsonl"
 OUT = BASE / "results" / "layer2_dynamic_events"
+DEFAULT_EMBEDDER_MODEL = BASE / "models" / "all-MiniLM-L6-v2.onnx"
+DEFAULT_EMBEDDER_VOCAB = BASE.parent / "Plasmod" / "models" / "minilm-l6-v2-vocab.txt"
+EMBEDDING_DIM = 384
+MAX_EMBED_TOKENS = 128
+BERT_CLS = 101
+BERT_SEP = 102
+BERT_PAD = 0
+BERT_UNK = 100
 
 PLASMOD_MODES = {
     "strict": "strict_visible",
@@ -55,6 +66,11 @@ EVENT_TYPE_ALIASES = {
 
 TABLE4_PLASMOD_TYPES = ["observation", "tool_result", "memory", "state_update", "artifact", "relation"]
 TABLE4_BASELINE_TYPES = ["observation", "tool_result", "memory"]
+MILVUS_SYSTEM_ALIASES = {"milvus", "vector_metadata", "baseline"}
+
+
+def wants_milvus_baseline(systems: list[str]) -> bool:
+    return any(system in MILVUS_SYSTEM_ALIASES for system in systems)
 
 
 def now_ms() -> float:
@@ -96,6 +112,141 @@ def percent(num: float, den: float) -> float:
     if den == 0:
         return 0.0
     return (num / den) * 100.0
+
+
+def sanitize_collection_name(value: str) -> str:
+    value = re.sub(r"[^0-9A-Za-z_]+", "_", value)
+    if not value or value[0].isdigit():
+        value = "c_" + value
+    return value[:255]
+
+
+def collection_name_from_path(path: Path | None, prefix: str = "layer2_milvus") -> str:
+    raw = str(path or (OUT / "default"))
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    stem = sanitize_collection_name(Path(raw).stem or "run")
+    return sanitize_collection_name(f"{prefix}_{stem}_{digest}")
+
+
+def _is_cjk(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x4E00 <= code <= 0x9FFF
+        or 0x3400 <= code <= 0x4DBF
+        or 0x20000 <= code <= 0x2A6DF
+        or 0xF900 <= code <= 0xFAFF
+        or 0x2F800 <= code <= 0x2FA1F
+    )
+
+
+def _is_ascii_punct(ch: str) -> bool:
+    code = ord(ch)
+    return 33 <= code <= 47 or 58 <= code <= 64 or 91 <= code <= 96 or 123 <= code <= 126
+
+
+class MiniLMEmbedder:
+    def __init__(self, model_path: Path = DEFAULT_EMBEDDER_MODEL, vocab_path: Path = DEFAULT_EMBEDDER_VOCAB):
+        self.model_path = model_path
+        self.vocab_path = vocab_path
+        self._session: Any = None
+        self._input_names: list[str] = []
+        self._output_name = ""
+        self._vocab: dict[str, int] = {}
+
+    def _load(self) -> None:
+        if self._session is not None:
+            return
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"MiniLM ONNX model not found: {self.model_path}")
+        if not self.vocab_path.exists():
+            raise FileNotFoundError(f"MiniLM vocab not found: {self.vocab_path}")
+        import numpy as np
+        import onnxruntime as ort
+
+        with self.vocab_path.open("r", encoding="utf-8") as f:
+            self._vocab = {line.strip(): i for i, line in enumerate(f) if line.strip()}
+        self._session = ort.InferenceSession(str(self.model_path), providers=["CPUExecutionProvider"])
+        self._input_names = [inp.name for inp in self._session.get_inputs()]
+        output_names = [out.name for out in self._session.get_outputs()]
+        self._output_name = "last_hidden_state" if "last_hidden_state" in output_names else output_names[0]
+        self._np = np
+
+    def _normalize_text(self, text: str) -> str:
+        import unicodedata
+
+        text = unicodedata.normalize("NFD", text.lower())
+        chars: list[str] = []
+        for ch in text:
+            if unicodedata.category(ch) == "Mn":
+                continue
+            if _is_cjk(ch) or _is_ascii_punct(ch):
+                chars.extend([" ", ch, " "])
+            elif ch.isspace():
+                chars.append(" ")
+            else:
+                chars.append(ch)
+        return "".join(chars)
+
+    def _word_piece_split(self, word: str) -> list[int]:
+        chars = list(word)
+        tokens: list[int] = []
+        start = 0
+        while start < len(chars):
+            end = len(chars)
+            found = False
+            while end > start:
+                sub = word[start:end]
+                if start > 0:
+                    sub = "##" + sub
+                if sub in self._vocab:
+                    tokens.append(self._vocab[sub])
+                    start = end
+                    found = True
+                    break
+                end -= 1
+            if not found:
+                return [BERT_UNK]
+        return tokens
+
+    def _tokenize(self, texts: list[str]) -> tuple[Any, Any]:
+        np = self._np
+        input_ids = np.full((len(texts), MAX_EMBED_TOKENS), BERT_PAD, dtype=np.int64)
+        attention_mask = np.zeros((len(texts), MAX_EMBED_TOKENS), dtype=np.int64)
+        for i, text in enumerate(texts):
+            words = self._normalize_text(text).split()
+            pos = 1
+            input_ids[i, 0] = BERT_CLS
+            attention_mask[i, 0] = 1
+            for word in words:
+                if pos >= MAX_EMBED_TOKENS - 1:
+                    break
+                for token_id in self._word_piece_split(word):
+                    if pos >= MAX_EMBED_TOKENS - 1:
+                        break
+                    input_ids[i, pos] = token_id
+                    attention_mask[i, pos] = 1
+                    pos += 1
+            input_ids[i, pos] = BERT_SEP
+            attention_mask[i, pos] = 1
+        return input_ids, attention_mask
+
+    def embed_one(self, text: str) -> list[float]:
+        vectors = self.embed_many([text])
+        return vectors[0]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        self._load()
+        np = self._np
+        input_ids, attention_mask = self._tokenize([t or "" for t in texts])
+        feed = {self._input_names[0]: input_ids, self._input_names[1]: attention_mask}
+        if len(self._input_names) > 2:
+            feed[self._input_names[2]] = np.zeros_like(input_ids)
+        last_hidden = self._session.run([self._output_name], feed)[0]
+        mask = attention_mask[..., np.newaxis].astype(np.float32)
+        pooled = np.sum(last_hidden * mask, axis=1) / np.maximum(np.sum(mask, axis=1), 1e-9)
+        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+        pooled = pooled / np.maximum(norms, 1e-12)
+        return pooled.astype("float32").tolist()
 
 
 def get_path(doc: dict[str, Any], path: str, default: Any = None) -> Any:
@@ -512,8 +663,228 @@ class PlasmodAdapter(SystemAdapter):
         return self.http.request("POST", "/v1/admin/replay", body)
 
 
+def milvus_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def milvus_string_list(values: list[str]) -> str:
+    return "[" + ", ".join(f'"{milvus_escape(v)}"' for v in values) + "]"
+
+
+def milvus_hit_entity(hit: Any) -> dict[str, Any]:
+    if isinstance(hit, dict):
+        entity = hit.get("entity")
+        if isinstance(entity, dict):
+            return entity
+        return hit
+    entity = getattr(hit, "entity", None)
+    if isinstance(entity, dict):
+        return entity
+    if hasattr(hit, "get"):
+        try:
+            entity = hit.get("entity")
+            if isinstance(entity, dict):
+                return entity
+        except Exception:
+            pass
+    return {}
+
+
+class MilvusAdapter(SystemAdapter):
+    name = "Milvus"
+
+    def __init__(
+        self,
+        uri: str = "http://127.0.0.1:19530",
+        collection_name: str = "layer2_milvus",
+        timeout: float = 30.0,
+        embedder: MiniLMEmbedder | None = None,
+    ):
+        from pymilvus import MilvusClient
+
+        self.uri = uri
+        self.collection_name = collection_name
+        self.timeout = timeout
+        self.embedder = embedder or MiniLMEmbedder()
+        self.client = MilvusClient(uri=uri)
+        self.mu = threading.Lock()
+        self._ensure_collection(drop=False)
+
+    def _ensure_collection(self, drop: bool) -> None:
+        from pymilvus import DataType, MilvusClient
+
+        if drop:
+            try:
+                self.client.drop_collection(self.collection_name)
+            except Exception:
+                pass
+        if self.client.has_collection(self.collection_name):
+            try:
+                self.client.load_collection(self.collection_name)
+            except Exception:
+                pass
+            return
+
+        schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
+        schema.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=256)
+        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
+        schema.add_field("event_id", DataType.VARCHAR, max_length=512)
+        schema.add_field("object_id", DataType.VARCHAR, max_length=512)
+        schema.add_field("session_id", DataType.VARCHAR, max_length=512)
+        schema.add_field("agent_id", DataType.VARCHAR, max_length=256)
+        schema.add_field("workspace_id", DataType.VARCHAR, max_length=256)
+        schema.add_field("tenant_id", DataType.VARCHAR, max_length=256)
+        schema.add_field("event_type", DataType.VARCHAR, max_length=128)
+        schema.add_field("object_type", DataType.VARCHAR, max_length=128)
+        schema.add_field("version", DataType.INT64)
+        schema.add_field("text", DataType.VARCHAR, max_length=8192)
+        schema.add_field("payload_json", DataType.VARCHAR, max_length=65535)
+
+        index_params = MilvusClient.prepare_index_params()
+        index_params.add_index(
+            "vector",
+            index_type="HNSW",
+            metric_type="COSINE",
+            params={"M": 16, "efConstruction": 200},
+        )
+        self.client.create_collection(
+            self.collection_name,
+            schema=schema,
+            index_params=index_params,
+            consistency_level="Strong",
+            timeout=self.timeout,
+        )
+        self.client.load_collection(self.collection_name)
+
+    def health(self) -> None:
+        self.client.list_collections()
+
+    def reset(self) -> None:
+        with self.mu:
+            self._ensure_collection(drop=True)
+
+    def close(self) -> None:
+        return None
+
+    def _row_for_event(self, ev: dict[str, Any], vector: list[float]) -> dict[str, Any]:
+        eid = event_id(ev)
+        oid = object_id(ev)
+        payload_json = json.dumps(ev, ensure_ascii=False, sort_keys=True)
+        return {
+            "pk": (eid or oid or hashlib.sha1(payload_json.encode("utf-8")).hexdigest())[:256],
+            "vector": vector,
+            "event_id": eid[:512],
+            "object_id": oid[:512],
+            "session_id": session_id(ev)[:512],
+            "agent_id": agent_id(ev)[:256],
+            "workspace_id": workspace_id(ev)[:256],
+            "tenant_id": tenant_id(ev)[:256],
+            "event_type": event_type(ev)[:128],
+            "object_type": object_type(ev)[:128],
+            "version": int(event_version(ev)),
+            "text": payload_text(ev)[:8192],
+            "payload_json": payload_json[:65535],
+        }
+
+    def ingest(self, ev: dict[str, Any]) -> IngestResult:
+        t0 = now_ms()
+        eid = event_id(ev)
+        oid = object_id(ev)
+        try:
+            vector = self.embedder.embed_one(payload_text(ev))
+            row = self._row_for_event(ev, vector)
+            with self.mu:
+                self.client.insert(self.collection_name, [row])
+                self.client.flush(self.collection_name)
+            t1 = now_ms()
+            return IngestResult(
+                system=self.name,
+                event_type=event_type(ev),
+                event_id=eid,
+                object_id=oid,
+                expected_ids={x for x in [eid, oid] if x},
+                write_start_ms=t0,
+                write_ack_ms=t1,
+                write_latency_ms=t1 - t0,
+                ok=True,
+            )
+        except Exception as exc:
+            t1 = now_ms()
+            return IngestResult(
+                system=self.name,
+                event_type=event_type(ev),
+                event_id=eid,
+                object_id=oid,
+                expected_ids={x for x in [eid, oid] if x},
+                write_start_ms=t0,
+                write_ack_ms=t1,
+                write_latency_ms=t1 - t0,
+                ok=False,
+                error=str(exc),
+            )
+
+    def query(self, q: QuerySpec) -> tuple[QueryResult, Any]:
+        t0 = now_ms()
+        try:
+            clauses: list[str] = []
+            if q.session_id:
+                clauses.append(f'session_id == "{milvus_escape(q.session_id)}"')
+            if q.object_types:
+                values = milvus_string_list(q.object_types)
+                clauses.append(f"(object_type in {values} or event_type in {values})")
+            expr = " and ".join(clauses) if clauses else ""
+            vector = self.embedder.embed_one(q.query_text or "latest")
+            with self.mu:
+                rows = self.client.search(
+                    self.collection_name,
+                    [vector],
+                    limit=10,
+                    filter=expr,
+                    output_fields=["event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
+                    search_params={"ef": 64},
+                    timeout=self.timeout,
+                )
+            ids: set[str] = set()
+            objects: list[dict[str, Any]] = []
+            for hit in rows[0] if rows else []:
+                entity = milvus_hit_entity(hit)
+                if entity:
+                    objects.append(entity)
+                for key in ("event_id", "object_id", "id", "pk"):
+                    value = entity.get(key)
+                    if isinstance(value, str) and value:
+                        ids.add(value)
+            visible = bool(ids & q.expected_ids)
+            t1 = now_ms()
+            resp = {"objects": list(ids), "rows": objects}
+            return QueryResult(self.name, q.query_type, t1 - t0, True, visible, not visible), resp
+        except Exception as exc:
+            t1 = now_ms()
+            return QueryResult(self.name, q.query_type, t1 - t0, False, False, True, str(exc)), {}
+
+    def replay_events(self, events: list[dict[str, Any]]) -> dict[str, Any]:
+        t0 = now_ms()
+        applied = 0
+        failed = 0
+        for ev in events:
+            res = self.ingest(ev)
+            if res.ok:
+                applied += 1
+            else:
+                failed += 1
+        elapsed = max((now_ms() - t0) / 1000.0, 1e-9)
+        return {
+            "status": "ok",
+            "attempted": len(events),
+            "applied": applied,
+            "failed": failed,
+            "elapsed_s": elapsed,
+            "throughput_eps": applied / elapsed,
+        }
+
+
 class VectorMetadataAdapter(SystemAdapter):
-    name = "Vector+Metadata"
+    name = "SQLiteMetadata"
 
     def __init__(self, db_path: Path | None = None):
         self.db_path = str(db_path) if db_path else ":memory:"
@@ -654,10 +1025,26 @@ class VectorMetadataAdapter(SystemAdapter):
         }
 
 
-def make_adapter(system: str, base_url: str, sqlite_path: Path | None = None, timeout: float = 30.0) -> SystemAdapter:
+def make_adapter(
+    system: str,
+    base_url: str,
+    sqlite_path: Path | None = None,
+    timeout: float = 30.0,
+    milvus_uri: str = "http://127.0.0.1:19530",
+    embedder_model: Path = DEFAULT_EMBEDDER_MODEL,
+    embedder_vocab: Path = DEFAULT_EMBEDDER_VOCAB,
+) -> SystemAdapter:
     if system == "plasmod":
         return PlasmodAdapter(base_url, timeout=timeout)
-    if system in {"vector_metadata", "baseline"}:
+    if system in {"milvus", "vector_metadata", "baseline"}:
+        embedder = MiniLMEmbedder(embedder_model, embedder_vocab)
+        return MilvusAdapter(
+            uri=milvus_uri,
+            collection_name=collection_name_from_path(sqlite_path),
+            timeout=timeout,
+            embedder=embedder,
+        )
+    if system == "sqlite_metadata":
         return VectorMetadataAdapter(sqlite_path)
     raise ValueError(f"unknown system: {system}")
 
@@ -840,7 +1227,15 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     systems = args.systems
     for system in systems:
-        adapter = make_adapter(system, args.plasmod_url, run_dir / f"{system}.sqlite", args.http_timeout)
+        adapter = make_adapter(
+            system,
+            args.plasmod_url,
+            run_dir / f"{system}.collection",
+            args.http_timeout,
+            args.milvus_uri,
+            args.embedder_model,
+            args.embedder_vocab,
+        )
         if system == "plasmod":
             adapter.health()
         types = TABLE4_PLASMOD_TYPES if system == "plasmod" else TABLE4_BASELINE_TYPES
@@ -918,7 +1313,15 @@ def run_freshness_trial(
 def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for system in args.systems:
-        adapter = make_adapter(system, args.plasmod_url, run_dir / f"{system}.sqlite", args.http_timeout)
+        adapter = make_adapter(
+            system,
+            args.plasmod_url,
+            run_dir / f"{system}.collection",
+            args.http_timeout,
+            args.milvus_uri,
+            args.embedder_model,
+            args.embedder_vocab,
+        )
         if system == "plasmod":
             adapter.health()
         for rate in args.write_rates:
@@ -1002,9 +1405,17 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             })
             adapter.close()
 
-    if "vector_metadata" in args.systems or "baseline" in args.systems:
-        adapter = make_adapter("vector_metadata", args.plasmod_url, run_dir / "vector_metadata.sqlite", args.http_timeout)
-        run_id = f"{args.run_id}_t6_baseline_best_effort"
+    if wants_milvus_baseline(args.systems):
+        adapter = make_adapter(
+            "milvus",
+            args.plasmod_url,
+            run_dir / "milvus_t6.collection",
+            args.http_timeout,
+            args.milvus_uri,
+            args.embedder_model,
+            args.embedder_vocab,
+        )
+        run_id = f"{args.run_id}_t6_milvus_best_effort"
         events = [namespace_event(ev, run_id) for ev in raw]
         if args.reset_between_runs:
             adapter.reset()
@@ -1016,7 +1427,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
         irow = summarize_ingests(adapter.name, "best_effort", ingests, queries)
         rows.append({
             "table": "table6",
-            "system": "Vector+Metadata",
+            "system": adapter.name,
             "visibility_mode": "Best-effort",
             "write_qps": irow["write_qps"],
             "query_qps": zero_if_none(safe_div(len(queries), elapsed_s)),
@@ -1106,14 +1517,22 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 })
         adapter.close()
 
-    if "vector_metadata" in args.systems or "baseline" in args.systems:
-        events = [namespace_event(ev, f"{args.run_id}_t7_baseline") for ev in raw]
-        baseline = VectorMetadataAdapter(run_dir / "vector_metadata_replay.sqlite")
+    if wants_milvus_baseline(args.systems):
+        events = [namespace_event(ev, f"{args.run_id}_t7_milvus") for ev in raw]
+        baseline = make_adapter(
+            "milvus",
+            args.plasmod_url,
+            run_dir / "milvus_t7.collection",
+            args.http_timeout,
+            args.milvus_uri,
+            args.embedder_model,
+            args.embedder_vocab,
+        )
         baseline.reset()
         replay_out = baseline.replay_events(events)
         rows.append({
             "table": "table7",
-            "system": "Vector+Metadata",
+            "system": baseline.name,
             "failure_type": "service restart",
             "event_log_size": len(events),
             "write_errors": replay_out["failed"],
@@ -1123,9 +1542,9 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "recovered_objects_pct": percent(float(replay_out["applied"]), float(len(events))),
             "recovered_relations_pct": percent(float(replay_out["applied"]), float(len(events))) if replay_relation_events > 0 else 100.0,
             "query_available_during_recovery": False,
-            "recovery_measurement_mode": "offline_jsonl_rebuild",
+            "recovery_measurement_mode": "milvus_reingest_rebuild",
             "status": "ok",
-            "note": "baseline rebuilds metadata from input JSONL, not from a database WAL",
+            "note": "Milvus baseline rebuilds vector records and scalar metadata from input JSONL, not from a database WAL",
         })
         baseline.close()
     write_csv(run_dir / "table7_replay_recovery.csv", rows)
@@ -1154,10 +1573,10 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     raw_all = load_events(args.replay_input, limit=args.replay_events, shuffle=False)
     cases: list[tuple[str, str, str]] = []
-    if "vector_metadata" in args.systems or "baseline" in args.systems:
+    if wants_milvus_baseline(args.systems):
         cases.extend([
-            ("vector_metadata", "tool_result -> state", "tool_result_to_state"),
-            ("vector_metadata", "artifact update", "artifact_update"),
+            ("milvus", "tool_result -> state", "tool_result_to_state"),
+            ("milvus", "artifact update", "artifact_update"),
         ])
     if "plasmod" in args.systems:
         cases.extend([
@@ -1169,7 +1588,15 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
         selected = select_table8_events(raw_all, selector)[: args.table8_updates]
         run_id = f"{args.run_id}_t8_{system}_{selector}"
         events = [namespace_event(ev, run_id) for ev in selected]
-        adapter = make_adapter(system, args.plasmod_url, run_dir / f"{system}_t8.sqlite", args.http_timeout)
+        adapter = make_adapter(
+            system,
+            args.plasmod_url,
+            run_dir / f"{system}_t8.collection",
+            args.http_timeout,
+            args.milvus_uri,
+            args.embedder_model,
+            args.embedder_vocab,
+        )
         if system == "plasmod":
             adapter.health()
         if args.reset_between_runs:
@@ -1235,6 +1662,9 @@ def run_tables(args: argparse.Namespace) -> Path:
         "synthetic_input": str(args.synthetic_input),
         "replay_input": str(args.replay_input),
         "systems": args.systems,
+        "milvus_uri": args.milvus_uri,
+        "embedder_model": str(args.embedder_model),
+        "embedder_vocab": str(args.embedder_vocab),
         "write_rates": args.write_rates,
         "query_qps": args.query_qps,
         "created_at_ms": wall_ms(),
@@ -1283,7 +1713,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run = sub.add_parser("run", help="Run one or more Layer 2 experiment tables.")
     add_common(run)
     run.add_argument("--tables", nargs="+", default=["all"], choices=["all", "4", "5", "6", "7", "8"])
-    run.add_argument("--systems", nargs="+", default=["vector_metadata", "plasmod"], choices=["vector_metadata", "plasmod"])
+    run.add_argument(
+        "--systems",
+        nargs="+",
+        default=["milvus", "plasmod"],
+        choices=["milvus", "plasmod", "vector_metadata", "baseline", "sqlite_metadata"],
+        help="Systems to benchmark. vector_metadata/baseline are accepted as legacy aliases for milvus.",
+    )
     run.add_argument("--write-rates", type=float, nargs="+", default=[10, 100, 500, 1000])
     run.add_argument("--write-rate", type=float, default=100.0, help="Default write rate for Table 4, 7, 8.")
     run.add_argument("--fixed-write-rate", type=float, default=100.0, help="Fixed write rate for Table 6.")
@@ -1297,6 +1733,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--visible-timeout-ms", type=float, default=5000.0)
     run.add_argument("--visible-poll-ms", type=float, default=50.0)
     run.add_argument("--http-timeout", type=float, default=30.0)
+    run.add_argument("--milvus-uri", default="http://127.0.0.1:19530")
+    run.add_argument("--embedder-model", type=Path, default=DEFAULT_EMBEDDER_MODEL)
+    run.add_argument("--embedder-vocab", type=Path, default=DEFAULT_EMBEDDER_VOCAB)
     run.add_argument("--reset-between-runs", action="store_true")
     return ap.parse_args(argv)
 

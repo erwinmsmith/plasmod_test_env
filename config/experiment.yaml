@@ -31,7 +31,7 @@ layers:
     top_k: [5, 10, 20, 50]
     warmup_rounds: 1
     baselines:
-      - vector_metadata
+      - milvus
     # Baselines:
       # - plasmod_vector_only: Vector index + filtering, no object graph/version/policy
       # - plasmod_full: Complete agent-native unified object model
@@ -48,10 +48,10 @@ layers:
       - memory
       - artifact
     baselines:
-      - vector_metadata
+      - milvus
       - plasmod_vector_only
     # Baselines:
-      # - vector_metadata: Use timestamp/session as metadata, filter for "latest visible"
+      # - milvus: Vector index + scalar metadata filters, no native event log/materialized object model
       # - plasmod_vector_only: Write chunks only, no event stream materialization
       # - plasmod_full: Event log, async materialization, version queries
 
