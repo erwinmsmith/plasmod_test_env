@@ -605,6 +605,10 @@ class PlasmodAdapter(SystemAdapter):
                     value = ack.get(key)
                     if isinstance(value, str) and value:
                         expected.add(value)
+                for key in ("edge_ids", "relation_ids", "object_ids"):
+                    values = ack.get(key)
+                    if isinstance(values, list):
+                        expected.update(str(value) for value in values if value)
             return IngestResult(
                 system=self.name,
                 event_type=event_type(ev),
@@ -633,13 +637,14 @@ class PlasmodAdapter(SystemAdapter):
             )
 
     def query(self, q: QuerySpec) -> tuple[QueryResult, Any]:
+        top_k = 100 if q.query_type in {"relation_query", "provenance_query"} else 10
         body = {
             "query_text": q.query_text or "latest",
             "session_id": q.session_id,
             "agent_id": q.agent_id,
             "workspace_id": q.workspace_id,
             "tenant_id": q.tenant_id,
-            "top_k": 10,
+            "top_k": top_k,
             "object_types": q.object_types,
             "response_mode": "objects_only",
         }
@@ -795,7 +800,6 @@ class MilvusAdapter(SystemAdapter):
             row = self._row_for_event(ev, vector)
             with self.mu:
                 self.client.insert(self.collection_name, [row])
-                self.client.flush(self.collection_name)
             t1 = now_ms()
             return IngestResult(
                 system=self.name,
@@ -872,6 +876,11 @@ class MilvusAdapter(SystemAdapter):
                 applied += 1
             else:
                 failed += 1
+        if applied:
+            try:
+                self.client.flush(self.collection_name)
+            except Exception:
+                pass
         elapsed = max((now_ms() - t0) / 1000.0, 1e-9)
         return {
             "status": "ok",
@@ -1143,6 +1152,49 @@ def wait_until_visible(
     return last
 
 
+def wait_for_visible_batch(
+    adapter: SystemAdapter,
+    events: list[dict[str, Any]],
+    ingests: list[IngestResult],
+    run_id: str,
+    timeout_ms: float,
+    poll_ms: float,
+    workers: int,
+) -> list[QueryResult]:
+    pairs = [(ev, res) for ev, res in zip(events, ingests) if res.ok]
+    if not pairs:
+        return []
+    max_workers = max(1, min(workers, len(pairs)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [
+            pool.submit(wait_until_visible, adapter, ev, res, run_id, timeout_ms, poll_ms)
+            for ev, res in pairs
+        ]
+        return [future.result() for future in futures]
+
+
+def fill_missing_visibility(
+    adapter: SystemAdapter,
+    events: list[dict[str, Any]],
+    ingests: list[IngestResult],
+    run_id: str,
+    timeout_ms: float,
+    poll_ms: float,
+    workers: int,
+) -> None:
+    pairs = [(ev, res) for ev, res in zip(events, ingests) if res.ok and res.first_visible_ms is None]
+    if not pairs:
+        return
+    max_workers = max(1, min(workers, len(pairs)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [
+            pool.submit(wait_until_visible, adapter, ev, res, run_id, timeout_ms, poll_ms)
+            for ev, res in pairs
+        ]
+        for future in futures:
+            future.result()
+
+
 def summarize_ingests(system: str, key: str, ingests: list[IngestResult], queries: list[QueryResult] | None = None) -> dict[str, Any]:
     ok_ingests = [r for r in ingests if r.ok]
     failed_ingests = [r for r in ingests if not r.ok]
@@ -1246,7 +1298,7 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             if args.reset_between_runs:
                 adapter.reset()
             ingests = ingest_with_rate(adapter, events, args.write_rate, args.workers)
-            queries = [wait_until_visible(adapter, ev, res, run_id, args.visible_timeout_ms, args.visible_poll_ms) for ev, res in zip(events, ingests) if res.ok]
+            queries = wait_for_visible_batch(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
             row = summarize_ingests(adapter.name, et.replace("state_update", "state"), ingests, queries)
             row.update({"table": "table4", "event_type": et.replace("state_update", "state")})
             rows.append(row)
@@ -1331,9 +1383,7 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             if args.reset_between_runs:
                 adapter.reset()
             ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, rate, args.query_qps, args.workers, args.query_limit)
-            for ev, res in zip(events, ingests):
-                if res.ok and res.first_visible_ms is None:
-                    wait_until_visible(adapter, ev, res, run_id, args.visible_timeout_ms, args.visible_poll_ms)
+            fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
             ingest_row = summarize_ingests(adapter.name, str(rate), ingests, queries)
             query_row = summarize_queries(adapter.name, str(rate), queries)
             row = {
@@ -1378,9 +1428,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             if args.reset_between_runs:
                 adapter.reset()
             ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, args.fixed_write_rate, args.query_qps, args.workers, args.query_limit)
-            for ev, res in zip(events, ingests):
-                if res.ok and res.first_visible_ms is None:
-                    wait_until_visible(adapter, ev, res, run_id, args.visible_timeout_ms, args.visible_poll_ms)
+            fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
             qrow = summarize_queries(adapter.name, mode, queries)
             irow = summarize_ingests(adapter.name, mode, ingests, queries)
             rows.append({
@@ -1420,9 +1468,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
         if args.reset_between_runs:
             adapter.reset()
         ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, args.fixed_write_rate, args.query_qps, args.workers, args.query_limit)
-        for ev, res in zip(events, ingests):
-            if res.ok and res.first_visible_ms is None:
-                wait_until_visible(adapter, ev, res, run_id, args.visible_timeout_ms, args.visible_poll_ms)
+        fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
         qrow = summarize_queries(adapter.name, "best_effort", queries)
         irow = summarize_ingests(adapter.name, "best_effort", ingests, queries)
         rows.append({
