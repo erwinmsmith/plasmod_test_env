@@ -1,5 +1,13 @@
 # Keep folder structure, ignore contents
 data/*
+!data/layer2_dynamic_events/
+data/layer2_dynamic_events/**/*
+!data/layer2_dynamic_events/**/
+!data/layer2_dynamic_events/**/.gitkeep
+!data/layer2_dynamic_events/**/README.md
+!data/layer2_dynamic_events/manifests/*.json
+!data/layer2_dynamic_events/manifests/*.yaml
+!data/layer2_dynamic_events/manifests/*.yml
 results/*
 models/*
 !.gitkeep
@@ -8,6 +16,7 @@ models/*
 .*
 # Exception: keep .gitignore itself
 !.gitignore
+!data/layer2_dynamic_events/**/.gitkeep
 
 # Ignore large generated data
 bin/

@@ -188,6 +188,16 @@ bash stop_all.sh && bash start_all.sh
 
 汇总表会在日志末尾打印（DB / Index / Build / Batch QPS / Serial QPS / Recall@K / P50 / P95 / P99 / Memory）。
 
+第二层 Dynamic Event Stream and State Visibility 数据放在：
+
+- `data/layer2_dynamic_events/synthetic/`：Synthetic Agent Event Stream
+- `data/layer2_dynamic_events/replay_traces/`：Replayable Agent Execution Trace
+- `data/layer2_dynamic_events/queries/`：查询 workload
+- `data/layer2_dynamic_events/ground_truth/`：可见性、状态、关系和 timing ground truth
+- `data/layer2_dynamic_events/manifests/`：数据版本、生成参数和校验信息
+
+第二层实验数据只放在 `plasmod_test_env`，不要放进 `Plasmod` 核心库。
+
 ---
 
 ## 6. 关键参数
