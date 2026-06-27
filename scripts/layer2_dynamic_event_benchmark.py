@@ -1067,6 +1067,8 @@ class MilvusAdapter(SystemAdapter):
         timeout: float = 30.0,
         embedder: MiniLMEmbedder | None = None,
         visibility_policy: str = "flush_on_ack",
+        index_type: str = "HNSW",
+        payload_json_bytes: int = 65535,
     ):
         from pymilvus import MilvusClient
 
@@ -1075,6 +1077,8 @@ class MilvusAdapter(SystemAdapter):
         self.timeout = timeout
         self.embedder = embedder or MiniLMEmbedder()
         self.visibility_policy = visibility_policy
+        self.index_type = index_type.upper()
+        self.payload_json_bytes = payload_json_bytes
         self.client = MilvusClient(uri=uri)
         self.mu = threading.Lock()
         self._ensure_collection(drop=False)
@@ -1110,12 +1114,15 @@ class MilvusAdapter(SystemAdapter):
         schema.add_field("payload_json", DataType.VARCHAR, max_length=65535)
 
         index_params = MilvusClient.prepare_index_params()
-        index_params.add_index(
-            "vector",
-            index_type="HNSW",
-            metric_type="COSINE",
-            params={"M": 16, "efConstruction": 200},
-        )
+        if self.index_type == "FLAT":
+            index_params.add_index("vector", index_type="FLAT", metric_type="COSINE", params={})
+        else:
+            index_params.add_index(
+                "vector",
+                index_type="HNSW",
+                metric_type="COSINE",
+                params={"M": 16, "efConstruction": 200},
+            )
         self.client.create_collection(
             self.collection_name,
             schema=schema,
@@ -1152,7 +1159,7 @@ class MilvusAdapter(SystemAdapter):
             "object_type": truncate_utf8(object_type(ev), 128),
             "version": int(event_version(ev)),
             "text": truncate_utf8(payload_text(ev), 8192),
-            "payload_json": truncate_utf8(payload_json, 65535),
+            "payload_json": truncate_utf8(payload_json, self.payload_json_bytes) if self.payload_json_bytes > 0 else "",
         }
 
     def ingest(self, ev: dict[str, Any]) -> IngestResult:
@@ -1426,6 +1433,8 @@ def make_adapter(
     embedding_batch_size: int = 64,
     embedding_provider: str = "minilm",
     milvus_visibility_policy: str = "flush_on_ack",
+    milvus_index_type: str = "HNSW",
+    milvus_payload_json_bytes: int = 65535,
 ) -> SystemAdapter:
     if system == "plasmod":
         return PlasmodAdapter(base_url, timeout=timeout)
@@ -1450,6 +1459,8 @@ def make_adapter(
             timeout=timeout,
             embedder=embedder,
             visibility_policy=milvus_visibility_policy,
+            index_type=milvus_index_type,
+            payload_json_bytes=milvus_payload_json_bytes,
         )
     if system == "sqlite_metadata":
         return VectorMetadataAdapter(sqlite_path)
@@ -1515,6 +1526,7 @@ def ingest_with_rate(
     on_complete: Callable[[dict[str, Any], IngestResult], None] | None = None,
     progress_label: str = "",
     total_events: int | None = None,
+    fail_fast: bool = True,
 ) -> list[IngestResult]:
     if total_events is None:
         try:
@@ -1547,6 +1559,8 @@ def ingest_with_rate(
             results[idx] = res
         else:
             unordered_results[idx] = res
+        if fail_fast and not res.ok:
+            raise RuntimeError(f"{progress_label or adapter.name}: write failed for event_id={res.event_id}: {res.error}")
         completed += 1
         now = time.perf_counter()
         if progress_label and now >= next_progress:
@@ -1612,6 +1626,7 @@ def ingest_with_visibility_probe(
             on_complete=on_complete,
             progress_label=f"{run_id}/{adapter.name}",
             total_events=total_events,
+            fail_fast=True,
         )
         with visibility_mu:
             pending = list(visibility_futures)
@@ -1637,6 +1652,8 @@ def wait_until_visible(
     while now_ms() <= deadline:
         qr, _ = adapter.query(query)
         last = qr
+        if not qr.ok:
+            return qr
         if qr.ok and qr.visible:
             t = now_ms()
             if ingest_result.first_visible_ms is None:
@@ -1832,6 +1849,8 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedding_batch_size,
             args.embedding_provider,
             args.milvus_visibility_policy,
+            args.milvus_index_type,
+            args.milvus_payload_json_bytes,
         )
         if system == "plasmod":
             adapter.health()
@@ -1978,6 +1997,8 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedding_batch_size,
             args.embedding_provider,
             args.milvus_visibility_policy,
+            args.milvus_index_type,
+            args.milvus_payload_json_bytes,
         )
         if system == "plasmod":
             adapter.health()
@@ -2094,6 +2115,8 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedding_batch_size,
             args.embedding_provider,
             args.milvus_visibility_policy,
+            args.milvus_index_type,
+            args.milvus_payload_json_bytes,
         )
         run_id = f"{args.run_id}_t6_milvus_best_effort"
         events = [namespace_event(ev, run_id) for ev in raw]
@@ -2222,6 +2245,8 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedding_batch_size,
             args.embedding_provider,
             args.milvus_visibility_policy,
+            args.milvus_index_type,
+            args.milvus_payload_json_bytes,
         )
         prewarm_adapter_embeddings(baseline, events)
         baseline.reset()
@@ -2303,6 +2328,8 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedding_batch_size,
             args.embedding_provider,
             args.milvus_visibility_policy,
+            args.milvus_index_type,
+            args.milvus_payload_json_bytes,
         )
         if system == "plasmod":
             adapter.health()
@@ -2413,6 +2440,8 @@ def run_tables(args: argparse.Namespace) -> Path:
         "systems": args.systems,
         "milvus_uri": args.milvus_uri,
         "milvus_visibility_policy": args.milvus_visibility_policy,
+        "milvus_index_type": args.milvus_index_type,
+        "milvus_payload_json_bytes": args.milvus_payload_json_bytes,
         "embedder_model": str(args.embedder_model),
         "embedder_vocab": str(args.embedder_vocab),
         "embedding_cache": "disabled" if args.no_embedding_cache else str(args.embedding_cache),
@@ -2515,6 +2544,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["flush_on_ack", "deferred"],
         default="flush_on_ack",
         help="flush_on_ack makes Milvus writes read-visible before ACK; deferred measures best-effort async visibility.",
+    )
+    run.add_argument(
+        "--milvus-index-type",
+        choices=["HNSW", "FLAT"],
+        default="HNSW",
+        help="Milvus vector index for baseline collections. FLAT avoids background HNSW builds in visibility-only workloads.",
+    )
+    run.add_argument(
+        "--milvus-payload-json-bytes",
+        type=int,
+        default=65535,
+        help="Bytes of full event JSON to store in Milvus metadata; use 0 for vector+metadata pointer-style baselines.",
     )
     run.add_argument("--reset-between-runs", action="store_true")
     run.add_argument("--allow-write-errors", action="store_true", help="Record write failures instead of stopping the run.")
