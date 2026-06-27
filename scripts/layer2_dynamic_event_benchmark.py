@@ -44,6 +44,7 @@ DEFAULT_LAYER2 = BASE / "data" / "layer2_dynamic_events"
 DEFAULT_SYNTHETIC = DEFAULT_LAYER2 / "traces_collected"
 DEFAULT_REPLAY = DEFAULT_LAYER2 / "events.jsonl"
 OUT = BASE / "results" / "layer2_dynamic_events"
+DEFAULT_EMBEDDING_CACHE = OUT / "embedding_cache.sqlite3"
 DEFAULT_EMBEDDER_MODEL = BASE / "models" / "all-MiniLM-L6-v2.onnx"
 DEFAULT_EMBEDDER_VOCAB = BASE.parent / "Plasmod" / "models" / "minilm-l6-v2-vocab.txt"
 EMBEDDING_DIM = 384
@@ -247,6 +248,151 @@ class MiniLMEmbedder:
         norms = np.linalg.norm(pooled, axis=1, keepdims=True)
         pooled = pooled / np.maximum(norms, 1e-12)
         return pooled.astype("float32").tolist()
+
+
+def embedding_model_signature(model_path: Path, vocab_path: Path) -> str:
+    h = hashlib.sha256()
+    for path in [model_path, vocab_path]:
+        resolved = path.resolve()
+        stat = resolved.stat()
+        h.update(str(resolved).encode("utf-8"))
+        h.update(str(stat.st_size).encode("ascii"))
+        h.update(str(stat.st_mtime_ns).encode("ascii"))
+    h.update(str(EMBEDDING_DIM).encode("ascii"))
+    h.update(str(MAX_EMBED_TOKENS).encode("ascii"))
+    return h.hexdigest()
+
+
+class CachedEmbedder:
+    def __init__(
+        self,
+        embedder: MiniLMEmbedder,
+        cache_path: Path,
+        model_path: Path,
+        vocab_path: Path,
+        batch_size: int = 64,
+    ):
+        self.embedder = embedder
+        self.cache_path = cache_path
+        self.model_sig = embedding_model_signature(model_path, vocab_path)
+        self.batch_size = max(1, batch_size)
+        self.mu = threading.Lock()
+        self._ready = False
+
+    def _ensure_db(self) -> None:
+        if self._ready:
+            return
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.cache_path) as conn:
+            conn.execute(
+                """
+                create table if not exists embeddings (
+                    model_sig text not null,
+                    text_hash text not null,
+                    text text not null,
+                    dim integer not null,
+                    vector blob not null,
+                    created_at_ms integer not null,
+                    primary key (model_sig, text_hash)
+                )
+                """
+            )
+            conn.execute("create index if not exists embeddings_text_hash_idx on embeddings(text_hash)")
+        self._ready = True
+
+    @staticmethod
+    def _text_hash(text: str) -> str:
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _vector_to_blob(vector: list[float]) -> bytes:
+        import numpy as np
+
+        return np.asarray(vector, dtype=np.float32).tobytes()
+
+    @staticmethod
+    def _blob_to_vector(blob: bytes, dim: int) -> list[float]:
+        import numpy as np
+
+        return np.frombuffer(blob, dtype=np.float32, count=dim).astype(np.float32).tolist()
+
+    def embed_one(self, text: str) -> list[float]:
+        return self.embed_many([text])[0]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        texts = [t or "" for t in texts]
+        if not texts:
+            return []
+        with self.mu:
+            self._ensure_db()
+            results: dict[str, list[float]] = {}
+            unique_texts = list(dict.fromkeys(texts))
+            hashes = {text: self._text_hash(text) for text in unique_texts}
+            with sqlite3.connect(self.cache_path) as conn:
+                for text in unique_texts:
+                    row = conn.execute(
+                        "select text, dim, vector from embeddings where model_sig = ? and text_hash = ?",
+                        (self.model_sig, hashes[text]),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    cached_text, dim, blob = row
+                    if cached_text == text and int(dim) == EMBEDDING_DIM:
+                        results[text] = self._blob_to_vector(blob, EMBEDDING_DIM)
+
+                missing = [text for text in unique_texts if text not in results]
+                for start in range(0, len(missing), self.batch_size):
+                    chunk = missing[start : start + self.batch_size]
+                    vectors = self.embedder.embed_many(chunk)
+                    rows = [
+                        (
+                            self.model_sig,
+                            hashes[text],
+                            text,
+                            EMBEDDING_DIM,
+                            self._vector_to_blob(vector),
+                            wall_ms(),
+                        )
+                        for text, vector in zip(chunk, vectors)
+                    ]
+                    conn.executemany(
+                        """
+                        insert or replace into embeddings
+                        (model_sig, text_hash, text, dim, vector, created_at_ms)
+                        values (?, ?, ?, ?, ?, ?)
+                        """,
+                        rows,
+                    )
+                    conn.commit()
+                    for text, vector in zip(chunk, vectors):
+                        results[text] = vector
+        return [results[text] for text in texts]
+
+    def prewarm_texts(self, texts: Iterable[str]) -> dict[str, Any]:
+        unique = [text for text in dict.fromkeys((t or "") for t in texts) if text]
+        before = self.count_cached()
+        started = now_ms()
+        for start in range(0, len(unique), self.batch_size):
+            self.embed_many(unique[start : start + self.batch_size])
+        after = self.count_cached()
+        return {
+            "cache_path": str(self.cache_path),
+            "model_sig": self.model_sig,
+            "texts": len(unique),
+            "new_embeddings": max(0, after - before),
+            "cached_embeddings": after,
+            "elapsed_s": (now_ms() - started) / 1000.0,
+        }
+
+    def count_cached(self) -> int:
+        with self.mu:
+            self._ensure_db()
+            with sqlite3.connect(self.cache_path) as conn:
+                row = conn.execute(
+                    "select count(*) from embeddings where model_sig = ?",
+                    (self.model_sig,),
+                ).fetchone()
+        return int(row[0] if row else 0)
 
 
 def get_path(doc: dict[str, Any], path: str, default: Any = None) -> Any:
@@ -1042,11 +1188,21 @@ def make_adapter(
     milvus_uri: str = "http://127.0.0.1:19530",
     embedder_model: Path = DEFAULT_EMBEDDER_MODEL,
     embedder_vocab: Path = DEFAULT_EMBEDDER_VOCAB,
+    embedding_cache: Path | None = DEFAULT_EMBEDDING_CACHE,
+    embedding_batch_size: int = 64,
 ) -> SystemAdapter:
     if system == "plasmod":
         return PlasmodAdapter(base_url, timeout=timeout)
     if system in {"milvus", "vector_metadata", "baseline"}:
         embedder = MiniLMEmbedder(embedder_model, embedder_vocab)
+        if embedding_cache is not None:
+            embedder = CachedEmbedder(
+                embedder,
+                embedding_cache,
+                embedder_model,
+                embedder_vocab,
+                batch_size=embedding_batch_size,
+            )
         return MilvusAdapter(
             uri=milvus_uri,
             collection_name=collection_name_from_path(sqlite_path),
@@ -1056,6 +1212,20 @@ def make_adapter(
     if system == "sqlite_metadata":
         return VectorMetadataAdapter(sqlite_path)
     raise ValueError(f"unknown system: {system}")
+
+
+def prewarm_adapter_embeddings(adapter: SystemAdapter, events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    embedder = getattr(adapter, "embedder", None)
+    prewarm = getattr(embedder, "prewarm_texts", None)
+    if prewarm is None:
+        return None
+    return prewarm(payload_text(ev) for ev in events)
+
+
+def embedding_cache_arg(args: argparse.Namespace) -> Path | None:
+    if getattr(args, "no_embedding_cache", False):
+        return None
+    return getattr(args, "embedding_cache", DEFAULT_EMBEDDING_CACHE)
 
 
 def query_for_event(ev: dict[str, Any], run_id: str, query_id: str) -> QuerySpec:
@@ -1287,6 +1457,8 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.milvus_uri,
             args.embedder_model,
             args.embedder_vocab,
+            embedding_cache_arg(args),
+            args.embedding_batch_size,
         )
         if system == "plasmod":
             adapter.health()
@@ -1295,6 +1467,7 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             raw = load_events(args.synthetic_input, limit=args.events_per_type, event_types={et}, shuffle=args.shuffle, seed=args.seed)
             run_id = f"{args.run_id}_t4_{system}_{et}"
             events = [namespace_event(ev, run_id) for ev in raw]
+            prewarm_adapter_embeddings(adapter, events)
             if args.reset_between_runs:
                 adapter.reset()
             ingests = ingest_with_rate(adapter, events, args.write_rate, args.workers)
@@ -1373,6 +1546,8 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.milvus_uri,
             args.embedder_model,
             args.embedder_vocab,
+            embedding_cache_arg(args),
+            args.embedding_batch_size,
         )
         if system == "plasmod":
             adapter.health()
@@ -1380,6 +1555,7 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             raw = load_events(args.synthetic_input, limit=args.events_per_rate, shuffle=args.shuffle, seed=args.seed)
             run_id = f"{args.run_id}_t5_{system}_{rate}"
             events = [namespace_event(ev, run_id) for ev in raw]
+            prewarm_adapter_embeddings(adapter, events)
             if args.reset_between_runs:
                 adapter.reset()
             ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, rate, args.query_qps, args.workers, args.query_limit)
@@ -1462,9 +1638,12 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.milvus_uri,
             args.embedder_model,
             args.embedder_vocab,
+            embedding_cache_arg(args),
+            args.embedding_batch_size,
         )
         run_id = f"{args.run_id}_t6_milvus_best_effort"
         events = [namespace_event(ev, run_id) for ev in raw]
+        prewarm_adapter_embeddings(adapter, events)
         if args.reset_between_runs:
             adapter.reset()
         ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, args.fixed_write_rate, args.query_qps, args.workers, args.query_limit)
@@ -1573,7 +1752,10 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.milvus_uri,
             args.embedder_model,
             args.embedder_vocab,
+            embedding_cache_arg(args),
+            args.embedding_batch_size,
         )
+        prewarm_adapter_embeddings(baseline, events)
         baseline.reset()
         replay_out = baseline.replay_events(events)
         rows.append({
@@ -1642,9 +1824,12 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.milvus_uri,
             args.embedder_model,
             args.embedder_vocab,
+            embedding_cache_arg(args),
+            args.embedding_batch_size,
         )
         if system == "plasmod":
             adapter.health()
+        prewarm_adapter_embeddings(adapter, events)
         if args.reset_between_runs:
             adapter.reset()
         ingests = ingest_with_rate(adapter, events, args.write_rate, args.workers)
@@ -1698,6 +1883,40 @@ def run_analyze(args: argparse.Namespace) -> None:
     print(json.dumps(rows, indent=2, ensure_ascii=False, sort_keys=True))
 
 
+def run_prepare_embeddings(args: argparse.Namespace) -> None:
+    if args.no_embedding_cache:
+        raise ValueError("prepare-embeddings requires embedding cache to be enabled")
+    synthetic = load_events(
+        args.synthetic_input,
+        limit=args.synthetic_limit,
+        shuffle=args.shuffle,
+        seed=args.seed,
+        max_files=args.max_files,
+    )
+    replay = load_events(
+        args.replay_input,
+        limit=args.replay_limit,
+        shuffle=False,
+        max_files=args.max_files,
+    )
+    texts = [payload_text(ev) for ev in synthetic]
+    texts.extend(payload_text(ev) for ev in replay)
+    embedder = CachedEmbedder(
+        MiniLMEmbedder(args.embedder_model, args.embedder_vocab),
+        args.embedding_cache,
+        args.embedder_model,
+        args.embedder_vocab,
+        batch_size=args.embedding_batch_size,
+    )
+    summary = embedder.prewarm_texts(texts)
+    summary.update({
+        "synthetic_events": len(synthetic),
+        "replay_events": len(replay),
+        "embedding_cache_enabled": True,
+    })
+    print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
+
+
 def run_tables(args: argparse.Namespace) -> Path:
     run_id = args.run_id or time.strftime("layer2_%Y%m%d_%H%M%S")
     args.run_id = run_id
@@ -1711,6 +1930,8 @@ def run_tables(args: argparse.Namespace) -> Path:
         "milvus_uri": args.milvus_uri,
         "embedder_model": str(args.embedder_model),
         "embedder_vocab": str(args.embedder_vocab),
+        "embedding_cache": "disabled" if args.no_embedding_cache else str(args.embedding_cache),
+        "embedding_batch_size": args.embedding_batch_size,
         "write_rates": args.write_rates,
         "query_qps": args.query_qps,
         "created_at_ms": wall_ms(),
@@ -1756,8 +1977,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     analyze.add_argument("--limit", type=int, default=0)
     analyze.add_argument("--max-files", type=int, default=0)
 
+    def add_embedding_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--embedder-model", type=Path, default=DEFAULT_EMBEDDER_MODEL)
+        p.add_argument("--embedder-vocab", type=Path, default=DEFAULT_EMBEDDER_VOCAB)
+        p.add_argument("--embedding-cache", type=Path, default=DEFAULT_EMBEDDING_CACHE)
+        p.add_argument("--embedding-batch-size", type=int, default=64)
+        p.add_argument("--no-embedding-cache", action="store_true", help="Disable reusable embedding cache; useful only for debugging.")
+
+    prepare = sub.add_parser("prepare-embeddings", help="Precompute and persist reusable MiniLM embeddings for Layer 2 data.")
+    add_common(prepare)
+    add_embedding_args(prepare)
+    prepare.add_argument("--synthetic-limit", type=int, default=0)
+    prepare.add_argument("--replay-limit", type=int, default=0)
+    prepare.add_argument("--max-files", type=int, default=0)
+
     run = sub.add_parser("run", help="Run one or more Layer 2 experiment tables.")
     add_common(run)
+    add_embedding_args(run)
     run.add_argument("--tables", nargs="+", default=["all"], choices=["all", "4", "5", "6", "7", "8"])
     run.add_argument(
         "--systems",
@@ -1780,8 +2016,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--visible-poll-ms", type=float, default=50.0)
     run.add_argument("--http-timeout", type=float, default=30.0)
     run.add_argument("--milvus-uri", default="http://127.0.0.1:19530")
-    run.add_argument("--embedder-model", type=Path, default=DEFAULT_EMBEDDER_MODEL)
-    run.add_argument("--embedder-vocab", type=Path, default=DEFAULT_EMBEDDER_VOCAB)
     run.add_argument("--reset-between-runs", action="store_true")
     return ap.parse_args(argv)
 
@@ -1790,6 +2024,9 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.cmd == "analyze":
         run_analyze(args)
+        return 0
+    if args.cmd == "prepare-embeddings":
+        run_prepare_embeddings(args)
         return 0
     if args.cmd == "run":
         run_dir = run_tables(args)
