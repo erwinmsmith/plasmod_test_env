@@ -669,6 +669,8 @@ class QueryResult:
     visible: bool
     stale: bool
     error: str = ""
+    start_ms: float = 0.0
+    end_ms: float = 0.0
 
 
 class HTTPJSONClient:
@@ -803,10 +805,10 @@ class PlasmodAdapter(SystemAdapter):
             t1 = now_ms()
             ids = response_ids(resp)
             visible = bool(ids & q.expected_ids) or json_contains_any(resp, q.expected_ids)
-            return QueryResult(self.name, q.query_type, t1 - t0, True, visible, not visible), resp
+            return QueryResult(self.name, q.query_type, t1 - t0, True, visible, not visible, start_ms=t0, end_ms=t1), resp
         except Exception as exc:
             t1 = now_ms()
-            return QueryResult(self.name, q.query_type, t1 - t0, False, False, True, str(exc)), {}
+            return QueryResult(self.name, q.query_type, t1 - t0, False, False, True, str(exc), start_ms=t0, end_ms=t1), {}
 
     def replay(self, from_lsn: int = 0, limit: int = 0, apply: bool = False) -> dict[str, Any]:
         body = {"from_lsn": from_lsn, "limit": limit, "apply": apply}
@@ -852,6 +854,7 @@ class MilvusAdapter(SystemAdapter):
         collection_name: str = "layer2_milvus",
         timeout: float = 30.0,
         embedder: MiniLMEmbedder | None = None,
+        visibility_policy: str = "flush_on_ack",
     ):
         from pymilvus import MilvusClient
 
@@ -859,6 +862,7 @@ class MilvusAdapter(SystemAdapter):
         self.collection_name = collection_name
         self.timeout = timeout
         self.embedder = embedder or MiniLMEmbedder()
+        self.visibility_policy = visibility_policy
         self.client = MilvusClient(uri=uri)
         self.mu = threading.Lock()
         self._ensure_collection(drop=False)
@@ -940,6 +944,9 @@ class MilvusAdapter(SystemAdapter):
         }
 
     def ingest(self, ev: dict[str, Any]) -> IngestResult:
+        return self._ingest(ev, enforce_visibility=True)
+
+    def _ingest(self, ev: dict[str, Any], enforce_visibility: bool) -> IngestResult:
         t0 = now_ms()
         eid = event_id(ev)
         oid = object_id(ev)
@@ -947,7 +954,9 @@ class MilvusAdapter(SystemAdapter):
             vector = self.embedder.embed_one(payload_text(ev))
             row = self._row_for_event(ev, vector)
             with self.mu:
-                self.client.insert(self.collection_name, [row])
+                self.client.insert(self.collection_name, [row], timeout=self.timeout)
+                if enforce_visibility and self.visibility_policy == "flush_on_ack":
+                    self.client.flush(self.collection_name, timeout=self.timeout)
             t1 = now_ms()
             return IngestResult(
                 system=self.name,
@@ -988,26 +997,25 @@ class MilvusAdapter(SystemAdapter):
                 target_values = milvus_string_list(sorted(q.target_object_ids))
                 clauses.append(f"(event_id in {target_values} or object_id in {target_values} or pk in {target_values})")
             expr = " and ".join(clauses) if clauses else ""
-            with self.mu:
-                if q.target_object_ids:
-                    rows = self.client.query(
-                        self.collection_name,
-                        filter=expr,
-                        output_fields=["pk", "event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
-                        timeout=self.timeout,
-                    )
-                    rows = [rows]
-                else:
-                    vector = self.embedder.embed_one(q.query_text or "latest")
-                    rows = self.client.search(
-                        self.collection_name,
-                        [vector],
-                        limit=10,
-                        filter=expr,
-                        output_fields=["event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
-                        search_params={"ef": 64},
-                        timeout=self.timeout,
-                    )
+            if q.target_object_ids:
+                rows = self.client.query(
+                    self.collection_name,
+                    filter=expr,
+                    output_fields=["pk", "event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
+                    timeout=self.timeout,
+                )
+                rows = [rows]
+            else:
+                vector = self.embedder.embed_one(q.query_text or "latest")
+                rows = self.client.search(
+                    self.collection_name,
+                    [vector],
+                    limit=10,
+                    filter=expr,
+                    output_fields=["event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
+                    search_params={"ef": 64},
+                    timeout=self.timeout,
+                )
             ids: set[str] = set()
             objects: list[dict[str, Any]] = []
             for hit in rows[0] if rows else []:
@@ -1021,17 +1029,17 @@ class MilvusAdapter(SystemAdapter):
             visible = bool(ids & q.expected_ids)
             t1 = now_ms()
             resp = {"objects": list(ids), "rows": objects}
-            return QueryResult(self.name, q.query_type, t1 - t0, True, visible, not visible), resp
+            return QueryResult(self.name, q.query_type, t1 - t0, True, visible, not visible, start_ms=t0, end_ms=t1), resp
         except Exception as exc:
             t1 = now_ms()
-            return QueryResult(self.name, q.query_type, t1 - t0, False, False, True, str(exc)), {}
+            return QueryResult(self.name, q.query_type, t1 - t0, False, False, True, str(exc), start_ms=t0, end_ms=t1), {}
 
     def replay_events(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         t0 = now_ms()
         applied = 0
         failed = 0
         for ev in events:
-            res = self.ingest(ev)
+            res = self._ingest(ev, enforce_visibility=False)
             if res.ok:
                 applied += 1
             else:
@@ -1168,10 +1176,10 @@ class VectorMetadataAdapter(SystemAdapter):
             visible = bool(ids & q.expected_ids)
             t1 = now_ms()
             resp = {"objects": list(ids), "rows": rows}
-            return QueryResult(self.name, q.query_type, t1 - t0, True, visible, not visible), resp
+            return QueryResult(self.name, q.query_type, t1 - t0, True, visible, not visible, start_ms=t0, end_ms=t1), resp
         except Exception as exc:
             t1 = now_ms()
-            return QueryResult(self.name, q.query_type, t1 - t0, False, False, True, str(exc)), {}
+            return QueryResult(self.name, q.query_type, t1 - t0, False, False, True, str(exc), start_ms=t0, end_ms=t1), {}
 
     def replay_events(self, events: list[dict[str, Any]]) -> dict[str, Any]:
         t0 = now_ms()
@@ -1204,6 +1212,7 @@ def make_adapter(
     embedder_vocab: Path = DEFAULT_EMBEDDER_VOCAB,
     embedding_cache: Path | None = DEFAULT_EMBEDDING_CACHE,
     embedding_batch_size: int = 64,
+    milvus_visibility_policy: str = "flush_on_ack",
 ) -> SystemAdapter:
     if system == "plasmod":
         return PlasmodAdapter(base_url, timeout=timeout)
@@ -1222,6 +1231,7 @@ def make_adapter(
             collection_name=collection_name_from_path(sqlite_path),
             timeout=timeout,
             embedder=embedder,
+            visibility_policy=milvus_visibility_policy,
         )
     if system == "sqlite_metadata":
         return VectorMetadataAdapter(sqlite_path)
@@ -1259,6 +1269,8 @@ def query_for_event(ev: dict[str, Any], run_id: str, query_id: str) -> QuerySpec
         "tool_result": ["event", "memory"],
         "observation": ["event", "memory"],
     }.get(et, [ot] if ot else [])
+    if et and et not in object_types:
+        object_types.append(et)
     expected = {event_id(ev), object_id(ev)}
     expected = {x for x in expected if x}
     return QuerySpec(
@@ -1289,7 +1301,10 @@ def ingest_with_rate(
     interval = 0.0 if rate_eps <= 0 else 1.0 / rate_eps
     start = time.perf_counter()
     futures: list[tuple[dict[str, Any], Future[IngestResult]]] = []
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+    effective_workers = max(1, workers)
+    if adapter.name == "Milvus" and getattr(adapter, "visibility_policy", "") == "flush_on_ack":
+        effective_workers = 1
+    with ThreadPoolExecutor(max_workers=effective_workers) as pool:
         for idx, ev in enumerate(events):
             target = start + idx * interval
             delay = target - time.perf_counter()
@@ -1367,7 +1382,8 @@ def wait_until_visible(
         if materialization_enabled(ev) and ingest_result.materialized_ms is None:
             ingest_result.materialized_ms = ingest_result.write_ack_ms + timeout_ms
     if last is None:
-        last = QueryResult(adapter.name, query.query_type, 0.0, False, False, True, "visibility timeout")
+        t = now_ms()
+        last = QueryResult(adapter.name, query.query_type, 0.0, False, False, True, "visibility timeout", start_ms=t, end_ms=t)
     return last
 
 
@@ -1496,6 +1512,18 @@ def summarize_queries(system: str, key: str, queries: list[QueryResult]) -> dict
     }
 
 
+def query_window_qps(queries: list[QueryResult]) -> float:
+    ok = [q for q in queries if q.ok]
+    if not ok:
+        return 0.0
+    start = min(q.start_ms for q in ok)
+    end = max(q.end_ms for q in ok)
+    window_ms = end - start
+    if window_ms <= 0:
+        window_ms = sum(max(q.latency_ms, 0.0) for q in ok)
+    return zero_if_none(safe_div(float(len(ok)), max(window_ms / 1000.0, 1e-9)))
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -1533,6 +1561,7 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedder_vocab,
             embedding_cache_arg(args),
             args.embedding_batch_size,
+            args.milvus_visibility_policy,
         )
         if system == "plasmod":
             adapter.health()
@@ -1645,6 +1674,7 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedder_vocab,
             embedding_cache_arg(args),
             args.embedding_batch_size,
+            args.milvus_visibility_policy,
         )
         if system == "plasmod":
             adapter.health()
@@ -1655,7 +1685,7 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             prewarm_adapter_embeddings(adapter, events)
             if args.reset_between_runs:
                 adapter.reset()
-            ingests, queries, elapsed_s = run_freshness_trial(
+            ingests, queries, _elapsed_s = run_freshness_trial(
                 adapter,
                 events,
                 run_id,
@@ -1674,7 +1704,7 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "table": "table5",
                 "system": adapter.name,
                 "write_rate_events_s": rate,
-                "query_qps": zero_if_none(safe_div(len(queries), elapsed_s)),
+                "query_qps": query_window_qps(queries),
                 "query_p50_ms": query_row["query_p50_ms"],
                 "query_p95_ms": query_row["query_p95_ms"],
                 "write_to_visible_p95_ms": ingest_row["write_to_visible_p95_ms"],
@@ -1711,7 +1741,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             events = [namespace_event(ev, run_id, PLASMOD_MODES[mode]) for ev in raw]
             if args.reset_between_runs:
                 adapter.reset()
-            ingests, queries, elapsed_s = run_freshness_trial(
+            ingests, queries, _elapsed_s = run_freshness_trial(
                 adapter,
                 events,
                 run_id,
@@ -1731,7 +1761,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "system": "Plasmod",
                 "visibility_mode": {"strict": "Strict", "bounded": "Bounded Staleness", "eventual": "Eventual"}[mode],
                 "write_qps": irow["write_qps"],
-                "query_qps": zero_if_none(safe_div(len(queries), elapsed_s)),
+                "query_qps": query_window_qps(queries),
                 "query_p95_ms": qrow["query_p95_ms"],
                 "write_to_visible_p95_ms": irow["write_to_visible_p95_ms"],
                 "materialization_lag_p95_ms": irow["materialization_lag_p95_ms"],
@@ -1759,13 +1789,14 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedder_vocab,
             embedding_cache_arg(args),
             args.embedding_batch_size,
+            args.milvus_visibility_policy,
         )
         run_id = f"{args.run_id}_t6_milvus_best_effort"
         events = [namespace_event(ev, run_id) for ev in raw]
         prewarm_adapter_embeddings(adapter, events)
         if args.reset_between_runs:
             adapter.reset()
-        ingests, queries, elapsed_s = run_freshness_trial(
+        ingests, queries, _elapsed_s = run_freshness_trial(
             adapter,
             events,
             run_id,
@@ -1785,7 +1816,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "system": adapter.name,
             "visibility_mode": "Best-effort",
             "write_qps": irow["write_qps"],
-            "query_qps": zero_if_none(safe_div(len(queries), elapsed_s)),
+            "query_qps": query_window_qps(queries),
             "query_p95_ms": qrow["query_p95_ms"],
             "write_to_visible_p95_ms": irow["write_to_visible_p95_ms"],
             "materialization_lag_p95_ms": irow["materialization_lag_p95_ms"],
@@ -1885,6 +1916,7 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedder_vocab,
             embedding_cache_arg(args),
             args.embedding_batch_size,
+            args.milvus_visibility_policy,
         )
         prewarm_adapter_embeddings(baseline, events)
         baseline.reset()
@@ -1933,6 +1965,7 @@ def select_table8_events(events: list[dict[str, Any]], update_type: str) -> list
 def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     raw_all = load_events(args.replay_input, limit=args.replay_events, shuffle=False)
+    raw_full: list[dict[str, Any]] | None = None
     cases: list[tuple[str, str, str]] = []
     if wants_milvus_baseline(args.systems):
         cases.extend([
@@ -1947,6 +1980,10 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
         ])
     for system, label, selector in cases:
         selected = select_table8_events(raw_all, selector)[: args.table8_updates]
+        if len(selected) < args.table8_updates and args.replay_events > 0:
+            if raw_full is None:
+                raw_full = load_events(args.replay_input, limit=0, shuffle=False)
+            selected = select_table8_events(raw_full, selector)[: args.table8_updates]
         run_id = f"{args.run_id}_t8_{system}_{selector}"
         events = [namespace_event(ev, run_id) for ev in selected]
         adapter = make_adapter(
@@ -1959,6 +1996,7 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.embedder_vocab,
             embedding_cache_arg(args),
             args.embedding_batch_size,
+            args.milvus_visibility_policy,
         )
         if system == "plasmod":
             adapter.health()
@@ -2063,6 +2101,7 @@ def run_tables(args: argparse.Namespace) -> Path:
         "replay_input": str(args.replay_input),
         "systems": args.systems,
         "milvus_uri": args.milvus_uri,
+        "milvus_visibility_policy": args.milvus_visibility_policy,
         "embedder_model": str(args.embedder_model),
         "embedder_vocab": str(args.embedder_vocab),
         "embedding_cache": "disabled" if args.no_embedding_cache else str(args.embedding_cache),
@@ -2154,6 +2193,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--visible-poll-ms", type=float, default=50.0)
     run.add_argument("--http-timeout", type=float, default=30.0)
     run.add_argument("--milvus-uri", default="http://127.0.0.1:19530")
+    run.add_argument(
+        "--milvus-visibility-policy",
+        choices=["flush_on_ack", "deferred"],
+        default="flush_on_ack",
+        help="flush_on_ack makes Milvus writes read-visible before ACK; deferred measures best-effort async visibility.",
+    )
     run.add_argument("--reset-between-runs", action="store_true")
     run.add_argument("--allow-write-errors", action="store_true", help="Record write failures instead of stopping the run.")
     run.add_argument("--allow-query-errors", action="store_true", help="Record query failures instead of stopping the run.")
