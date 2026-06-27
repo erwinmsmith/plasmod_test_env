@@ -1622,14 +1622,17 @@ def run_freshness_trial(
 
     def query_loop() -> None:
         idx = 0
+        cursor = 0
+        effective_query_limit = len(events) if query_limit <= 0 else query_limit
         while True:
-            if query_limit > 0 and idx >= query_limit:
+            if idx >= effective_query_limit:
                 break
             with completed_mu:
-                item = completed[-1] if completed else None
+                item = completed[cursor] if cursor < len(completed) else None
             if item is None and stop.is_set():
                 break
             if item is not None:
+                cursor += 1
                 ev, res = item
                 q = query_for_event(ev, run_id, f"q_{idx}")
                 q.expected_ids |= res.expected_ids
