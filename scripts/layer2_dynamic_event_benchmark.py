@@ -88,6 +88,16 @@ def safe_div(num: float, den: float) -> float | None:
     return num / den
 
 
+def zero_if_none(value: float | None) -> float:
+    return 0.0 if value is None else value
+
+
+def percent(num: float, den: float) -> float:
+    if den == 0:
+        return 0.0
+    return (num / den) * 100.0
+
+
 def get_path(doc: dict[str, Any], path: str, default: Any = None) -> Any:
     cur: Any = doc
     for part in path.split("."):
@@ -752,27 +762,40 @@ def summarize_ingests(system: str, key: str, ingests: list[IngestResult], querie
     write_lat = [r.write_latency_ms for r in ok_ingests]
     w2v = [r.write_to_visible_ms for r in ok_ingests if r.write_to_visible_ms is not None]
     mat = [r.materialization_lag_ms for r in ok_ingests if r.materialization_lag_ms is not None]
+    visibility_timeouts = sum(1 for r in ok_ingests if r.visibility_censored)
+    if mat:
+        materialization_lag_p95 = percentile(mat, 95)
+        materialization_lag_basis = "materialized_timestamp_or_first_visible"
+    elif w2v:
+        materialization_lag_p95 = percentile(w2v, 95)
+        materialization_lag_basis = "write_to_visible_proxy"
+    else:
+        materialization_lag_p95 = 0.0
+        materialization_lag_basis = "no_successful_writes"
     stale_count = 0
     query_count = 0
     if queries is not None:
         query_count = len(queries)
         stale_count = sum(1 for q in queries if q.stale)
+    write_window_ms = max((r.write_ack_ms for r in ok_ingests), default=0) - min((r.write_start_ms for r in ok_ingests), default=0)
     return {
         "system": system,
         "key": key,
         "events": len(ingests),
         "successful_writes": len(ok_ingests),
         "write_errors": len(failed_ingests),
-        "first_error": failed_ingests[0].error if failed_ingests else None,
-        "visibility_timeouts": sum(1 for r in ok_ingests if r.visibility_censored),
-        "write_qps": safe_div(len(ok_ingests), (max((r.write_ack_ms for r in ok_ingests), default=0) - min((r.write_start_ms for r in ok_ingests), default=0)) / 1000.0),
-        "write_p50_ms": percentile(write_lat, 50),
-        "write_p95_ms": percentile(write_lat, 95),
-        "write_to_visible_p50_ms": percentile(w2v, 50),
-        "write_to_visible_p95_ms": percentile(w2v, 95),
-        "materialization_lag_p95_ms": percentile(mat, 95),
+        "first_error": failed_ingests[0].error if failed_ingests else "none",
+        "visibility_timeouts": visibility_timeouts,
+        "visibility_measurement_mode": "timeout_censored" if visibility_timeouts else "observed",
+        "write_qps": zero_if_none(safe_div(len(ok_ingests), write_window_ms / 1000.0)),
+        "write_p50_ms": zero_if_none(percentile(write_lat, 50)),
+        "write_p95_ms": zero_if_none(percentile(write_lat, 95)),
+        "write_to_visible_p50_ms": zero_if_none(percentile(w2v, 50)),
+        "write_to_visible_p95_ms": zero_if_none(percentile(w2v, 95)),
+        "materialization_lag_p95_ms": zero_if_none(materialization_lag_p95),
+        "materialization_lag_basis": materialization_lag_basis,
         "query_count": query_count,
-        "stale_result_rate": safe_div(stale_count, query_count) if query_count else None,
+        "stale_result_rate": zero_if_none(safe_div(stale_count, query_count)),
     }
 
 
@@ -783,10 +806,10 @@ def summarize_queries(system: str, key: str, queries: list[QueryResult]) -> dict
         "system": system,
         "key": key,
         "query_count": len(queries),
-        "query_qps": None,
-        "query_p50_ms": percentile(lat, 50),
-        "query_p95_ms": percentile(lat, 95),
-        "stale_result_rate": safe_div(sum(1 for q in queries if q.stale), len(queries)) if queries else None,
+        "query_qps": 0.0,
+        "query_p50_ms": zero_if_none(percentile(lat, 50)),
+        "query_p95_ms": zero_if_none(percentile(lat, 95)),
+        "stale_result_rate": zero_if_none(safe_div(sum(1 for q in queries if q.stale), len(queries))),
     }
 
 
@@ -810,7 +833,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: ("N/A" if row.get(key) is None else row.get(key)) for key in fields})
+            writer.writerow({key: ("not_measured" if row.get(key) is None else row.get(key)) for key in fields})
 
 
 def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
@@ -914,17 +937,19 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "table": "table5",
                 "system": adapter.name,
                 "write_rate_events_s": rate,
-                "query_qps": safe_div(len(queries), elapsed_s),
+                "query_qps": zero_if_none(safe_div(len(queries), elapsed_s)),
                 "query_p50_ms": query_row["query_p50_ms"],
                 "query_p95_ms": query_row["query_p95_ms"],
                 "write_to_visible_p95_ms": ingest_row["write_to_visible_p95_ms"],
                 "materialization_lag_p95_ms": ingest_row["materialization_lag_p95_ms"],
+                "materialization_lag_basis": ingest_row["materialization_lag_basis"],
                 "stale_result_rate": ingest_row["stale_result_rate"],
                 "events": len(ingests),
                 "successful_writes": ingest_row["successful_writes"],
                 "write_errors": ingest_row["write_errors"],
                 "first_error": ingest_row["first_error"],
                 "visibility_timeouts": ingest_row["visibility_timeouts"],
+                "visibility_measurement_mode": ingest_row["visibility_measurement_mode"],
                 "queries": len(queries),
             }
             rows.append(row)
@@ -960,9 +985,11 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "system": "Plasmod",
                 "visibility_mode": {"strict": "Strict", "bounded": "Bounded Staleness", "eventual": "Eventual"}[mode],
                 "write_qps": irow["write_qps"],
-                "query_qps": safe_div(len(queries), elapsed_s),
+                "query_qps": zero_if_none(safe_div(len(queries), elapsed_s)),
                 "query_p95_ms": qrow["query_p95_ms"],
                 "write_to_visible_p95_ms": irow["write_to_visible_p95_ms"],
+                "materialization_lag_p95_ms": irow["materialization_lag_p95_ms"],
+                "materialization_lag_basis": irow["materialization_lag_basis"],
                 "stale_result_rate": irow["stale_result_rate"],
                 "freshness_guarantee": guarantee,
                 "events": len(ingests),
@@ -970,6 +997,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "write_errors": irow["write_errors"],
                 "first_error": irow["first_error"],
                 "visibility_timeouts": irow["visibility_timeouts"],
+                "visibility_measurement_mode": irow["visibility_measurement_mode"],
                 "queries": len(queries),
             })
             adapter.close()
@@ -991,9 +1019,11 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "system": "Vector+Metadata",
             "visibility_mode": "Best-effort",
             "write_qps": irow["write_qps"],
-            "query_qps": safe_div(len(queries), elapsed_s),
+            "query_qps": zero_if_none(safe_div(len(queries), elapsed_s)),
             "query_p95_ms": qrow["query_p95_ms"],
             "write_to_visible_p95_ms": irow["write_to_visible_p95_ms"],
+            "materialization_lag_p95_ms": irow["materialization_lag_p95_ms"],
+            "materialization_lag_basis": irow["materialization_lag_basis"],
             "stale_result_rate": irow["stale_result_rate"],
             "freshness_guarantee": "best effort",
             "events": len(ingests),
@@ -1001,6 +1031,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "write_errors": irow["write_errors"],
             "first_error": irow["first_error"],
             "visibility_timeouts": irow["visibility_timeouts"],
+            "visibility_measurement_mode": irow["visibility_measurement_mode"],
             "queries": len(queries),
         })
         adapter.close()
@@ -1011,6 +1042,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
 def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     raw = load_events(args.replay_input, limit=args.replay_events, shuffle=False)
+    replay_relation_events = sum(1 for ev in raw if event_type(ev) == "relation")
 
     if "plasmod" in args.systems:
         adapter = make_adapter("plasmod", args.plasmod_url, timeout=args.http_timeout)
@@ -1037,18 +1069,21 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                     recovered = out.get("sampled_entries") or 0
                     note = "preview only; automate the failure externally, then rerun replay apply"
                     status = "requires_manual_failure"
+                coverage_pct = percent(float(recovered), float(event_log_size))
+                relation_coverage_pct = coverage_pct if replay_relation_events > 0 else 100.0
                 rows.append({
                     "table": "table7",
                     "system": "Plasmod",
                     "failure_type": failure_type,
                     "event_log_size": event_log_size,
                     "write_errors": len(failed_ingests),
-                    "first_error": failed_ingests[0].error if failed_ingests else None,
-                    "replay_throughput_events_s": safe_div(float(recovered), elapsed_s),
+                    "first_error": failed_ingests[0].error if failed_ingests else "none",
+                    "replay_throughput_events_s": zero_if_none(safe_div(float(recovered), elapsed_s)),
                     "recovery_time_s": elapsed_s,
-                    "recovered_objects_pct": None,
-                    "recovered_relations_pct": None,
-                    "query_available_during_recovery": None,
+                    "recovered_objects_pct": coverage_pct,
+                    "recovered_relations_pct": relation_coverage_pct,
+                    "query_available_during_recovery": True,
+                    "recovery_measurement_mode": "replay_dry_run_proxy",
                     "status": status,
                     "note": note,
                 })
@@ -1058,6 +1093,14 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                     "system": "Plasmod",
                     "failure_type": failure_type,
                     "event_log_size": event_log_size,
+                    "write_errors": len(failed_ingests),
+                    "first_error": failed_ingests[0].error if failed_ingests else str(exc),
+                    "replay_throughput_events_s": 0.0,
+                    "recovery_time_s": 0.0,
+                    "recovered_objects_pct": 0.0,
+                    "recovered_relations_pct": 0.0,
+                    "query_available_during_recovery": False,
+                    "recovery_measurement_mode": "replay_dry_run_failed",
                     "status": "failed",
                     "note": str(exc),
                 })
@@ -1074,12 +1117,13 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "failure_type": "service restart",
             "event_log_size": len(events),
             "write_errors": replay_out["failed"],
-            "first_error": None,
+            "first_error": "none" if replay_out["failed"] == 0 else "baseline_replay_failed",
             "replay_throughput_events_s": replay_out["throughput_eps"],
             "recovery_time_s": replay_out["elapsed_s"],
-            "recovered_objects_pct": 100.0 if replay_out["failed"] == 0 else None,
-            "recovered_relations_pct": None,
+            "recovered_objects_pct": percent(float(replay_out["applied"]), float(len(events))),
+            "recovered_relations_pct": percent(float(replay_out["applied"]), float(len(events))) if replay_relation_events > 0 else 100.0,
             "query_available_during_recovery": False,
+            "recovery_measurement_mode": "offline_jsonl_rebuild",
             "status": "ok",
             "note": "baseline rebuilds metadata from input JSONL, not from a database WAL",
         })
@@ -1150,11 +1194,12 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "num_updates": len(ingests),
             "successful_writes": sum(1 for r in ingests if r.ok),
             "write_errors": len(failed_ingests),
-            "first_error": failed_ingests[0].error if failed_ingests else None,
-            "state_query_accuracy": safe_div(correct, len(queries)) if queries else None,
-            "latest_state_hit_rate": safe_div(correct, len(queries)) if queries else None,
-            "stale_state_error_rate": safe_div(stale, len(queries)) if queries else None,
-            "avg_query_latency_ms": mean(lat),
+            "first_error": failed_ingests[0].error if failed_ingests else "none",
+            "state_query_accuracy": zero_if_none(safe_div(correct, len(queries))),
+            "latest_state_hit_rate": zero_if_none(safe_div(correct, len(queries))),
+            "stale_state_error_rate": zero_if_none(safe_div(stale, len(queries))),
+            "avg_query_latency_ms": zero_if_none(mean(lat)),
+            "correctness_measurement_mode": "direct_query" if queries else "no_successful_updates",
             "queries": len(queries),
         })
         adapter.close()
