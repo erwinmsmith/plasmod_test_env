@@ -337,6 +337,7 @@ class IngestResult:
     ack: dict[str, Any] = field(default_factory=dict)
     first_visible_ms: float | None = None
     materialized_ms: float | None = None
+    visibility_censored: bool = False
 
     @property
     def write_to_visible_ms(self) -> float | None:
@@ -643,9 +644,9 @@ class VectorMetadataAdapter(SystemAdapter):
         }
 
 
-def make_adapter(system: str, base_url: str, sqlite_path: Path | None = None) -> SystemAdapter:
+def make_adapter(system: str, base_url: str, sqlite_path: Path | None = None, timeout: float = 30.0) -> SystemAdapter:
     if system == "plasmod":
-        return PlasmodAdapter(base_url)
+        return PlasmodAdapter(base_url, timeout=timeout)
     if system in {"vector_metadata", "baseline"}:
         return VectorMetadataAdapter(sqlite_path)
     raise ValueError(f"unknown system: {system}")
@@ -735,6 +736,11 @@ def wait_until_visible(
                 ingest_result.materialized_ms = t
             return qr
         time.sleep(max(poll_ms, 1.0) / 1000.0)
+    if ingest_result.ok and ingest_result.first_visible_ms is None:
+        ingest_result.first_visible_ms = ingest_result.write_ack_ms + timeout_ms
+        ingest_result.visibility_censored = True
+        if materialization_enabled(ev) and ingest_result.materialized_ms is None:
+            ingest_result.materialized_ms = ingest_result.write_ack_ms + timeout_ms
     if last is None:
         last = QueryResult(adapter.name, query.query_type, 0.0, False, False, True, "visibility timeout")
     return last
@@ -742,6 +748,7 @@ def wait_until_visible(
 
 def summarize_ingests(system: str, key: str, ingests: list[IngestResult], queries: list[QueryResult] | None = None) -> dict[str, Any]:
     ok_ingests = [r for r in ingests if r.ok]
+    failed_ingests = [r for r in ingests if not r.ok]
     write_lat = [r.write_latency_ms for r in ok_ingests]
     w2v = [r.write_to_visible_ms for r in ok_ingests if r.write_to_visible_ms is not None]
     mat = [r.materialization_lag_ms for r in ok_ingests if r.materialization_lag_ms is not None]
@@ -755,6 +762,9 @@ def summarize_ingests(system: str, key: str, ingests: list[IngestResult], querie
         "key": key,
         "events": len(ingests),
         "successful_writes": len(ok_ingests),
+        "write_errors": len(failed_ingests),
+        "first_error": failed_ingests[0].error if failed_ingests else None,
+        "visibility_timeouts": sum(1 for r in ok_ingests if r.visibility_censored),
         "write_qps": safe_div(len(ok_ingests), (max((r.write_ack_ms for r in ok_ingests), default=0) - min((r.write_start_ms for r in ok_ingests), default=0)) / 1000.0),
         "write_p50_ms": percentile(write_lat, 50),
         "write_p95_ms": percentile(write_lat, 95),
@@ -799,14 +809,15 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        writer.writerows(rows)
+        for row in rows:
+            writer.writerow({key: ("N/A" if row.get(key) is None else row.get(key)) for key in fields})
 
 
 def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     systems = args.systems
     for system in systems:
-        adapter = make_adapter(system, args.plasmod_url, run_dir / f"{system}.sqlite")
+        adapter = make_adapter(system, args.plasmod_url, run_dir / f"{system}.sqlite", args.http_timeout)
         if system == "plasmod":
             adapter.health()
         types = TABLE4_PLASMOD_TYPES if system == "plasmod" else TABLE4_BASELINE_TYPES
@@ -848,17 +859,26 @@ def run_freshness_trial(
 
     def query_loop() -> None:
         idx = 0
-        while not stop.is_set() or idx < query_limit:
+        while True:
+            if query_limit > 0 and idx >= query_limit:
+                break
             with completed_mu:
                 item = completed[-1] if completed else None
+            if item is None and stop.is_set():
+                break
             if item is not None:
                 ev, res = item
                 q = query_for_event(ev, run_id, f"q_{idx}")
                 q.expected_ids |= res.expected_ids
                 qr, _ = adapter.query(q)
+                if qr.ok and qr.visible and res.first_visible_ms is None:
+                    t = now_ms()
+                    res.first_visible_ms = t
+                    if materialization_enabled(ev) and res.materialized_ms is None:
+                        res.materialized_ms = t
                 query_results.append(qr)
                 idx += 1
-                if query_limit > 0 and idx >= query_limit and stop.is_set():
+                if stop.is_set() and len(completed) == 0:
                     break
             time.sleep(q_interval if q_interval > 0 else 0.001)
 
@@ -875,7 +895,7 @@ def run_freshness_trial(
 def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for system in args.systems:
-        adapter = make_adapter(system, args.plasmod_url, run_dir / f"{system}.sqlite")
+        adapter = make_adapter(system, args.plasmod_url, run_dir / f"{system}.sqlite", args.http_timeout)
         if system == "plasmod":
             adapter.health()
         for rate in args.write_rates:
@@ -885,6 +905,9 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             if args.reset_between_runs:
                 adapter.reset()
             ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, rate, args.query_qps, args.workers, args.query_limit)
+            for ev, res in zip(events, ingests):
+                if res.ok and res.first_visible_ms is None:
+                    wait_until_visible(adapter, ev, res, run_id, args.visible_timeout_ms, args.visible_poll_ms)
             ingest_row = summarize_ingests(adapter.name, str(rate), ingests, queries)
             query_row = summarize_queries(adapter.name, str(rate), queries)
             row = {
@@ -898,6 +921,10 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "materialization_lag_p95_ms": ingest_row["materialization_lag_p95_ms"],
                 "stale_result_rate": ingest_row["stale_result_rate"],
                 "events": len(ingests),
+                "successful_writes": ingest_row["successful_writes"],
+                "write_errors": ingest_row["write_errors"],
+                "first_error": ingest_row["first_error"],
+                "visibility_timeouts": ingest_row["visibility_timeouts"],
                 "queries": len(queries),
             }
             rows.append(row)
@@ -915,7 +942,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             ("bounded", "bounded lag"),
             ("eventual", "eventual visibility"),
         ]:
-            adapter = make_adapter("plasmod", args.plasmod_url)
+            adapter = make_adapter("plasmod", args.plasmod_url, timeout=args.http_timeout)
             adapter.health()
             adapter.set_visibility_mode(mode)
             run_id = f"{args.run_id}_t6_plasmod_{mode}"
@@ -923,6 +950,9 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             if args.reset_between_runs:
                 adapter.reset()
             ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, args.fixed_write_rate, args.query_qps, args.workers, args.query_limit)
+            for ev, res in zip(events, ingests):
+                if res.ok and res.first_visible_ms is None:
+                    wait_until_visible(adapter, ev, res, run_id, args.visible_timeout_ms, args.visible_poll_ms)
             qrow = summarize_queries(adapter.name, mode, queries)
             irow = summarize_ingests(adapter.name, mode, ingests, queries)
             rows.append({
@@ -936,17 +966,24 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "stale_result_rate": irow["stale_result_rate"],
                 "freshness_guarantee": guarantee,
                 "events": len(ingests),
+                "successful_writes": irow["successful_writes"],
+                "write_errors": irow["write_errors"],
+                "first_error": irow["first_error"],
+                "visibility_timeouts": irow["visibility_timeouts"],
                 "queries": len(queries),
             })
             adapter.close()
 
     if "vector_metadata" in args.systems or "baseline" in args.systems:
-        adapter = make_adapter("vector_metadata", args.plasmod_url, run_dir / "vector_metadata.sqlite")
+        adapter = make_adapter("vector_metadata", args.plasmod_url, run_dir / "vector_metadata.sqlite", args.http_timeout)
         run_id = f"{args.run_id}_t6_baseline_best_effort"
         events = [namespace_event(ev, run_id) for ev in raw]
         if args.reset_between_runs:
             adapter.reset()
         ingests, queries, elapsed_s = run_freshness_trial(adapter, events, run_id, args.fixed_write_rate, args.query_qps, args.workers, args.query_limit)
+        for ev, res in zip(events, ingests):
+            if res.ok and res.first_visible_ms is None:
+                wait_until_visible(adapter, ev, res, run_id, args.visible_timeout_ms, args.visible_poll_ms)
         qrow = summarize_queries(adapter.name, "best_effort", queries)
         irow = summarize_ingests(adapter.name, "best_effort", ingests, queries)
         rows.append({
@@ -960,6 +997,10 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "stale_result_rate": irow["stale_result_rate"],
             "freshness_guarantee": "best effort",
             "events": len(ingests),
+            "successful_writes": irow["successful_writes"],
+            "write_errors": irow["write_errors"],
+            "first_error": irow["first_error"],
+            "visibility_timeouts": irow["visibility_timeouts"],
             "queries": len(queries),
         })
         adapter.close()
@@ -972,7 +1013,7 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     raw = load_events(args.replay_input, limit=args.replay_events, shuffle=False)
 
     if "plasmod" in args.systems:
-        adapter = make_adapter("plasmod", args.plasmod_url)
+        adapter = make_adapter("plasmod", args.plasmod_url, timeout=args.http_timeout)
         adapter.health()
         run_id = f"{args.run_id}_t7_plasmod_seed"
         events = [namespace_event(ev, run_id) for ev in raw]
@@ -980,6 +1021,7 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             adapter.reset()
         ingests = ingest_with_rate(adapter, events, args.write_rate, args.workers)
         event_log_size = sum(1 for r in ingests if r.ok)
+        failed_ingests = [r for r in ingests if not r.ok]
         for failure_type in ["materialized view reset", "index rebuild", "service restart"]:
             t0 = now_ms()
             try:
@@ -1000,6 +1042,8 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                     "system": "Plasmod",
                     "failure_type": failure_type,
                     "event_log_size": event_log_size,
+                    "write_errors": len(failed_ingests),
+                    "first_error": failed_ingests[0].error if failed_ingests else None,
                     "replay_throughput_events_s": safe_div(float(recovered), elapsed_s),
                     "recovery_time_s": elapsed_s,
                     "recovered_objects_pct": None,
@@ -1029,6 +1073,8 @@ def run_table7(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "system": "Vector+Metadata",
             "failure_type": "service restart",
             "event_log_size": len(events),
+            "write_errors": replay_out["failed"],
+            "first_error": None,
             "replay_throughput_events_s": replay_out["throughput_eps"],
             "recovery_time_s": replay_out["elapsed_s"],
             "recovered_objects_pct": 100.0 if replay_out["failed"] == 0 else None,
@@ -1079,12 +1125,13 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
         selected = select_table8_events(raw_all, selector)[: args.table8_updates]
         run_id = f"{args.run_id}_t8_{system}_{selector}"
         events = [namespace_event(ev, run_id) for ev in selected]
-        adapter = make_adapter(system, args.plasmod_url, run_dir / f"{system}_t8.sqlite")
+        adapter = make_adapter(system, args.plasmod_url, run_dir / f"{system}_t8.sqlite", args.http_timeout)
         if system == "plasmod":
             adapter.health()
         if args.reset_between_runs:
             adapter.reset()
         ingests = ingest_with_rate(adapter, events, args.write_rate, args.workers)
+        failed_ingests = [r for r in ingests if not r.ok]
         queries: list[QueryResult] = []
         for ev, res in zip(events, ingests):
             if not res.ok:
@@ -1101,6 +1148,9 @@ def run_table8(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "system": adapter.name,
             "update_type": label,
             "num_updates": len(ingests),
+            "successful_writes": sum(1 for r in ingests if r.ok),
+            "write_errors": len(failed_ingests),
+            "first_error": failed_ingests[0].error if failed_ingests else None,
             "state_query_accuracy": safe_div(correct, len(queries)) if queries else None,
             "latest_state_hit_rate": safe_div(correct, len(queries)) if queries else None,
             "stale_state_error_rate": safe_div(stale, len(queries)) if queries else None,
@@ -1201,6 +1251,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--table8-updates", type=int, default=1000)
     run.add_argument("--visible-timeout-ms", type=float, default=5000.0)
     run.add_argument("--visible-poll-ms", type=float, default=50.0)
+    run.add_argument("--http-timeout", type=float, default=30.0)
     run.add_argument("--reset-between-runs", action="store_true")
     return ap.parse_args(argv)
 
