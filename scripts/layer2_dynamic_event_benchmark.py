@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1911,7 +1912,7 @@ def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
 
 def run_freshness_trial(
     adapter: SystemAdapter,
-    events: list[dict[str, Any]],
+    events: Iterable[dict[str, Any]],
     run_id: str,
     write_rate: float,
     query_qps: float,
@@ -1919,20 +1920,34 @@ def run_freshness_trial(
     query_limit: int,
     visible_timeout_ms: float,
     visible_poll_ms: float,
+    total_events: int | None = None,
 ) -> tuple[list[IngestResult], list[QueryResult], float]:
-    completed: list[tuple[dict[str, Any], IngestResult]] = []
+    completed: deque[tuple[dict[str, Any], IngestResult]] = deque()
     completed_mu = threading.Lock()
     stop = threading.Event()
+    query_done = threading.Event()
     query_results: list[QueryResult] = []
     q_interval = 0.0 if query_qps <= 0 else 1.0 / query_qps
     visibility_futures: list[Future[QueryResult]] = []
     visibility_mu = threading.Lock()
     visibility_pool = ThreadPoolExecutor(max_workers=max(1, workers))
+    if total_events is None:
+        try:
+            total_events = len(events)  # type: ignore[arg-type]
+        except TypeError:
+            total_events = None
+    query_goal = total_events if query_limit <= 0 else query_limit
+    enqueued_queries = 0
 
     def on_complete(ev: dict[str, Any], res: IngestResult) -> None:
+        nonlocal enqueued_queries
         if res.ok:
+            should_enqueue = False
             with completed_mu:
-                completed.append((ev, res))
+                if not query_done.is_set() and (query_goal is None or enqueued_queries < query_goal):
+                    completed.append((ev, res))
+                    enqueued_queries += 1
+                    should_enqueue = True
             with visibility_mu:
                 visibility_futures.append(
                     visibility_pool.submit(wait_until_visible, adapter, ev, res, run_id, visible_timeout_ms, visible_poll_ms)
@@ -1940,17 +1955,15 @@ def run_freshness_trial(
 
     def query_loop() -> None:
         idx = 0
-        cursor = 0
-        effective_query_limit = len(events) if query_limit <= 0 else query_limit
         while True:
-            if idx >= effective_query_limit:
+            if query_goal is not None and idx >= query_goal:
+                query_done.set()
                 break
             with completed_mu:
-                item = completed[cursor] if cursor < len(completed) else None
+                item = completed.popleft() if completed else None
             if item is None and stop.is_set():
                 break
             if item is not None:
-                cursor += 1
                 ev, res = item
                 q = query_for_event(ev, run_id, f"q_{idx}")
                 q.expected_ids |= res.expected_ids
@@ -1970,7 +1983,16 @@ def run_freshness_trial(
     t0 = now_ms()
     qt = threading.Thread(target=query_loop, daemon=True)
     qt.start()
-    ingests = ingest_with_rate(adapter, events, write_rate, workers, on_complete=on_complete)
+    ingests = ingest_with_rate(
+        adapter,
+        events,
+        write_rate,
+        workers,
+        on_complete=on_complete,
+        progress_label=f"{run_id}/{adapter.name}",
+        total_events=total_events,
+        fail_fast=True,
+    )
     stop.set()
     qt.join(timeout=30)
     with visibility_mu:
@@ -2003,10 +2025,19 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
         if system == "plasmod":
             adapter.health()
         for rate in args.write_rates:
-            raw = load_events(args.synthetic_input, limit=args.events_per_rate, shuffle=args.shuffle, seed=args.seed)
             run_id = f"{args.run_id}_t5_{system}_{rate}"
-            events = [namespace_event(ev, run_id) for ev in raw]
-            prewarm_adapter_embeddings(adapter, events)
+            event_count = count_events(args.synthetic_input, limit=args.events_per_rate)
+            print(
+                f"[table5] start system={system} write_rate={rate} events={event_count}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if args.shuffle:
+                raw = load_events(args.synthetic_input, limit=args.events_per_rate, shuffle=args.shuffle, seed=args.seed)
+                events: Iterable[dict[str, Any]] = [namespace_event(ev, run_id) for ev in raw]
+                prewarm_adapter_embeddings(adapter, events)  # type: ignore[arg-type]
+            else:
+                events = (namespace_event(ev, run_id) for ev in iter_events(args.synthetic_input, limit=args.events_per_rate))
             if args.reset_between_runs:
                 adapter.reset()
             ingests, queries, _elapsed_s = run_freshness_trial(
@@ -2019,8 +2050,10 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 args.query_limit,
                 args.visible_timeout_ms,
                 args.visible_poll_ms,
+                total_events=event_count,
             )
-            fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
+            if args.shuffle:
+                fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)  # type: ignore[arg-type]
             validate_measurements_or_raise(args, "table5", f"{system}/rate={rate}", ingests, queries)
             ingest_row = summarize_ingests(adapter.name, str(rate), ingests, queries)
             query_row = summarize_queries(adapter.name, str(rate), queries)
@@ -2044,6 +2077,15 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "queries": len(queries),
             }
             rows.append(row)
+            write_csv(run_dir / "table5_freshness_under_write_load.csv", rows)
+            print(
+                f"[table5] done system={adapter.name} write_rate={rate} "
+                f"events={len(ingests)} query_p95_ms={row['query_p95_ms']:.3f} "
+                f"w2v_p95_ms={row['write_to_visible_p95_ms']:.3f} "
+                f"stale={row['stale_result_rate']:.6f} timeouts={row['visibility_timeouts']} errors={row['write_errors']}",
+                file=sys.stderr,
+                flush=True,
+            )
         adapter.close()
     write_csv(run_dir / "table5_freshness_under_write_load.csv", rows)
     return rows
@@ -2051,7 +2093,10 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
 
 def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    raw = load_events(args.synthetic_input, limit=args.events_per_rate, shuffle=args.shuffle, seed=args.seed)
+    event_count = count_events(args.synthetic_input, limit=args.events_per_rate)
+    raw: list[dict[str, Any]] | None = None
+    if args.shuffle:
+        raw = load_events(args.synthetic_input, limit=args.events_per_rate, shuffle=args.shuffle, seed=args.seed)
     if "plasmod" in args.systems:
         for mode, guarantee in [
             ("strict", "read-after-write"),
@@ -2062,7 +2107,19 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             adapter.health()
             adapter.set_visibility_mode(mode)
             run_id = f"{args.run_id}_t6_plasmod_{mode}"
-            events = [namespace_event(ev, run_id, PLASMOD_MODES[mode]) for ev in raw]
+            print(
+                f"[table6] start system=plasmod visibility_mode={mode} events={event_count}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if args.shuffle:
+                assert raw is not None
+                events: Iterable[dict[str, Any]] = [namespace_event(ev, run_id, PLASMOD_MODES[mode]) for ev in raw]
+            else:
+                events = (
+                    namespace_event(ev, run_id, PLASMOD_MODES[mode])
+                    for ev in iter_events(args.synthetic_input, limit=args.events_per_rate)
+                )
             if args.reset_between_runs:
                 adapter.reset()
             ingests, queries, _elapsed_s = run_freshness_trial(
@@ -2075,12 +2132,14 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 args.query_limit,
                 args.visible_timeout_ms,
                 args.visible_poll_ms,
+                total_events=event_count,
             )
-            fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
+            if args.shuffle:
+                fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)  # type: ignore[arg-type]
             validate_measurements_or_raise(args, "table6", f"plasmod/{mode}", ingests, queries)
             qrow = summarize_queries(adapter.name, mode, queries)
             irow = summarize_ingests(adapter.name, mode, ingests, queries)
-            rows.append({
+            row = {
                 "table": "table6",
                 "system": "Plasmod",
                 "visibility_mode": {"strict": "Strict", "bounded": "Bounded Staleness", "eventual": "Eventual"}[mode],
@@ -2099,7 +2158,16 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "visibility_timeouts": irow["visibility_timeouts"],
                 "visibility_measurement_mode": irow["visibility_measurement_mode"],
                 "queries": len(queries),
-            })
+            }
+            rows.append(row)
+            write_csv(run_dir / "table6_consistency_mode_tradeoff.csv", rows)
+            print(
+                f"[table6] done system=Plasmod visibility_mode={mode} "
+                f"query_p95_ms={row['query_p95_ms']:.3f} w2v_p95_ms={row['write_to_visible_p95_ms']:.3f} "
+                f"stale={row['stale_result_rate']:.6f} timeouts={row['visibility_timeouts']} errors={row['write_errors']}",
+                file=sys.stderr,
+                flush=True,
+            )
             adapter.close()
 
     if wants_milvus_baseline(args.systems):
@@ -2119,8 +2187,17 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.milvus_payload_json_bytes,
         )
         run_id = f"{args.run_id}_t6_milvus_best_effort"
-        events = [namespace_event(ev, run_id) for ev in raw]
-        prewarm_adapter_embeddings(adapter, events)
+        print(
+            f"[table6] start system=milvus visibility_mode=best_effort events={event_count}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if args.shuffle:
+            assert raw is not None
+            events = [namespace_event(ev, run_id) for ev in raw]
+            prewarm_adapter_embeddings(adapter, events)
+        else:
+            events = (namespace_event(ev, run_id) for ev in iter_events(args.synthetic_input, limit=args.events_per_rate))
         if args.reset_between_runs:
             adapter.reset()
         ingests, queries, _elapsed_s = run_freshness_trial(
@@ -2133,12 +2210,14 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.query_limit,
             args.visible_timeout_ms,
             args.visible_poll_ms,
+            total_events=event_count,
         )
-        fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)
+        if args.shuffle:
+            fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)  # type: ignore[arg-type]
         validate_measurements_or_raise(args, "table6", "milvus/best_effort", ingests, queries)
         qrow = summarize_queries(adapter.name, "best_effort", queries)
         irow = summarize_ingests(adapter.name, "best_effort", ingests, queries)
-        rows.append({
+        row = {
             "table": "table6",
             "system": adapter.name,
             "visibility_mode": "Best-effort",
@@ -2157,7 +2236,16 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "visibility_timeouts": irow["visibility_timeouts"],
             "visibility_measurement_mode": irow["visibility_measurement_mode"],
             "queries": len(queries),
-        })
+        }
+        rows.append(row)
+        write_csv(run_dir / "table6_consistency_mode_tradeoff.csv", rows)
+        print(
+            f"[table6] done system={adapter.name} visibility_mode=best_effort "
+            f"query_p95_ms={row['query_p95_ms']:.3f} w2v_p95_ms={row['write_to_visible_p95_ms']:.3f} "
+            f"stale={row['stale_result_rate']:.6f} timeouts={row['visibility_timeouts']} errors={row['write_errors']}",
+            file=sys.stderr,
+            flush=True,
+        )
         adapter.close()
     write_csv(run_dir / "table6_consistency_mode_tradeoff.csv", rows)
     return rows
