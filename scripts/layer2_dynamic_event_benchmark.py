@@ -1924,7 +1924,7 @@ def run_freshness_trial(
 ) -> tuple[list[IngestResult], list[QueryResult], float]:
     completed: deque[tuple[dict[str, Any], IngestResult]] = deque()
     completed_mu = threading.Lock()
-    stop = threading.Event()
+    ingest_done = threading.Event()
     query_done = threading.Event()
     query_results: list[QueryResult] = []
     q_interval = 0.0 if query_qps <= 0 else 1.0 / query_qps
@@ -1955,30 +1955,51 @@ def run_freshness_trial(
 
     def query_loop() -> None:
         idx = 0
+        next_query_at = time.perf_counter()
+        next_progress = time.perf_counter() + 30.0
         while True:
             if query_goal is not None and idx >= query_goal:
                 query_done.set()
                 break
             with completed_mu:
                 item = completed.popleft() if completed else None
-            if item is None and stop.is_set():
-                break
-            if item is not None:
-                ev, res = item
-                q = query_for_event(ev, run_id, f"q_{idx}")
-                q.expected_ids |= res.expected_ids
-                q.target_object_ids |= res.expected_ids
-                qr, _ = adapter.query(q)
-                if qr.ok and qr.visible and res.first_visible_ms is None:
-                    t = now_ms()
-                    res.first_visible_ms = t
-                    if materialization_enabled(ev) and res.materialized_ms is None:
-                        res.materialized_ms = t
-                query_results.append(qr)
-                idx += 1
-                if stop.is_set() and len(completed) == 0:
+                enqueued = enqueued_queries
+            if item is None:
+                if ingest_done.is_set() and idx >= enqueued:
                     break
-            time.sleep(q_interval if q_interval > 0 else 0.001)
+                next_query_at = time.perf_counter()
+                time.sleep(0.001)
+                continue
+            if q_interval > 0:
+                delay = next_query_at - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+                next_query_at = max(next_query_at + q_interval, time.perf_counter() + q_interval)
+            ev, res = item
+            q = query_for_event(ev, run_id, f"q_{idx}")
+            q.expected_ids |= res.expected_ids
+            q.target_object_ids |= res.expected_ids
+            qr, _ = adapter.query(q)
+            if qr.ok and qr.visible and res.first_visible_ms is None:
+                t = now_ms()
+                res.first_visible_ms = t
+                if materialization_enabled(ev) and res.materialized_ms is None:
+                    res.materialized_ms = t
+            query_results.append(qr)
+            idx += 1
+            now = time.perf_counter()
+            if now >= next_progress:
+                denominator = query_goal if query_goal is not None else enqueued
+                print(
+                    f"[progress] {run_id}/{adapter.name}: {idx}/{denominator} queries completed",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                next_progress = now + 30.0
+            if not qr.ok:
+                query_done.set()
+                break
+        query_done.set()
 
     t0 = now_ms()
     qt = threading.Thread(target=query_loop, daemon=True)
@@ -1993,8 +2014,14 @@ def run_freshness_trial(
         total_events=total_events,
         fail_fast=True,
     )
-    stop.set()
-    qt.join(timeout=30)
+    ingest_done.set()
+    qt.join()
+    if query_goal is not None and len(query_results) < query_goal:
+        raise RuntimeError(
+            f"{run_id}/{adapter.name}: query workload incomplete "
+            f"({len(query_results)}/{query_goal}); first query error="
+            f"{next((q.error for q in query_results if not q.ok), 'none')}"
+        )
     with visibility_mu:
         pending_visibility = list(visibility_futures)
     for fut in pending_visibility:
