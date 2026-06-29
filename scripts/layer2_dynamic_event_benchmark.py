@@ -1748,6 +1748,7 @@ def summarize_ingests(system: str, key: str, ingests: list[IngestResult], querie
     write_lat = [r.write_latency_ms for r in ok_ingests]
     w2v = [r.write_to_visible_ms for r in ok_ingests if r.write_to_visible_ms is not None]
     mat = [r.materialization_lag_ms for r in ok_ingests if r.materialization_lag_ms is not None]
+    visibility_probe_count = len(w2v)
     visibility_timeouts = sum(1 for r in ok_ingests if r.visibility_censored)
     if mat:
         materialization_lag_p95 = percentile(mat, 95)
@@ -1771,6 +1772,7 @@ def summarize_ingests(system: str, key: str, ingests: list[IngestResult], querie
         "successful_writes": len(ok_ingests),
         "write_errors": len(failed_ingests),
         "first_error": failed_ingests[0].error if failed_ingests else "none",
+        "visibility_probe_count": visibility_probe_count,
         "visibility_timeouts": visibility_timeouts,
         "visibility_measurement_mode": "timeout_censored" if visibility_timeouts else "observed",
         "write_qps": zero_if_none(safe_div(len(ok_ingests), write_window_ms / 1000.0)),
@@ -1921,6 +1923,7 @@ def run_freshness_trial(
     visible_timeout_ms: float,
     visible_poll_ms: float,
     total_events: int | None = None,
+    visibility_probe_limit: int = 5000,
 ) -> tuple[list[IngestResult], list[QueryResult], float]:
     completed: deque[tuple[dict[str, Any], IngestResult]] = deque()
     completed_mu = threading.Lock()
@@ -1930,6 +1933,7 @@ def run_freshness_trial(
     q_interval = 0.0 if query_qps <= 0 else 1.0 / query_qps
     visibility_futures: list[Future[QueryResult]] = []
     visibility_mu = threading.Lock()
+    probe_mu = threading.Lock()
     visibility_pool = ThreadPoolExecutor(max_workers=max(1, workers))
     if total_events is None:
         try:
@@ -1938,20 +1942,40 @@ def run_freshness_trial(
             total_events = None
     query_goal = total_events if query_limit <= 0 else query_limit
     enqueued_queries = 0
+    completed_writes = 0
+    submitted_visibility = 0
+    visibility_stride = 1
+    if total_events is not None and visibility_probe_limit > 0:
+        visibility_stride = max(1, (total_events + visibility_probe_limit - 1) // visibility_probe_limit)
+
+    def should_probe_visibility(write_index: int) -> bool:
+        if visibility_probe_limit <= 0:
+            return True
+        if write_index == 1:
+            return True
+        if submitted_visibility >= visibility_probe_limit:
+            return False
+        return write_index % visibility_stride == 0
 
     def on_complete(ev: dict[str, Any], res: IngestResult) -> None:
-        nonlocal enqueued_queries
+        nonlocal completed_writes, enqueued_queries, submitted_visibility
         if res.ok:
-            should_enqueue = False
+            with probe_mu:
+                completed_writes += 1
+                write_index = completed_writes
             with completed_mu:
                 if not query_done.is_set() and (query_goal is None or enqueued_queries < query_goal):
                     completed.append((ev, res))
                     enqueued_queries += 1
-                    should_enqueue = True
-            with visibility_mu:
-                visibility_futures.append(
-                    visibility_pool.submit(wait_until_visible, adapter, ev, res, run_id, visible_timeout_ms, visible_poll_ms)
-                )
+            with probe_mu:
+                probe_visibility = should_probe_visibility(write_index)
+                if probe_visibility:
+                    submitted_visibility += 1
+            if probe_visibility:
+                with visibility_mu:
+                    visibility_futures.append(
+                        visibility_pool.submit(wait_until_visible, adapter, ev, res, run_id, visible_timeout_ms, visible_poll_ms)
+                    )
 
     def query_loop() -> None:
         idx = 0
@@ -1980,11 +2004,6 @@ def run_freshness_trial(
             q.expected_ids |= res.expected_ids
             q.target_object_ids |= res.expected_ids
             qr, _ = adapter.query(q)
-            if qr.ok and qr.visible and res.first_visible_ms is None:
-                t = now_ms()
-                res.first_visible_ms = t
-                if materialization_enabled(ev) and res.materialized_ms is None:
-                    res.materialized_ms = t
             query_results.append(qr)
             idx += 1
             now = time.perf_counter()
@@ -2078,6 +2097,7 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 args.visible_timeout_ms,
                 args.visible_poll_ms,
                 total_events=event_count,
+                visibility_probe_limit=args.visibility_probe_limit,
             )
             if args.shuffle:
                 fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)  # type: ignore[arg-type]
@@ -2099,6 +2119,7 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "successful_writes": ingest_row["successful_writes"],
                 "write_errors": ingest_row["write_errors"],
                 "first_error": ingest_row["first_error"],
+                "visibility_probe_count": ingest_row["visibility_probe_count"],
                 "visibility_timeouts": ingest_row["visibility_timeouts"],
                 "visibility_measurement_mode": ingest_row["visibility_measurement_mode"],
                 "queries": len(queries),
@@ -2160,6 +2181,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 args.visible_timeout_ms,
                 args.visible_poll_ms,
                 total_events=event_count,
+                visibility_probe_limit=args.visibility_probe_limit,
             )
             if args.shuffle:
                 fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)  # type: ignore[arg-type]
@@ -2182,6 +2204,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "successful_writes": irow["successful_writes"],
                 "write_errors": irow["write_errors"],
                 "first_error": irow["first_error"],
+                "visibility_probe_count": irow["visibility_probe_count"],
                 "visibility_timeouts": irow["visibility_timeouts"],
                 "visibility_measurement_mode": irow["visibility_measurement_mode"],
                 "queries": len(queries),
@@ -2238,6 +2261,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.visible_timeout_ms,
             args.visible_poll_ms,
             total_events=event_count,
+            visibility_probe_limit=args.visibility_probe_limit,
         )
         if args.shuffle:
             fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)  # type: ignore[arg-type]
@@ -2260,6 +2284,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "successful_writes": irow["successful_writes"],
             "write_errors": irow["write_errors"],
             "first_error": irow["first_error"],
+            "visibility_probe_count": irow["visibility_probe_count"],
             "visibility_timeouts": irow["visibility_timeouts"],
             "visibility_measurement_mode": irow["visibility_measurement_mode"],
             "queries": len(queries),
@@ -2652,6 +2677,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--table8-updates", type=int, default=1000)
     run.add_argument("--visible-timeout-ms", type=float, default=5000.0)
     run.add_argument("--visible-poll-ms", type=float, default=50.0)
+    run.add_argument(
+        "--visibility-probe-limit",
+        type=int,
+        default=5000,
+        help="Maximum per-run write-to-visible probe count for Table 5/6; 0 probes every successful write.",
+    )
     run.add_argument("--http-timeout", type=float, default=30.0)
     run.add_argument("--milvus-uri", default="http://127.0.0.1:19530")
     run.add_argument(
