@@ -1000,6 +1000,38 @@ class QueryResult:
     end_ms: float = 0.0
 
 
+@dataclass
+class QueryStats:
+    system: str = ""
+    query_count: int = 0
+    ok_count: int = 0
+    failed_count: int = 0
+    stale_count: int = 0
+    first_error: str = "none"
+    latencies_ms: list[float] = field(default_factory=list)
+    start_min_ms: float | None = None
+    end_max_ms: float | None = None
+
+    def append(self, q: QueryResult) -> None:
+        if not self.system:
+            self.system = q.system
+        self.query_count += 1
+        if q.ok:
+            self.ok_count += 1
+            self.latencies_ms.append(q.latency_ms)
+            self.start_min_ms = q.start_ms if self.start_min_ms is None else min(self.start_min_ms, q.start_ms)
+            self.end_max_ms = q.end_ms if self.end_max_ms is None else max(self.end_max_ms, q.end_ms)
+        else:
+            self.failed_count += 1
+            if self.first_error == "none":
+                self.first_error = q.error or "query failed"
+        if q.stale:
+            self.stale_count += 1
+
+    def __len__(self) -> int:
+        return self.query_count
+
+
 class HTTPJSONClient:
     def __init__(self, base_url: str, timeout: float = 30.0, retries: int = 3):
         self.base_url = base_url.rstrip("/")
@@ -1763,7 +1795,18 @@ def ingest_with_visibility_probe(
         )
         with visibility_mu:
             pending = list(visibility_futures)
-        queries = [future.result() for future in pending]
+        queries: list[QueryResult] = []
+        next_progress = time.perf_counter() + 30.0
+        for idx, future in enumerate(as_completed(pending), 1):
+            queries.append(future.result())
+            now = time.perf_counter()
+            if now >= next_progress:
+                print(
+                    f"[progress] {run_id}/{adapter.name}: {idx}/{len(pending)} visibility probes completed",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                next_progress = now + 30.0
         return ingests, queries
     finally:
         visibility_pool.shutdown(wait=True)
@@ -1811,17 +1854,15 @@ def validate_measurements_or_raise(
     table: str,
     context: str,
     ingests: list[IngestResult],
-    queries: list[QueryResult] | None = None,
+    queries: list[QueryResult] | QueryStats | None = None,
 ) -> None:
     failed_ingests = [r for r in ingests if not r.ok]
     if failed_ingests and not args.allow_write_errors:
         first = failed_ingests[0]
         raise RuntimeError(f"{table} {context}: write failed for event_id={first.event_id}: {first.error}")
     if queries is not None:
-        failed_queries = [q for q in queries if not q.ok]
-        if failed_queries and not args.allow_query_errors:
-            first_q = failed_queries[0]
-            raise RuntimeError(f"{table} {context}: query failed type={first_q.query_type}: {first_q.error}")
+        if query_failed_count(queries) and not args.allow_query_errors:
+            raise RuntimeError(f"{table} {context}: query failed: {query_first_error(queries)}")
     visibility_timeouts = [r for r in ingests if r.visibility_censored]
     if visibility_timeouts and not args.allow_visibility_timeouts:
         first = visibility_timeouts[0]
@@ -1870,11 +1911,50 @@ def fill_missing_visibility(
             pool.submit(wait_until_visible, adapter, ev, res, run_id, timeout_ms, poll_ms)
             for ev, res in pairs
         ]
-        for future in futures:
+        next_progress = time.perf_counter() + 30.0
+        for idx, future in enumerate(as_completed(futures), 1):
             future.result()
+            now = time.perf_counter()
+            if now >= next_progress:
+                print(
+                    f"[progress] {run_id}/{adapter.name}: {idx}/{len(futures)} missing visibility probes completed",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                next_progress = now + 30.0
 
 
-def summarize_ingests(system: str, key: str, ingests: list[IngestResult], queries: list[QueryResult] | None = None) -> dict[str, Any]:
+def query_len(queries: list[QueryResult] | QueryStats | None) -> int:
+    if queries is None:
+        return 0
+    return len(queries)
+
+
+def query_stale_count(queries: list[QueryResult] | QueryStats | None) -> int:
+    if queries is None:
+        return 0
+    if isinstance(queries, QueryStats):
+        return queries.stale_count
+    return sum(1 for q in queries if q.stale)
+
+
+def query_first_error(queries: list[QueryResult] | QueryStats | None) -> str:
+    if queries is None:
+        return "none"
+    if isinstance(queries, QueryStats):
+        return queries.first_error
+    return next((q.error for q in queries if not q.ok), "none")
+
+
+def query_failed_count(queries: list[QueryResult] | QueryStats | None) -> int:
+    if queries is None:
+        return 0
+    if isinstance(queries, QueryStats):
+        return queries.failed_count
+    return sum(1 for q in queries if not q.ok)
+
+
+def summarize_ingests(system: str, key: str, ingests: list[IngestResult], queries: list[QueryResult] | QueryStats | None = None) -> dict[str, Any]:
     ok_ingests = [r for r in ingests if r.ok]
     failed_ingests = [r for r in ingests if not r.ok]
     write_lat = [r.write_latency_ms for r in ok_ingests]
@@ -1891,11 +1971,8 @@ def summarize_ingests(system: str, key: str, ingests: list[IngestResult], querie
     else:
         materialization_lag_p95 = 0.0
         materialization_lag_basis = "no_successful_writes"
-    stale_count = 0
-    query_count = 0
-    if queries is not None:
-        query_count = len(queries)
-        stale_count = sum(1 for q in queries if q.stale)
+    query_count = query_len(queries)
+    stale_count = query_stale_count(queries)
     write_window_ms = max((r.write_ack_ms for r in ok_ingests), default=0) - min((r.write_start_ms for r in ok_ingests), default=0)
     return {
         "system": system,
@@ -1919,21 +1996,35 @@ def summarize_ingests(system: str, key: str, ingests: list[IngestResult], querie
     }
 
 
-def summarize_queries(system: str, key: str, queries: list[QueryResult]) -> dict[str, Any]:
-    ok = [q for q in queries if q.ok]
-    lat = [q.latency_ms for q in ok]
+def summarize_queries(system: str, key: str, queries: list[QueryResult] | QueryStats) -> dict[str, Any]:
+    if isinstance(queries, QueryStats):
+        lat = queries.latencies_ms
+        query_count = queries.query_count
+        stale_count = queries.stale_count
+    else:
+        ok = [q for q in queries if q.ok]
+        lat = [q.latency_ms for q in ok]
+        query_count = len(queries)
+        stale_count = sum(1 for q in queries if q.stale)
     return {
         "system": system,
         "key": key,
-        "query_count": len(queries),
+        "query_count": query_count,
         "query_qps": 0.0,
         "query_p50_ms": zero_if_none(percentile(lat, 50)),
         "query_p95_ms": zero_if_none(percentile(lat, 95)),
-        "stale_result_rate": zero_if_none(safe_div(sum(1 for q in queries if q.stale), len(queries))),
+        "stale_result_rate": zero_if_none(safe_div(stale_count, query_count)),
     }
 
 
-def query_window_qps(queries: list[QueryResult]) -> float:
+def query_window_qps(queries: list[QueryResult] | QueryStats) -> float:
+    if isinstance(queries, QueryStats):
+        if queries.ok_count <= 0 or queries.start_min_ms is None or queries.end_max_ms is None:
+            return 0.0
+        window_ms = queries.end_max_ms - queries.start_min_ms
+        if window_ms <= 0:
+            window_ms = sum(max(lat, 0.0) for lat in queries.latencies_ms)
+        return zero_if_none(safe_div(float(queries.ok_count), max(window_ms / 1000.0, 1e-9)))
     ok = [q for q in queries if q.ok]
     if not ok:
         return 0.0
@@ -1966,6 +2057,20 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({key: ("not_measured" if row.get(key) is None else row.get(key)) for key in fields})
+
+
+def read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def csv_number_key(value: Any) -> str:
+    try:
+        return str(float(value))
+    except Exception:
+        return str(value)
 
 
 def run_table4(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
@@ -2056,12 +2161,12 @@ def run_freshness_trial(
     visible_poll_ms: float,
     total_events: int | None = None,
     visibility_probe_limit: int = 5000,
-) -> tuple[list[IngestResult], list[QueryResult], float]:
+) -> tuple[list[IngestResult], QueryStats, float]:
     completed: deque[tuple[dict[str, Any], IngestResult]] = deque()
     completed_mu = threading.Lock()
     ingest_done = threading.Event()
     query_done = threading.Event()
-    query_results: list[QueryResult] = []
+    query_results = QueryStats()
     q_interval = 0.0 if query_qps <= 0 else 1.0 / query_qps
     visibility_futures: list[Future[QueryResult]] = []
     visibility_mu = threading.Lock()
@@ -2175,20 +2280,40 @@ def run_freshness_trial(
     if query_goal is not None and len(query_results) < query_goal:
         raise RuntimeError(
             f"{run_id}/{adapter.name}: query workload incomplete "
-            f"({len(query_results)}/{query_goal}); first query error="
-            f"{next((q.error for q in query_results if not q.ok), 'none')}"
+            f"({len(query_results)}/{query_goal}); first query error={query_first_error(query_results)}"
         )
     with visibility_mu:
         pending_visibility = list(visibility_futures)
-    for fut in pending_visibility:
+    if pending_visibility:
+        print(
+            f"[progress] {run_id}/{adapter.name}: waiting for {len(pending_visibility)} visibility probes",
+            file=sys.stderr,
+            flush=True,
+        )
+    next_progress = time.perf_counter() + 30.0
+    for idx, fut in enumerate(as_completed(pending_visibility), 1):
         fut.result()
+        now = time.perf_counter()
+        if now >= next_progress:
+            print(
+                f"[progress] {run_id}/{adapter.name}: {idx}/{len(pending_visibility)} visibility probes completed",
+                file=sys.stderr,
+                flush=True,
+            )
+            next_progress = now + 30.0
     visibility_pool.shutdown(wait=True)
     elapsed_s = max((now_ms() - t0) / 1000.0, 1e-9)
     return ingests, query_results, elapsed_s
 
 
 def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+    csv_path = run_dir / "table5_freshness_under_write_load.csv"
+    rows: list[dict[str, Any]] = read_csv_rows(csv_path)
+    done_keys = {
+        (str(row.get("system", "")), csv_number_key(row.get("write_rate_events_s", "")))
+        for row in rows
+        if row.get("table") == "table5" and row.get("write_errors", "0") in {"0", "0.0"} and row.get("first_error", "none") == "none"
+    }
     for system in args.systems:
         adapter = make_adapter(
             system,
@@ -2209,6 +2334,15 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             adapter.health()
         for rate in args.write_rates:
             run_id = f"{args.run_id}_t5_{system}_{rate}"
+            adapter_name = "Plasmod" if system == "plasmod" else "Milvus"
+            resume_key = (adapter_name, csv_number_key(rate))
+            if resume_key in done_keys:
+                print(
+                    f"[table5] skip completed system={adapter_name} write_rate={rate}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
             event_count = count_events(args.synthetic_input, limit=args.events_per_rate)
             print(
                 f"[table5] start system={system} write_rate={rate} events={event_count}",
@@ -2262,7 +2396,8 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "queries": len(queries),
             }
             rows.append(row)
-            write_csv(run_dir / "table5_freshness_under_write_load.csv", rows)
+            done_keys.add((row["system"], csv_number_key(row["write_rate_events_s"])))
+            write_csv(csv_path, rows)
             print(
                 f"[table5] done system={adapter.name} write_rate={rate} "
                 f"events={len(ingests)} query_p95_ms={row['query_p95_ms']:.3f} "
@@ -2272,12 +2407,18 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 flush=True,
             )
         adapter.close()
-    write_csv(run_dir / "table5_freshness_under_write_load.csv", rows)
+    write_csv(csv_path, rows)
     return rows
 
 
 def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+    csv_path = run_dir / "table6_consistency_mode_tradeoff.csv"
+    rows: list[dict[str, Any]] = read_csv_rows(csv_path)
+    done_keys = {
+        (str(row.get("system", "")), str(row.get("visibility_mode", "")))
+        for row in rows
+        if row.get("table") == "table6" and row.get("write_errors", "0") in {"0", "0.0"} and row.get("first_error", "none") == "none"
+    }
     event_count = count_events(args.synthetic_input, limit=args.events_per_rate)
     raw: list[dict[str, Any]] | None = None
     if args.shuffle:
@@ -2292,6 +2433,15 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             adapter.health()
             adapter.set_visibility_mode(mode)
             run_id = f"{args.run_id}_t6_plasmod_{mode}"
+            mode_label = {"strict": "Strict", "bounded": "Bounded Staleness", "eventual": "Eventual"}[mode]
+            if ("Plasmod", mode_label) in done_keys:
+                print(
+                    f"[table6] skip completed system=Plasmod visibility_mode={mode}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                adapter.close()
+                continue
             print(
                 f"[table6] start system=plasmod visibility_mode={mode} events={event_count}",
                 file=sys.stderr,
@@ -2328,7 +2478,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             row = {
                 "table": "table6",
                 "system": "Plasmod",
-                "visibility_mode": {"strict": "Strict", "bounded": "Bounded Staleness", "eventual": "Eventual"}[mode],
+                "visibility_mode": mode_label,
                 "write_qps": irow["write_qps"],
                 "query_qps": query_window_qps(queries),
                 "query_p95_ms": qrow["query_p95_ms"],
@@ -2347,7 +2497,8 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "queries": len(queries),
             }
             rows.append(row)
-            write_csv(run_dir / "table6_consistency_mode_tradeoff.csv", rows)
+            done_keys.add((row["system"], row["visibility_mode"]))
+            write_csv(csv_path, rows)
             print(
                 f"[table6] done system=Plasmod visibility_mode={mode} "
                 f"query_p95_ms={row['query_p95_ms']:.3f} w2v_p95_ms={row['write_to_visible_p95_ms']:.3f} "
@@ -2374,6 +2525,15 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.milvus_payload_json_bytes,
         )
         run_id = f"{args.run_id}_t6_milvus_best_effort"
+        if ("Milvus", "Best-effort") in done_keys:
+            print(
+                "[table6] skip completed system=Milvus visibility_mode=best_effort",
+                file=sys.stderr,
+                flush=True,
+            )
+            adapter.close()
+            write_csv(csv_path, rows)
+            return rows
         print(
             f"[table6] start system=milvus visibility_mode=best_effort events={event_count}",
             file=sys.stderr,
@@ -2427,7 +2587,8 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             "queries": len(queries),
         }
         rows.append(row)
-        write_csv(run_dir / "table6_consistency_mode_tradeoff.csv", rows)
+        done_keys.add((row["system"], row["visibility_mode"]))
+        write_csv(csv_path, rows)
         print(
             f"[table6] done system={adapter.name} visibility_mode=best_effort "
             f"query_p95_ms={row['query_p95_ms']:.3f} w2v_p95_ms={row['write_to_visible_p95_ms']:.3f} "
@@ -2436,7 +2597,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             flush=True,
         )
         adapter.close()
-    write_csv(run_dir / "table6_consistency_mode_tradeoff.csv", rows)
+    write_csv(csv_path, rows)
     return rows
 
 
