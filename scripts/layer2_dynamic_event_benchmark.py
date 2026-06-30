@@ -50,6 +50,10 @@ DEFAULT_EMBEDDER_MODEL = BASE / "models" / "all-MiniLM-L6-v2.onnx"
 DEFAULT_EMBEDDER_VOCAB = BASE.parent / "Plasmod" / "models" / "minilm-l6-v2-vocab.txt"
 EMBEDDING_DIM = 384
 MAX_EMBED_TOKENS = 128
+DEFAULT_MAX_HOT_EVENT_BYTES = 1024 * 1024
+DEFAULT_HOT_PAYLOAD_PREVIEW_BYTES = 4096
+HOT_EVENT_MAX_BYTES = DEFAULT_MAX_HOT_EVENT_BYTES
+HOT_PAYLOAD_PREVIEW_BYTES = DEFAULT_HOT_PAYLOAD_PREVIEW_BYTES
 BERT_CLS = 101
 BERT_SEP = 102
 BERT_PAD = 0
@@ -69,6 +73,12 @@ EVENT_TYPE_ALIASES = {
 TABLE4_PLASMOD_TYPES = ["observation", "tool_result", "memory", "state_update", "artifact", "relation"]
 TABLE4_BASELINE_TYPES = ["observation", "tool_result", "memory"]
 MILVUS_SYSTEM_ALIASES = {"milvus", "vector_metadata", "baseline"}
+PAYLOAD_EXTERNALIZATION_STATS: dict[str, int] = {
+    "events_externalized": 0,
+    "original_payload_bytes": 0,
+    "original_record_bytes": 0,
+}
+PAYLOAD_EXTERNALIZATION_LOCK = threading.Lock()
 
 
 def wants_milvus_baseline(systems: list[str]) -> bool:
@@ -473,6 +483,128 @@ def set_path_copy(doc: dict[str, Any], path: str, value: Any) -> dict[str, Any]:
     return copied
 
 
+def int_path(doc: dict[str, Any], path: str) -> int:
+    value = get_path(doc, path)
+    try:
+        return int(value)
+    except Exception:
+        return 0
+
+
+def utf8_len(value: str) -> int:
+    return len(value.encode("utf-8"))
+
+
+def truncate_text_bytes(value: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    raw = value.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return value
+    return raw[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def summarize_externalized_value(value: Any, preview_bytes: int) -> Any:
+    if isinstance(value, str):
+        return {
+            "externalized": True,
+            "type": "str",
+            "original_bytes": utf8_len(value),
+            "preview": truncate_text_bytes(value, preview_bytes),
+        }
+    if isinstance(value, dict):
+        out: dict[str, Any] = {"externalized": True, "type": "dict", "fields": {}}
+        fields: dict[str, Any] = {}
+        for key, sub in value.items():
+            if isinstance(sub, str):
+                fields[key] = {
+                    "type": "str",
+                    "original_bytes": utf8_len(sub),
+                    "preview": truncate_text_bytes(sub, preview_bytes),
+                }
+            elif isinstance(sub, (int, float, bool)) or sub is None:
+                fields[key] = sub
+            elif isinstance(sub, list):
+                fields[key] = {
+                    "type": "list",
+                    "length": len(sub),
+                    "preview": sub[:10],
+                }
+            elif isinstance(sub, dict):
+                fields[key] = {
+                    "type": "dict",
+                    "keys": sorted(str(k) for k in sub.keys())[:50],
+                }
+            else:
+                fields[key] = {"type": type(sub).__name__}
+        out["fields"] = fields
+        return out
+    if isinstance(value, list):
+        return {
+            "externalized": True,
+            "type": "list",
+            "length": len(value),
+            "preview": value[:10],
+        }
+    return {"externalized": True, "type": type(value).__name__}
+
+
+def maybe_externalize_large_event(doc: dict[str, Any]) -> dict[str, Any]:
+    """Keep agent DB hot-path writes bounded while preserving object semantics.
+
+    Recorded traces can contain full artifacts such as 100MB+ patches. Those
+    bytes belong to the cold artifact body, while the Layer 2 experiment measures
+    event/object/state visibility. We keep identity, provenance, hashes, size
+    metadata, and a small preview in the online write.
+    """
+
+    max_hot_bytes = HOT_EVENT_MAX_BYTES
+    if max_hot_bytes <= 0:
+        return doc
+    payload_bytes = int_path(doc, "data.payload_size_bytes")
+    record_bytes = int_path(doc, "data.record_size_bytes")
+    if max(payload_bytes, record_bytes) <= max_hot_bytes:
+        return doc
+
+    eid = event_id(doc) or object_id(doc) or "unknown"
+    original_hash = get_path(doc, "data.payload_hash") or ""
+    external_ref = f"agent-artifact://{eid}/{original_hash or 'payload'}"
+    metadata = {
+        "enabled": True,
+        "reason": "hot_path_payload_exceeds_limit",
+        "max_hot_event_bytes": max_hot_bytes,
+        "preview_bytes": HOT_PAYLOAD_PREVIEW_BYTES,
+        "original_payload_size_bytes": payload_bytes,
+        "original_record_size_bytes": record_bytes,
+        "payload_hash": original_hash,
+        "external_ref": external_ref,
+    }
+
+    out = set_path_copy(doc, "extensions.benchmark.payload_externalization", metadata)
+    payload_content = get_path(out, "payload.content")
+    if payload_content is not None:
+        out = set_path_copy(out, "payload.content", summarize_externalized_value(payload_content, HOT_PAYLOAD_PREVIEW_BYTES))
+    elif out.get("payload") is not None:
+        out = set_path_copy(out, "payload", summarize_externalized_value(out.get("payload"), HOT_PAYLOAD_PREVIEW_BYTES))
+
+    retrieval_text = get_path(out, "retrieval.index_text")
+    if retrieval_text is not None:
+        out = set_path_copy(out, "retrieval.index_text", summarize_externalized_value(retrieval_text, HOT_PAYLOAD_PREVIEW_BYTES))
+
+    data = dict(out.get("data") or {})
+    data["hot_path_externalized"] = True
+    data["hot_path_external_ref"] = external_ref
+    data["hot_path_original_payload_size_bytes"] = payload_bytes
+    data["hot_path_original_record_size_bytes"] = record_bytes
+    out["data"] = data
+
+    with PAYLOAD_EXTERNALIZATION_LOCK:
+        PAYLOAD_EXTERNALIZATION_STATS["events_externalized"] += 1
+        PAYLOAD_EXTERNALIZATION_STATS["original_payload_bytes"] += payload_bytes
+        PAYLOAD_EXTERNALIZATION_STATS["original_record_bytes"] += record_bytes
+    return out
+
+
 def event_type(doc: dict[str, Any]) -> str:
     value = get_path(doc, "event.event_type") or doc.get("event_type") or get_path(doc, "event.eventType")
     value = str(value or "").strip()
@@ -806,7 +938,7 @@ def namespace_event(ev: dict[str, Any], run_id: str, mode: str | None = None) ->
     if mode:
         doc = set_path_copy(doc, "access.consistency", mode)
     doc = set_path_copy(doc, "runtime.t_write_start_ms", wall_ms())
-    return doc
+    return maybe_externalize_large_event(doc)
 
 
 @dataclass
@@ -1940,7 +2072,12 @@ def run_freshness_trial(
             total_events = len(events)  # type: ignore[arg-type]
         except TypeError:
             total_events = None
-    query_goal = total_events if query_limit <= 0 else query_limit
+    if query_limit <= 0:
+        query_goal = total_events
+    elif total_events is None:
+        query_goal = query_limit
+    else:
+        query_goal = min(query_limit, total_events)
     enqueued_queries = 0
     completed_writes = 0
     submitted_visibility = 0
@@ -2569,6 +2706,13 @@ def run_prepare_embeddings(args: argparse.Namespace) -> None:
 
 
 def run_tables(args: argparse.Namespace) -> Path:
+    global HOT_EVENT_MAX_BYTES, HOT_PAYLOAD_PREVIEW_BYTES
+    HOT_EVENT_MAX_BYTES = args.max_hot_event_bytes
+    HOT_PAYLOAD_PREVIEW_BYTES = args.hot_payload_preview_bytes
+    with PAYLOAD_EXTERNALIZATION_LOCK:
+        for key in PAYLOAD_EXTERNALIZATION_STATS:
+            PAYLOAD_EXTERNALIZATION_STATS[key] = 0
+
     run_id = args.run_id or time.strftime("layer2_%Y%m%d_%H%M%S")
     args.run_id = run_id
     run_dir = args.output_dir / run_id
@@ -2591,10 +2735,13 @@ def run_tables(args: argparse.Namespace) -> Path:
         "allow_visibility_timeouts": args.allow_visibility_timeouts,
         "write_rates": args.write_rates,
         "query_qps": args.query_qps,
+        "max_hot_event_bytes": args.max_hot_event_bytes,
+        "hot_payload_preview_bytes": args.hot_payload_preview_bytes,
         "created_at_ms": wall_ms(),
         "notes": [
             "write-to-visible is measured by polling /v1/query until expected ids appear",
             "materialization lag uses first-visible time as an external black-box proxy when no materialized timestamp is returned",
+            "large artifact payloads are represented by hash/size/ref plus preview on the online write path",
             "table7 Plasmod reset/rebuild rows are marked requires_manual_* unless the service exposes an automatic failure trigger",
         ],
     }
@@ -2612,6 +2759,9 @@ def run_tables(args: argparse.Namespace) -> Path:
         all_rows["table7"] = run_table7(args, run_dir)
     if "all" in selected or "8" in selected:
         all_rows["table8"] = run_table8(args, run_dir)
+    with PAYLOAD_EXTERNALIZATION_LOCK:
+        metadata["payload_externalization_stats"] = dict(PAYLOAD_EXTERNALIZATION_STATS)
+    write_json(run_dir / "run_metadata.json", metadata)
     write_json(run_dir / "summary.json", all_rows)
     return run_dir
 
@@ -2682,6 +2832,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=5000,
         help="Maximum per-run write-to-visible probe count for Table 5/6; 0 probes every successful write.",
+    )
+    run.add_argument(
+        "--max-hot-event-bytes",
+        type=int,
+        default=DEFAULT_MAX_HOT_EVENT_BYTES,
+        help="Externalize agent artifact payload bodies above this byte size on the online write path; 0 disables.",
+    )
+    run.add_argument(
+        "--hot-payload-preview-bytes",
+        type=int,
+        default=DEFAULT_HOT_PAYLOAD_PREVIEW_BYTES,
+        help="UTF-8 preview bytes retained when a large agent payload is externalized.",
     )
     run.add_argument("--http-timeout", type=float, default=30.0)
     run.add_argument("--milvus-uri", default="http://127.0.0.1:19530")
