@@ -1041,7 +1041,7 @@ class HTTPJSONClient:
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         url = self.base_url + path
         data = None
-        headers = {}
+        headers = {"Connection": "close", "Accept": "application/json"}
         if body is not None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -2205,6 +2205,8 @@ def run_freshness_trial(
     visibility_futures: list[Future[QueryResult]] = []
     visibility_mu = threading.Lock()
     probe_mu = threading.Lock()
+    query_progress_mu = threading.Lock()
+    last_query_progress_at = time.perf_counter()
     visibility_pool = ThreadPoolExecutor(max_workers=max(1, workers))
     if total_events is None:
         try:
@@ -2254,6 +2256,7 @@ def run_freshness_trial(
                     )
 
     def query_loop() -> None:
+        nonlocal last_query_progress_at
         idx = 0
         next_query_at = time.perf_counter()
         next_progress = time.perf_counter() + 30.0
@@ -2283,6 +2286,8 @@ def run_freshness_trial(
             query_results.append(qr)
             idx += 1
             now = time.perf_counter()
+            with query_progress_mu:
+                last_query_progress_at = now
             if now >= next_progress:
                 denominator = query_goal if query_goal is not None else enqueued
                 print(
@@ -2311,7 +2316,15 @@ def run_freshness_trial(
         no_progress_timeout_s=no_progress_timeout_s,
     )
     ingest_done.set()
-    qt.join()
+    while qt.is_alive():
+        qt.join(timeout=1.0)
+        with query_progress_mu:
+            idle_s = time.perf_counter() - last_query_progress_at
+        if idle_s >= no_progress_timeout_s:
+            raise RuntimeError(
+                f"{run_id}/{adapter.name}: no query completions for {no_progress_timeout_s:.1f}s; "
+                f"queries={len(query_results)}/{query_goal if query_goal is not None else 'unknown'}"
+            )
     if query_goal is not None and len(query_results) < query_goal:
         raise RuntimeError(
             f"{run_id}/{adapter.name}: query workload incomplete "
