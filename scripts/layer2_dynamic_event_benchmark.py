@@ -34,7 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -1692,6 +1692,7 @@ def ingest_with_rate(
     progress_label: str = "",
     total_events: int | None = None,
     fail_fast: bool = True,
+    no_progress_timeout_s: float = 600.0,
 ) -> list[IngestResult]:
     if total_events is None:
         try:
@@ -1712,15 +1713,29 @@ def ingest_with_rate(
     completed = 0
     submitted = 0
     next_progress = start + 30.0
+    last_completed_at = start
 
     def collect_one(block: bool = True) -> bool:
-        nonlocal completed, next_progress
+        nonlocal completed, next_progress, last_completed_at
         if not pending:
             return False
-        idx, _ev, fut = pending[0]
-        if not block and not fut.done():
+        ready_pos = next((pos for pos, (_idx, _ev, fut) in enumerate(pending) if fut.done()), None)
+        if ready_pos is None and not block:
             return False
-        pending.pop(0)
+        if ready_pos is None:
+            deadline = last_completed_at + max(1.0, no_progress_timeout_s)
+            while ready_pos is None:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    oldest_idx = pending[0][0]
+                    raise RuntimeError(
+                        f"{progress_label or adapter.name}: no write completions for "
+                        f"{no_progress_timeout_s:.1f}s; completed={completed} submitted={submitted} "
+                        f"pending={len(pending)} oldest_event_index={oldest_idx}"
+                    )
+                wait([fut for _idx, _ev, fut in pending], timeout=min(1.0, remaining), return_when=FIRST_COMPLETED)
+                ready_pos = next((pos for pos, (_idx, _ev, fut) in enumerate(pending) if fut.done()), None)
+        idx, _ev, fut = pending.pop(ready_pos)
         try:
             res = fut.result(timeout=future_timeout_s if block else 0.0)
         except FutureTimeoutError as exc:
@@ -1728,6 +1743,8 @@ def ingest_with_rate(
                 f"{progress_label or adapter.name}: write future stalled for event index={idx} "
                 f"after {future_timeout_s:.1f}s"
             ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"{progress_label or adapter.name}: write future failed for event index={idx}: {exc}") from exc
         if total_events is not None:
             results[idx] = res
         else:
@@ -1736,6 +1753,7 @@ def ingest_with_rate(
             raise RuntimeError(f"{progress_label or adapter.name}: write failed for event_id={res.event_id}: {res.error}")
         completed += 1
         now = time.perf_counter()
+        last_completed_at = now
         if progress_label and now >= next_progress:
             elapsed = max(now - start, 1e-9)
             denominator = str(total_events) if total_events is not None else str(submitted)
@@ -2176,6 +2194,7 @@ def run_freshness_trial(
     visible_poll_ms: float,
     total_events: int | None = None,
     visibility_probe_limit: int = 5000,
+    no_progress_timeout_s: float = 600.0,
 ) -> tuple[list[IngestResult], QueryStats, float]:
     completed: deque[tuple[dict[str, Any], IngestResult]] = deque()
     completed_mu = threading.Lock()
@@ -2289,6 +2308,7 @@ def run_freshness_trial(
         progress_label=f"{run_id}/{adapter.name}",
         total_events=total_events,
         fail_fast=True,
+        no_progress_timeout_s=no_progress_timeout_s,
     )
     ingest_done.set()
     qt.join()
@@ -2384,6 +2404,7 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 args.visible_poll_ms,
                 total_events=event_count,
                 visibility_probe_limit=args.visibility_probe_limit,
+                no_progress_timeout_s=args.no_progress_timeout_s,
             )
             if args.shuffle:
                 fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)  # type: ignore[arg-type]
@@ -2484,6 +2505,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 args.visible_poll_ms,
                 total_events=event_count,
                 visibility_probe_limit=args.visibility_probe_limit,
+                no_progress_timeout_s=args.no_progress_timeout_s,
             )
             if args.shuffle:
                 fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)  # type: ignore[arg-type]
@@ -2574,6 +2596,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.visible_poll_ms,
             total_events=event_count,
             visibility_probe_limit=args.visibility_probe_limit,
+            no_progress_timeout_s=args.no_progress_timeout_s,
         )
         if args.shuffle:
             fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)  # type: ignore[arg-type]
@@ -3022,6 +3045,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="UTF-8 preview bytes retained when a large agent payload is externalized.",
     )
     run.add_argument("--http-timeout", type=float, default=30.0)
+    run.add_argument(
+        "--no-progress-timeout-s",
+        type=float,
+        default=600.0,
+        help="Fail a write/query workload when no writes complete for this many seconds.",
+    )
     run.add_argument("--milvus-uri", default="http://127.0.0.1:19530")
     run.add_argument(
         "--milvus-visibility-policy",
