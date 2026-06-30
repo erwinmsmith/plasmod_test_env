@@ -34,7 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -1707,6 +1707,8 @@ def ingest_with_rate(
     if adapter.name == "Milvus" and getattr(adapter, "visibility_policy", "") == "flush_on_ack":
         effective_workers = 1
     max_pending = max(effective_workers * 8, effective_workers)
+    adapter_timeout = float(getattr(adapter, "timeout", 30.0) or 30.0)
+    future_timeout_s = max(adapter_timeout * 4.0, 300.0)
     completed = 0
     submitted = 0
     next_progress = start + 30.0
@@ -1719,7 +1721,13 @@ def ingest_with_rate(
         if not block and not fut.done():
             return False
         pending.pop(0)
-        res = fut.result()
+        try:
+            res = fut.result(timeout=future_timeout_s if block else 0.0)
+        except FutureTimeoutError as exc:
+            raise RuntimeError(
+                f"{progress_label or adapter.name}: write future stalled for event index={idx} "
+                f"after {future_timeout_s:.1f}s"
+            ) from exc
         if total_events is not None:
             results[idx] = res
         else:
@@ -1740,7 +1748,9 @@ def ingest_with_rate(
             next_progress = now + 30.0
         return True
 
-    with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=effective_workers)
+    shutdown_wait = True
+    try:
         for idx, ev in enumerate(events):
             submitted = idx + 1
             target = start + idx * interval
@@ -1755,6 +1765,11 @@ def ingest_with_rate(
                 collect_one(block=True)
         while pending:
             collect_one(block=True)
+    except BaseException:
+        shutdown_wait = False
+        raise
+    finally:
+        pool.shutdown(wait=shutdown_wait, cancel_futures=not shutdown_wait)
     if total_events is not None:
         return [r for r in results[:submitted] if r is not None]
     return [unordered_results[idx] for idx in sorted(unordered_results)]
