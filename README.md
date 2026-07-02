@@ -201,6 +201,98 @@ bash stop_all.sh && bash start_all.sh
 python3 scripts/layer2_dynamic_event_benchmark.py analyze
 ```
 
+### 当前第二层实验方案：Dynamic Event Stream and State Visibility
+
+第二层实验只在 `plasmod_test_env` 中实现和运行；`Plasmod` 核心库不放实验逻辑。实验输入来自真实 agent runtime 记录后整理的数据：
+
+- `data/layer2_dynamic_events/traces_collected/`：Synthetic Agent Event Stream，用于 Table 4/5/6 的动态写入、可见性和 freshness 压测
+- `data/layer2_dynamic_events/events.jsonl`：Replayable Agent Execution Trace，用于 Table 7/8 的 replay、recovery 和 state correctness 验证
+
+当前 Table 5 的正式口径是：同一批 agent event object，在不同 write rate 下并发触发写入、query、visibility probe，输出 `query_p50_ms`、`query_p95_ms`、`write_to_visible_p95_ms`、`materialization_lag_p95_ms`、`stale_result_rate` 等指标。默认 `--query-qps 0` 表示查询不额外限速，CSV 中的 `query_qps` 是实际完成查询吞吐；如果论文表格需要固定查询 workload，应显式设置 `--query-qps <N>` 并在表注中说明。
+
+当前 Table 6 的正式口径是：固定 write rate 和 query workload，对比 Plasmod 的 `Strict / Bounded Staleness / Eventual` 三种 visibility mode，以及 Milvus 的 best-effort baseline。Table 6 结果应写入单独 sheet，不要混入 Table 5 的 Sheet1。
+
+推荐运行参数：
+
+- embedding: `--embedding-provider hash`，复用确定性预计算/哈希 embedding，避免把 embedding 计算开销混入数据库性能
+- Milvus index: `--milvus-index-type FLAT`
+- Milvus visibility: `--milvus-visibility-policy deferred`
+- large payload: `--milvus-payload-json-bytes 0`，大 payload 外部化，避免 Milvus varchar 长度限制影响实验
+- visibility probes: `--visibility-probe-limit 5000`
+- full data: `--events-per-rate 0 --query-limit 0`
+
+### Milvus-only Table 5 启动方案
+
+只跑 Milvus baseline 时，不需要启动 Plasmod、Qdrant 或本地 MinIO；只需要 Docker Desktop 和 `../milvus/docker-compose.yml` 里的 Milvus 三容器：`milvus-etcd`、`milvus-minio`、`milvus-standalone`。
+
+启动 Milvus：
+
+```bash
+cd /Users/erwin/Downloads/codespace/Plasmodexp/milvus
+docker compose up -d
+curl http://127.0.0.1:9091/healthz
+```
+
+期望输出 `OK`。若 Python SDK 也要确认：
+
+```bash
+cd /Users/erwin/Downloads/codespace/Plasmodexp/plasmod_test_env
+python3 - <<'PY'
+from pymilvus import MilvusClient
+c = MilvusClient(uri="http://127.0.0.1:19530")
+print(c.list_collections())
+PY
+```
+
+后台运行 Milvus Table 5 的 10 / 100 / 500 events/s：
+
+```bash
+cd /Users/erwin/Downloads/codespace/Plasmodexp/plasmod_test_env
+RUN_ID=table5_milvus_rates_$(date +%Y%m%d_%H%M%S)
+RUN_DIR="results/layer2_dynamic_events/${RUN_ID}"
+mkdir -p "${RUN_DIR}"
+screen -dmS layer2_milvus_table5 bash -lc "cd /Users/erwin/Downloads/codespace/Plasmodexp/plasmod_test_env && caffeinate -dimsu python3 scripts/layer2_dynamic_event_benchmark.py run --run-id ${RUN_ID} --tables 5 --systems milvus --embedding-provider hash --write-rates 500 100 10 --events-per-rate 0 --query-limit 0 --query-qps 0 --workers 32 --visible-timeout-ms 30000 --visible-poll-ms 25 --visibility-probe-limit 5000 --http-timeout 120 --milvus-index-type FLAT --milvus-visibility-policy deferred --milvus-payload-json-bytes 0 --reset-between-runs >> ${RUN_DIR}/run.log 2>&1"
+echo "${RUN_DIR}"
+```
+
+查看进度：
+
+```bash
+tail -f /Users/erwin/Downloads/codespace/Plasmodexp/plasmod_test_env/results/layer2_dynamic_events/<run-id>/run.log
+```
+
+查看已完成行：
+
+```bash
+cat /Users/erwin/Downloads/codespace/Plasmodexp/plasmod_test_env/results/layer2_dynamic_events/<run-id>/table5_freshness_under_write_load.csv
+```
+
+停止当前 Milvus Table 5 实验：
+
+```bash
+screen -S layer2_milvus_table5 -X quit 2>/dev/null || true
+pkill -f "layer2_dynamic_event_benchmark.py run --run-id table5_milvus" 2>/dev/null || true
+pkill -f "caffeinate -dimsu python3 scripts/layer2_dynamic_event_benchmark.py" 2>/dev/null || true
+```
+
+停止 Milvus 服务：
+
+```bash
+cd /Users/erwin/Downloads/codespace/Plasmodexp/milvus
+docker compose down
+```
+
+如果 `milvus-standalone` 秒退且日志反复出现 `find no available mixcoord`，优先认为是上次强停后 Milvus metadata / rocksmq 状态不一致。不要直接删除旧数据，先备份 volume 再重启：
+
+```bash
+cd /Users/erwin/Downloads/codespace/Plasmodexp/milvus
+docker compose down
+mv volumes "volumes_backup_$(date +%Y%m%d_%H%M%S)"
+mkdir -p volumes
+docker compose up -d
+curl http://127.0.0.1:9091/healthz
+```
+
 小规模 Milvus baseline 冒烟：
 
 ```bash
