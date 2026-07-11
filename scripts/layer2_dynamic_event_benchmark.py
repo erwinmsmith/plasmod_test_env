@@ -911,7 +911,12 @@ def prefix_string(value: Any, run_id: str) -> Any:
     return f"{run_id}_{value}"
 
 
-def namespace_event(ev: dict[str, Any], run_id: str, mode: str | None = None) -> dict[str, Any]:
+def namespace_event(
+    ev: dict[str, Any],
+    run_id: str,
+    mode: str | None = None,
+    freshness_sla_ms: int | None = None,
+) -> dict[str, Any]:
     doc = dict(ev)
     for path in [
         "identity.event_id",
@@ -937,6 +942,8 @@ def namespace_event(ev: dict[str, Any], run_id: str, mode: str | None = None) ->
 
     if mode:
         doc = set_path_copy(doc, "access.consistency", mode)
+    if freshness_sla_ms is not None:
+        doc = set_path_copy(doc, "access.freshness_sla_ms", freshness_sla_ms)
     doc = set_path_copy(doc, "runtime.t_write_start_ms", wall_ms())
     return maybe_externalize_large_event(doc)
 
@@ -1100,16 +1107,68 @@ class PlasmodAdapter(SystemAdapter):
 
     def __init__(self, base_url: str, timeout: float = 30.0):
         self.http = HTTPJSONClient(base_url, timeout)
+        self.active_mode: str | None = None
+        self.last_consistency_status: dict[str, Any] = {}
 
     def health(self) -> None:
         self.http.request("GET", "/healthz")
 
     def set_visibility_mode(self, mode: str) -> None:
         api_mode = PLASMOD_MODES.get(mode, mode)
-        self.http.request("POST", "/v1/admin/consistency-mode", {"mode": api_mode})
+        status = self.http.request("POST", "/v1/admin/consistency-mode", {"mode": api_mode})
+        self.last_consistency_status = validate_plasmod_consistency_status(status, api_mode)
+        self.active_mode = api_mode
+
+    def consistency_status(self, require_drained: bool = False) -> dict[str, Any]:
+        status = self.http.request("GET", "/v1/admin/consistency-mode")
+        expected_mode = self.active_mode or str(status.get("mode", ""))
+        validated = validate_plasmod_consistency_status(
+            status, expected_mode, require_drained=require_drained
+        )
+        self.last_consistency_status = validated
+        return validated
 
     def reset(self) -> None:
-        self.http.request("POST", "/v1/admin/data/wipe", {"confirm": "delete_all_data"})
+        result = self.http.request("POST", "/v1/admin/data/wipe", {"confirm": "delete_all_data"})
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            raise RuntimeError(f"Plasmod reset failed: {result!r}")
+        if result.get("consistency_projection") != "reset":
+            raise RuntimeError(f"Plasmod reset did not clear consistency projection: {result!r}")
+        self.consistency_status(require_drained=True)
+
+    def _validate_ingest_ack(self, ev: dict[str, Any], ack: Any) -> dict[str, Any]:
+        if not isinstance(ack, dict):
+            raise RuntimeError(f"Plasmod ingest returned a non-object acknowledgement: {ack!r}")
+        requested = str(get_path(ev, "access.consistency", "") or "").strip()
+        expected_mode = PLASMOD_MODES.get(requested, requested) if requested else self.active_mode
+        if not expected_mode:
+            return ack
+        actual_mode = str(ack.get("consistency_mode", ""))
+        if actual_mode != expected_mode:
+            raise RuntimeError(
+                f"Plasmod acknowledgement consistency_mode={actual_mode!r}, expected {expected_mode!r}"
+            )
+        expected_visibility = "visible" if expected_mode == "strict_visible" else "pending"
+        actual_visibility = str(ack.get("visibility_status", ""))
+        if actual_visibility != expected_visibility:
+            raise RuntimeError(
+                f"Plasmod acknowledgement visibility_status={actual_visibility!r}, "
+                f"expected {expected_visibility!r} for {expected_mode}"
+            )
+        if expected_mode == "bounded_staleness":
+            requested_sla = get_path(ev, "access.freshness_sla_ms", 1000)
+            expected_sla = int(requested_sla or 1000)
+            try:
+                actual_sla = int(ack.get("freshness_sla_ms"))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"Plasmod bounded acknowledgement omitted freshness_sla_ms: {ack!r}") from exc
+            if actual_sla != expected_sla:
+                raise RuntimeError(
+                    f"Plasmod acknowledgement freshness_sla_ms={actual_sla}, expected {expected_sla}"
+                )
+        if int(ack.get("lsn", 0) or 0) <= 0:
+            raise RuntimeError(f"Plasmod acknowledgement omitted a positive LSN: {ack!r}")
+        return ack
 
     def ingest(self, ev: dict[str, Any]) -> IngestResult:
         t0 = now_ms()
@@ -1118,6 +1177,7 @@ class PlasmodAdapter(SystemAdapter):
         expected = {eid, oid}
         try:
             ack = self.http.request("POST", "/v1/ingest/events", ev)
+            ack = self._validate_ingest_ack(ev, ack)
             t1 = now_ms()
             if isinstance(ack, dict):
                 for key in ("memory_id", "event_id", "object_id", "state_id", "artifact_id", "edge_id"):
@@ -1905,6 +1965,84 @@ def validate_measurements_or_raise(
         )
 
 
+def validate_plasmod_consistency_status(
+    status: Any,
+    expected_mode: str,
+    *,
+    require_drained: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(status, dict) or status.get("status") != "ok":
+        raise RuntimeError(f"Plasmod consistency status is unhealthy: {status!r}")
+    if str(status.get("mode", "")) != expected_mode:
+        raise RuntimeError(
+            f"Plasmod consistency mode is {status.get('mode')!r}, expected {expected_mode!r}"
+        )
+    if status.get("data_path_active") is not True:
+        raise RuntimeError(f"Plasmod consistency data path is not active: {status!r}")
+    supported = set(status.get("supported_modes") or [])
+    if expected_mode not in supported:
+        raise RuntimeError(f"Plasmod consistency mode is not advertised as supported: {status!r}")
+    if int(status.get("failed", 0) or 0) != 0:
+        raise RuntimeError(f"Plasmod consistency projection has terminal failures: {status!r}")
+    if require_drained:
+        for key in ("queue_depth", "pending", "retrying", "failed"):
+            if int(status.get(key, 0) or 0) != 0:
+                raise RuntimeError(f"Plasmod consistency projection is not drained ({key}): {status!r}")
+    return status
+
+
+def validate_table6_mode_semantics(
+    adapter: PlasmodAdapter,
+    mode: str,
+    ingests: list[IngestResult],
+    queries: list[QueryResult] | QueryStats,
+    bounded_sla_ms: int,
+) -> None:
+    expected_mode = PLASMOD_MODES[mode]
+    if adapter.active_mode != expected_mode:
+        raise RuntimeError(
+            f"table6 plasmod/{mode}: adapter mode={adapter.active_mode!r}, expected {expected_mode!r}"
+        )
+    successful = [result for result in ingests if result.ok]
+    for result in successful:
+        actual_mode = str(result.ack.get("consistency_mode", ""))
+        if actual_mode != expected_mode:
+            raise RuntimeError(
+                f"table6 plasmod/{mode}: acknowledgement mode={actual_mode!r}, expected {expected_mode!r}"
+            )
+
+    if mode == "strict":
+        if any(result.ack.get("visibility_status") != "visible" for result in successful):
+            raise RuntimeError("table6 plasmod/strict: strict acknowledgement was not visible")
+        if query_stale_count(queries) != 0:
+            raise RuntimeError("table6 plasmod/strict: strict query returned a stale result")
+    elif mode == "bounded":
+        for result in successful:
+            if result.ack.get("visibility_status") != "pending":
+                raise RuntimeError("table6 plasmod/bounded: bounded acknowledgement was not pending")
+            if int(result.ack.get("freshness_sla_ms", 0) or 0) != bounded_sla_ms:
+                raise RuntimeError("table6 plasmod/bounded: acknowledgement SLA does not match the configured SLA")
+        observed_lags = [
+            result.write_to_visible_ms
+            for result in successful
+            if result.write_to_visible_ms is not None
+        ]
+        p95_lag = percentile(observed_lags, 95)
+        if p95_lag is not None and p95_lag > bounded_sla_ms:
+            raise RuntimeError(
+                f"table6 plasmod/bounded: observed p95 visibility lag {p95_lag:.3f}ms exceeds SLA {bounded_sla_ms}ms"
+            )
+    elif mode == "eventual":
+        if any(result.ack.get("visibility_status") != "pending" for result in successful):
+            raise RuntimeError("table6 plasmod/eventual: eventual acknowledgement was not pending")
+    else:
+        raise RuntimeError(f"table6: unsupported Plasmod mode {mode!r}")
+
+    status = adapter.consistency_status(require_drained=True)
+    if int(status.get("sla_breaches", 0) or 0) != 0:
+        raise RuntimeError(f"table6 plasmod/{mode}: core reported consistency SLA breaches: {status!r}")
+
+
 def wait_for_visible_batch(
     adapter: SystemAdapter,
     events: list[dict[str, Any]],
@@ -2461,6 +2599,8 @@ def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
 
 
 def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
+    if args.bounded_sla_ms <= 0:
+        raise ValueError("--bounded-sla-ms must be positive")
     csv_path = run_dir / "table6_consistency_mode_tradeoff.csv"
     rows: list[dict[str, Any]] = read_csv_rows(csv_path)
     done_keys = {
@@ -2496,16 +2636,19 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 file=sys.stderr,
                 flush=True,
             )
+            mode_sla_ms = args.bounded_sla_ms if mode == "bounded" else None
             if args.shuffle:
                 assert raw is not None
-                events: Iterable[dict[str, Any]] = [namespace_event(ev, run_id, PLASMOD_MODES[mode]) for ev in raw]
+                events: Iterable[dict[str, Any]] = [
+                    namespace_event(ev, run_id, PLASMOD_MODES[mode], mode_sla_ms)
+                    for ev in raw
+                ]
             else:
                 events = (
-                    namespace_event(ev, run_id, PLASMOD_MODES[mode])
+                    namespace_event(ev, run_id, PLASMOD_MODES[mode], mode_sla_ms)
                     for ev in iter_events(args.synthetic_input, limit=args.events_per_rate)
                 )
-            if args.reset_between_runs:
-                adapter.reset()
+            adapter.reset()
             ingests, queries, _elapsed_s = run_freshness_trial(
                 adapter,
                 events,
@@ -2523,6 +2666,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             if args.shuffle:
                 fill_missing_visibility(adapter, events, ingests, run_id, args.visible_timeout_ms, args.visible_poll_ms, args.workers)  # type: ignore[arg-type]
             validate_measurements_or_raise(args, "table6", f"plasmod/{mode}", ingests, queries)
+            validate_table6_mode_semantics(adapter, mode, ingests, queries, args.bounded_sla_ms)
             qrow = summarize_queries(adapter.name, mode, queries)
             irow = summarize_ingests(adapter.name, mode, ingests, queries)
             row = {
@@ -2947,6 +3091,7 @@ def run_tables(args: argparse.Namespace) -> Path:
         "allow_visibility_timeouts": args.allow_visibility_timeouts,
         "write_rates": args.write_rates,
         "query_qps": args.query_qps,
+        "bounded_sla_ms": args.bounded_sla_ms,
         "max_hot_event_bytes": args.max_hot_event_bytes,
         "hot_payload_preview_bytes": args.hot_payload_preview_bytes,
         "created_at_ms": wall_ms(),
@@ -3030,6 +3175,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run.add_argument("--write-rates", type=float, nargs="+", default=[10, 100, 500, 1000])
     run.add_argument("--write-rate", type=float, default=100.0, help="Default write rate for Table 4, 7, 8.")
     run.add_argument("--fixed-write-rate", type=float, default=100.0, help="Fixed write rate for Table 6.")
+    run.add_argument(
+        "--bounded-sla-ms",
+        type=int,
+        default=1000,
+        help="Per-event freshness SLA for Plasmod bounded-staleness rows in Table 6.",
+    )
     run.add_argument("--query-qps", type=float, default=25.0)
     run.add_argument("--query-limit", type=int, default=200)
     run.add_argument("--workers", type=int, default=32)
