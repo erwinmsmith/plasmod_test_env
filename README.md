@@ -188,7 +188,19 @@ bash stop_all.sh && bash start_all.sh
 
 汇总表会在日志末尾打印（DB / Index / Build / Batch QPS / Serial QPS / Recall@K / P50 / P95 / P99 / Memory）。
 
-第二层 Dynamic Event Stream and State Visibility 数据放在：
+### 公开实验数据
+
+动态 agent event workload 和 replay 输入发布在 [CodeSoulco/plasmod-agent-event-data-release](https://huggingface.co/datasets/CodeSoulco/plasmod-agent-event-data-release)。将其下载到本仓库预期的位置并解压 shard archive：
+
+```bash
+hf download CodeSoulco/plasmod-agent-event-data-release \
+  --repo-type dataset \
+  --local-dir data/layer2_dynamic_events
+zstd -d --stdout data/layer2_dynamic_events/traces_collected.tar.zst \
+  | tar -xf - -C data/layer2_dynamic_events
+```
+
+该数据集提供经过脱敏和标准化的 JSONL 数据资产；本仓库提供用于加载、回放、压力测试和结果整理的实验代码。下载后目录包含：
 
 - `data/layer2_dynamic_events/traces_collected/`：Synthetic Agent Event Stream，来自真实 agent runtime trace 条目的大规模混合事件流
 - `data/layer2_dynamic_events/events.jsonl`：Replayable Agent Execution Trace，用于 replay、state correctness 和因果关系验证
