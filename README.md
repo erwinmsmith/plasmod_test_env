@@ -190,7 +190,9 @@ bash stop_all.sh && bash start_all.sh
 
 ### 公开实验数据
 
-动态 agent event workload 和 replay 输入发布在 [CodeSoulco/plasmod-agent-event-data-release](https://huggingface.co/datasets/CodeSoulco/plasmod-agent-event-data-release)。将其下载到本仓库预期的位置并解压 shard archive：
+动态 agent event workload 和 replay 输入发布在 [CodeSoulco/plasmod-agent-event-data-release](https://huggingface.co/datasets/CodeSoulco/plasmod-agent-event-data-release)。该发布包含重新收集并规范化的两组 agent trajectory：一组覆盖 MetaGPT x SWE-bench、LangGraph x BIRD-SQL/tau-bench、LlamaIndex x GAIA、PydanticAI x MINT 和 AutoGen x AgentBench；另一组覆盖 GPT Researcher x MS MARCO/GAIA、OpenManus x ToolBench 和 AutoGen x MS MARCO/GAIA。数据集卡提供各框架与 benchmark 的官方引用链接、采集规模和字段定义。
+
+将其下载到本仓库预期的位置并解压 shard archive：
 
 ```bash
 hf download CodeSoulco/plasmod-agent-event-data-release \
@@ -200,10 +202,10 @@ zstd -d --stdout data/layer2_dynamic_events/traces_collected.tar.zst \
   | tar -xf - -C data/layer2_dynamic_events
 ```
 
-该数据集提供经过脱敏和标准化的 JSONL 数据资产；本仓库提供用于加载、回放、压力测试和结果整理的实验代码。下载后目录包含：
+该数据集提供经过脱敏和标准化的 JSONL 数据资产；本仓库提供用于加载、回放、压力测试和结果整理的实验代码。上游 benchmark 的原始数据、许可证和访问条件不随本仓库分发。下载后目录包含：
 
-- `data/layer2_dynamic_events/traces_collected/`：Synthetic Agent Event Stream，来自真实 agent runtime trace 条目的大规模混合事件流
-- `data/layer2_dynamic_events/events.jsonl`：Replayable Agent Execution Trace，用于 replay、state correctness 和因果关系验证
+- `data/layer2_dynamic_events/traces_collected/`：按 source trajectory 分组的规范化 agent event shards
+- `data/layer2_dynamic_events/events.jsonl`：有序 replay trace，包含 research、tool-use 与 multi-agent 协作场景的事件记录
 
 第二层实验数据只放在 `plasmod_test_env`，不要放进 `Plasmod` 核心库。
 
