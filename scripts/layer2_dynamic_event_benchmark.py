@@ -1743,6 +1743,21 @@ def query_for_event(ev: dict[str, Any], run_id: str, query_id: str) -> QuerySpec
     )
 
 
+def notify_ingest_completion(
+    done: Future[IngestResult],
+    event: dict[str, Any],
+    on_complete: Callable[[dict[str, Any], IngestResult], None],
+) -> None:
+    """Run the optional success callback without masking the primary write error."""
+    if done.cancelled():
+        return
+    try:
+        result = done.result()
+    except Exception:
+        return
+    on_complete(event, result)
+
+
 def ingest_with_rate(
     adapter: SystemAdapter,
     events: Iterable[dict[str, Any]],
@@ -1837,7 +1852,9 @@ def ingest_with_rate(
                 time.sleep(delay)
             fut = pool.submit(adapter.ingest, ev)
             if on_complete is not None:
-                fut.add_done_callback(lambda done, event=ev: on_complete(event, done.result()))
+                fut.add_done_callback(
+                    lambda done, event=ev: notify_ingest_completion(done, event, on_complete)
+                )
             pending.append((idx, ev, fut))
             while len(pending) >= max_pending:
                 collect_one(block=True)

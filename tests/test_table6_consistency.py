@@ -1,4 +1,5 @@
 import unittest
+from concurrent.futures import Future
 
 from scripts import layer2_dynamic_event_benchmark as benchmark
 
@@ -59,6 +60,18 @@ def ingest_result(mode: str, visibility: str, *, sla_ms=None, visible_lag_ms=10.
 
 
 class Table6ConsistencyContractTest(unittest.TestCase):
+    def test_ingest_completion_callback_ignores_cancelled_future(self):
+        observed = []
+        future = Future()
+        self.assertTrue(future.cancel())
+        benchmark.notify_ingest_completion(
+            future,
+            {"identity": {"event_id": "event"}},
+            lambda _event, result: observed.append(result),
+        )
+
+        self.assertEqual(observed, [])
+
     def test_mode_switch_rejects_inactive_data_path(self):
         adapter = benchmark.PlasmodAdapter("http://plasmod.test")
         adapter.http = FakeHTTP(
