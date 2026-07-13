@@ -1,5 +1,6 @@
 import unittest
 from concurrent.futures import Future
+from pathlib import Path
 
 from scripts import layer2_dynamic_event_benchmark as benchmark
 
@@ -60,6 +61,14 @@ def ingest_result(mode: str, visibility: str, *, sla_ms=None, visible_lag_ms=10.
 
 
 class Table6ConsistencyContractTest(unittest.TestCase):
+    def test_table6_launcher_disables_periodic_retrieval_flush_by_default(self):
+        launcher = Path(__file__).parents[1] / "scripts" / "start_plasmod_table6.sh"
+
+        self.assertIn(
+            "PLASMOD_FLUSH_INTERVAL='${PLASMOD_FLUSH_INTERVAL:-0}'",
+            launcher.read_text(),
+        )
+
     def test_ingest_completion_callback_ignores_cancelled_future(self):
         observed = []
         future = Future()
