@@ -1,6 +1,7 @@
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from scripts import layer2_dynamic_event_benchmark as benchmark
 
@@ -61,6 +62,26 @@ def ingest_result(mode: str, visibility: str, *, sla_ms=None, visible_lag_ms=10.
 
 
 class Table6ConsistencyContractTest(unittest.TestCase):
+    def test_hash_embeddings_are_prewarmed_and_reused_from_disk_cache(self):
+        with TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "embeddings.sqlite3"
+            embedder = benchmark.make_embedding_provider(
+                "hash",
+                benchmark.DEFAULT_EMBEDDER_MODEL,
+                benchmark.DEFAULT_EMBEDDER_VOCAB,
+                cache_path,
+                2,
+            )
+
+            first = embedder.prewarm_texts(iter(["alpha", "beta", "alpha"]))
+            second = embedder.prewarm_texts(iter(["alpha", "beta"]))
+
+            self.assertIsInstance(embedder, benchmark.CachedEmbedder)
+            self.assertEqual(first["new_embeddings"], 2)
+            self.assertEqual(second["new_embeddings"], 0)
+            self.assertEqual(second["cached_embeddings"], 2)
+            self.assertEqual(embedder.embed_one("alpha"), embedder.embed_one("alpha"))
+
     def test_table6_launcher_disables_periodic_retrieval_flush_by_default(self):
         launcher = Path(__file__).parents[1] / "scripts" / "start_plasmod_table6.sh"
 

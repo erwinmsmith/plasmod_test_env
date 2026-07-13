@@ -291,6 +291,9 @@ class HashEmbedder:
             vectors.append(vec.astype("float32").tolist())
         return vectors
 
+    def cache_signature(self) -> str:
+        return f"hash-sha256-v1-dim-{EMBEDDING_DIM}"
+
     def prewarm_texts(self, texts: Iterable[str]) -> dict[str, Any]:
         unique = len([text for text in dict.fromkeys((t or "") for t in texts) if text])
         return {
@@ -318,7 +321,7 @@ def embedding_model_signature(model_path: Path, vocab_path: Path) -> str:
 class CachedEmbedder:
     def __init__(
         self,
-        embedder: MiniLMEmbedder,
+        embedder: Any,
         cache_path: Path,
         model_path: Path,
         vocab_path: Path,
@@ -326,7 +329,12 @@ class CachedEmbedder:
     ):
         self.embedder = embedder
         self.cache_path = cache_path
-        self.model_sig = embedding_model_signature(model_path, vocab_path)
+        cache_signature = getattr(embedder, "cache_signature", None)
+        self.model_sig = (
+            str(cache_signature())
+            if callable(cache_signature)
+            else embedding_model_signature(model_path, vocab_path)
+        )
         self.batch_size = max(1, batch_size)
         self.mu = threading.Lock()
         self._ready = False
@@ -421,16 +429,26 @@ class CachedEmbedder:
         return [results[text] for text in texts]
 
     def prewarm_texts(self, texts: Iterable[str]) -> dict[str, Any]:
-        unique = [text for text in dict.fromkeys((t or "") for t in texts) if text]
         before = self.count_cached()
         started = now_ms()
-        for start in range(0, len(unique), self.batch_size):
-            self.embed_many(unique[start : start + self.batch_size])
+        processed = 0
+        batch: list[str] = []
+        for text in texts:
+            text = text or ""
+            if not text:
+                continue
+            batch.append(text)
+            processed += 1
+            if len(batch) >= self.batch_size:
+                self.embed_many(batch)
+                batch = []
+        if batch:
+            self.embed_many(batch)
         after = self.count_cached()
         return {
             "cache_path": str(self.cache_path),
             "model_sig": self.model_sig,
-            "texts": len(unique),
+            "texts": processed,
             "new_embeddings": max(0, after - before),
             "cached_embeddings": after,
             "elapsed_s": (now_ms() - started) / 1000.0,
@@ -445,6 +463,30 @@ class CachedEmbedder:
                     (self.model_sig,),
                 ).fetchone()
         return int(row[0] if row else 0)
+
+
+def make_embedding_provider(
+    embedding_provider: str,
+    model_path: Path,
+    vocab_path: Path,
+    embedding_cache: Path | None,
+    embedding_batch_size: int,
+) -> Any:
+    if embedding_provider == "hash":
+        embedder: Any = HashEmbedder()
+    elif embedding_provider == "minilm":
+        embedder = MiniLMEmbedder(model_path, vocab_path)
+    else:
+        raise ValueError(f"unknown embedding provider: {embedding_provider}")
+    if embedding_cache is not None:
+        return CachedEmbedder(
+            embedder,
+            embedding_cache,
+            model_path,
+            vocab_path,
+            batch_size=embedding_batch_size,
+        )
+    return embedder
 
 
 def get_path(doc: dict[str, Any], path: str, default: Any = None) -> Any:
@@ -1664,20 +1706,13 @@ def make_adapter(
     if system == "plasmod":
         return PlasmodAdapter(base_url, timeout=timeout)
     if system in {"milvus", "vector_metadata", "baseline"}:
-        if embedding_provider == "hash":
-            embedder = HashEmbedder()
-        elif embedding_provider == "minilm":
-            embedder = MiniLMEmbedder(embedder_model, embedder_vocab)
-        else:
-            raise ValueError(f"unknown embedding provider: {embedding_provider}")
-        if embedding_provider == "minilm" and embedding_cache is not None:
-            embedder = CachedEmbedder(
-                embedder,
-                embedding_cache,
-                embedder_model,
-                embedder_vocab,
-                batch_size=embedding_batch_size,
-            )
+        embedder = make_embedding_provider(
+            embedding_provider,
+            embedder_model,
+            embedder_vocab,
+            embedding_cache,
+            embedding_batch_size,
+        )
         return MilvusAdapter(
             uri=milvus_uri,
             collection_name=collection_name_from_path(sqlite_path),
@@ -3042,37 +3077,35 @@ def run_analyze(args: argparse.Namespace) -> None:
 def run_prepare_embeddings(args: argparse.Namespace) -> None:
     if args.no_embedding_cache:
         raise ValueError("prepare-embeddings requires embedding cache to be enabled")
-    synthetic = load_events(
-        args.synthetic_input,
-        limit=args.synthetic_limit,
-        shuffle=args.shuffle,
-        seed=args.seed,
-        max_files=args.max_files,
+    counts = {"synthetic": 0, "replay": 0}
+
+    def texts() -> Iterable[str]:
+        for ev in iter_events(
+            args.synthetic_input,
+            limit=args.synthetic_limit,
+            max_files=args.max_files,
+        ):
+            counts["synthetic"] += 1
+            yield payload_text(ev)
+        for ev in iter_events(
+            args.replay_input,
+            limit=args.replay_limit,
+            max_files=args.max_files,
+        ):
+            counts["replay"] += 1
+            yield payload_text(ev)
+
+    embedder = make_embedding_provider(
+        args.embedding_provider,
+        args.embedder_model,
+        args.embedder_vocab,
+        args.embedding_cache,
+        args.embedding_batch_size,
     )
-    replay = load_events(
-        args.replay_input,
-        limit=args.replay_limit,
-        shuffle=False,
-        max_files=args.max_files,
-    )
-    texts = [payload_text(ev) for ev in synthetic]
-    texts.extend(payload_text(ev) for ev in replay)
-    if args.embedding_provider == "hash":
-        embedder = HashEmbedder()
-    elif args.embedding_provider == "minilm":
-        embedder = CachedEmbedder(
-            MiniLMEmbedder(args.embedder_model, args.embedder_vocab),
-            args.embedding_cache,
-            args.embedder_model,
-            args.embedder_vocab,
-            batch_size=args.embedding_batch_size,
-        )
-    else:
-        raise ValueError(f"unknown embedding provider: {args.embedding_provider}")
-    summary = embedder.prewarm_texts(texts)
+    summary = embedder.prewarm_texts(texts())
     summary.update({
-        "synthetic_events": len(synthetic),
-        "replay_events": len(replay),
+        "synthetic_events": counts["synthetic"],
+        "replay_events": counts["replay"],
         "embedding_cache_enabled": True,
     })
     print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
