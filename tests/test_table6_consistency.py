@@ -69,6 +69,14 @@ class Table6ConsistencyContractTest(unittest.TestCase):
             launcher.read_text(),
         )
 
+    def test_table6_launcher_skips_unneeded_vector_projection_by_default(self):
+        launcher = Path(__file__).parents[1] / "scripts" / "start_plasmod_table6.sh"
+
+        self.assertIn(
+            "PLASMOD_SKIP_VECTOR_INDEX='${PLASMOD_SKIP_VECTOR_INDEX:-1}'",
+            launcher.read_text(),
+        )
+
     def test_ingest_completion_callback_ignores_cancelled_future(self):
         observed = []
         future = Future()
