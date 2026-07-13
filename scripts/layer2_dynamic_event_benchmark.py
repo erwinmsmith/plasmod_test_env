@@ -1162,13 +1162,24 @@ class PlasmodAdapter(SystemAdapter):
         self.active_mode = api_mode
 
     def consistency_status(self, require_drained: bool = False) -> dict[str, Any]:
-        status = self.http.request("GET", "/v1/admin/consistency-mode")
-        expected_mode = self.active_mode or str(status.get("mode", ""))
-        validated = validate_plasmod_consistency_status(
-            status, expected_mode, require_drained=require_drained
-        )
-        self.last_consistency_status = validated
-        return validated
+        drain_timeout_s = min(max(float(getattr(self.http, "timeout", 5.0) or 5.0), 1.0), 30.0)
+        deadline = time.perf_counter() + drain_timeout_s
+        while True:
+            status = self.http.request("GET", "/v1/admin/consistency-mode")
+            expected_mode = self.active_mode or str(status.get("mode", ""))
+            validated = validate_plasmod_consistency_status(status, expected_mode)
+            drained = all(
+                int(validated.get(key, 0) or 0) == 0
+                for key in ("queue_depth", "pending", "retrying", "failed")
+            )
+            if not require_drained or drained:
+                self.last_consistency_status = validated
+                return validated
+            if time.perf_counter() >= deadline:
+                validate_plasmod_consistency_status(
+                    validated, expected_mode, require_drained=True
+                )
+            time.sleep(0.01)
 
     def reset(self) -> None:
         result = self.http.request("POST", "/v1/admin/data/wipe", {"confirm": "delete_all_data"})
@@ -1811,7 +1822,9 @@ def ingest_with_rate(
             total_events = None
     interval = 0.0 if rate_eps <= 0 else 1.0 / rate_eps
     start = time.perf_counter()
-    pending: list[tuple[int, dict[str, Any], Future[IngestResult]]] = []
+    pending: list[
+        tuple[int, dict[str, Any], Future[IngestResult], threading.Event | None, list[BaseException]]
+    ] = []
     results: list[IngestResult | None] = [None] * total_events if total_events is not None else []
     unordered_results: dict[int, IngestResult] = {}
     effective_workers = max(1, workers)
@@ -1829,7 +1842,7 @@ def ingest_with_rate(
         nonlocal completed, next_progress, last_completed_at
         if not pending:
             return False
-        ready_pos = next((pos for pos, (_idx, _ev, fut) in enumerate(pending) if fut.done()), None)
+        ready_pos = next((pos for pos, (_idx, _ev, fut, _callback_done, _callback_errors) in enumerate(pending) if fut.done()), None)
         if ready_pos is None and not block:
             return False
         if ready_pos is None:
@@ -1843,9 +1856,20 @@ def ingest_with_rate(
                         f"{no_progress_timeout_s:.1f}s; completed={completed} submitted={submitted} "
                         f"pending={len(pending)} oldest_event_index={oldest_idx}"
                     )
-                wait([fut for _idx, _ev, fut in pending], timeout=min(1.0, remaining), return_when=FIRST_COMPLETED)
-                ready_pos = next((pos for pos, (_idx, _ev, fut) in enumerate(pending) if fut.done()), None)
-        idx, _ev, fut = pending.pop(ready_pos)
+                wait(
+                    [fut for _idx, _ev, fut, _callback_done, _callback_errors in pending],
+                    timeout=min(1.0, remaining),
+                    return_when=FIRST_COMPLETED,
+                )
+                ready_pos = next(
+                    (
+                        pos
+                        for pos, (_idx, _ev, fut, _callback_done, _callback_errors) in enumerate(pending)
+                        if fut.done()
+                    ),
+                    None,
+                )
+        idx, _ev, fut, callback_done, callback_errors = pending.pop(ready_pos)
         try:
             res = fut.result(timeout=future_timeout_s if block else 0.0)
         except FutureTimeoutError as exc:
@@ -1855,6 +1879,16 @@ def ingest_with_rate(
             ) from exc
         except Exception as exc:
             raise RuntimeError(f"{progress_label or adapter.name}: write future failed for event index={idx}: {exc}") from exc
+        if callback_done is not None:
+            if not callback_done.wait(timeout=future_timeout_s):
+                raise RuntimeError(
+                    f"{progress_label or adapter.name}: completion callback stalled for event index={idx}"
+                )
+            if callback_errors:
+                raise RuntimeError(
+                    f"{progress_label or adapter.name}: completion callback failed for event index={idx}: "
+                    f"{callback_errors[0]}"
+                ) from callback_errors[0]
         if total_events is not None:
             results[idx] = res
         else:
@@ -1886,11 +1920,28 @@ def ingest_with_rate(
             if delay > 0:
                 time.sleep(delay)
             fut = pool.submit(adapter.ingest, ev)
+            callback_done = None
+            callback_errors: list[BaseException] = []
             if on_complete is not None:
+                callback_done = threading.Event()
+
+                def completion_callback(
+                    done: Future[IngestResult],
+                    event: dict[str, Any] = ev,
+                    done_event: threading.Event = callback_done,
+                    errors: list[BaseException] = callback_errors,
+                ) -> None:
+                    try:
+                        notify_ingest_completion(done, event, on_complete)
+                    except BaseException as exc:
+                        errors.append(exc)
+                    finally:
+                        done_event.set()
+
                 fut.add_done_callback(
-                    lambda done, event=ev: notify_ingest_completion(done, event, on_complete)
+                    completion_callback
                 )
-            pending.append((idx, ev, fut))
+            pending.append((idx, ev, fut, callback_done, callback_errors))
             while len(pending) >= max_pending:
                 collect_one(block=True)
         while pending:
@@ -2390,6 +2441,7 @@ def run_freshness_trial(
     completed_mu = threading.Lock()
     ingest_done = threading.Event()
     query_done = threading.Event()
+    cleanup_started = threading.Event()
     query_results = QueryStats()
     q_interval = 0.0 if query_qps <= 0 else 1.0 / query_qps
     visibility_futures: list[Future[QueryResult]] = []
@@ -2427,6 +2479,8 @@ def run_freshness_trial(
 
     def on_complete(ev: dict[str, Any], res: IngestResult) -> None:
         nonlocal completed_writes, enqueued_queries, submitted_visibility
+        if cleanup_started.is_set():
+            return
         if res.ok:
             with probe_mu:
                 completed_writes += 1
@@ -2441,6 +2495,8 @@ def run_freshness_trial(
                     submitted_visibility += 1
             if probe_visibility:
                 with visibility_mu:
+                    if cleanup_started.is_set():
+                        return
                     visibility_futures.append(
                         visibility_pool.submit(wait_until_visible, adapter, ev, res, run_id, visible_timeout_ms, visible_poll_ms)
                     )
@@ -2451,6 +2507,8 @@ def run_freshness_trial(
         next_query_at = time.perf_counter()
         next_progress = time.perf_counter() + 30.0
         while True:
+            if query_done.is_set():
+                break
             if query_goal is not None and idx >= query_goal:
                 query_done.set()
                 break
@@ -2494,54 +2552,64 @@ def run_freshness_trial(
     t0 = now_ms()
     qt = threading.Thread(target=query_loop, daemon=True)
     qt.start()
-    ingests = ingest_with_rate(
-        adapter,
-        events,
-        write_rate,
-        workers,
-        on_complete=on_complete,
-        progress_label=f"{run_id}/{adapter.name}",
-        total_events=total_events,
-        fail_fast=True,
-        no_progress_timeout_s=no_progress_timeout_s,
-    )
-    ingest_done.set()
-    while qt.is_alive():
-        qt.join(timeout=1.0)
-        with query_progress_mu:
-            idle_s = time.perf_counter() - last_query_progress_at
-        if idle_s >= no_progress_timeout_s:
+    try:
+        ingests = ingest_with_rate(
+            adapter,
+            events,
+            write_rate,
+            workers,
+            on_complete=on_complete,
+            progress_label=f"{run_id}/{adapter.name}",
+            total_events=total_events,
+            fail_fast=True,
+            no_progress_timeout_s=no_progress_timeout_s,
+        )
+        ingest_done.set()
+        while qt.is_alive():
+            qt.join(timeout=1.0)
+            with query_progress_mu:
+                idle_s = time.perf_counter() - last_query_progress_at
+            if idle_s >= no_progress_timeout_s:
+                raise RuntimeError(
+                    f"{run_id}/{adapter.name}: no query completions for {no_progress_timeout_s:.1f}s; "
+                    f"queries={len(query_results)}/{query_goal if query_goal is not None else 'unknown'}"
+                )
+        if query_goal is not None and len(query_results) < query_goal:
             raise RuntimeError(
-                f"{run_id}/{adapter.name}: no query completions for {no_progress_timeout_s:.1f}s; "
-                f"queries={len(query_results)}/{query_goal if query_goal is not None else 'unknown'}"
+                f"{run_id}/{adapter.name}: query workload incomplete "
+                f"({len(query_results)}/{query_goal}); first query error={query_first_error(query_results)}"
             )
-    if query_goal is not None and len(query_results) < query_goal:
-        raise RuntimeError(
-            f"{run_id}/{adapter.name}: query workload incomplete "
-            f"({len(query_results)}/{query_goal}); first query error={query_first_error(query_results)}"
-        )
-    with visibility_mu:
-        pending_visibility = list(visibility_futures)
-    if pending_visibility:
-        print(
-            f"[progress] {run_id}/{adapter.name}: waiting for {len(pending_visibility)} visibility probes",
-            file=sys.stderr,
-            flush=True,
-        )
-    next_progress = time.perf_counter() + 30.0
-    for idx, fut in enumerate(as_completed(pending_visibility), 1):
-        fut.result()
-        now = time.perf_counter()
-        if now >= next_progress:
+        with visibility_mu:
+            pending_visibility = list(visibility_futures)
+        if pending_visibility:
             print(
-                f"[progress] {run_id}/{adapter.name}: {idx}/{len(pending_visibility)} visibility probes completed",
+                f"[progress] {run_id}/{adapter.name}: waiting for {len(pending_visibility)} visibility probes",
                 file=sys.stderr,
                 flush=True,
             )
-            next_progress = now + 30.0
-    visibility_pool.shutdown(wait=True)
-    elapsed_s = max((now_ms() - t0) / 1000.0, 1e-9)
-    return ingests, query_results, elapsed_s
+        next_progress = time.perf_counter() + 30.0
+        for idx, fut in enumerate(as_completed(pending_visibility), 1):
+            fut.result()
+            now = time.perf_counter()
+            if now >= next_progress:
+                print(
+                    f"[progress] {run_id}/{adapter.name}: {idx}/{len(pending_visibility)} visibility probes completed",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                next_progress = now + 30.0
+        elapsed_s = max((now_ms() - t0) / 1000.0, 1e-9)
+        return ingests, query_results, elapsed_s
+    finally:
+        cleanup_started.set()
+        ingest_done.set()
+        query_done.set()
+        qt.join(timeout=max(1.0, float(getattr(adapter, "timeout", 1.0) or 1.0) + 1.0))
+        with visibility_mu:
+            pending_visibility = list(visibility_futures)
+        for fut in pending_visibility:
+            fut.cancel()
+        visibility_pool.shutdown(wait=True, cancel_futures=True)
 
 
 def run_table5(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
