@@ -30,6 +30,7 @@ import statistics
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1364,16 +1365,11 @@ class MilvusAdapter(SystemAdapter):
     def _ensure_collection(self, drop: bool) -> None:
         from pymilvus import DataType, MilvusClient
 
-        if drop:
-            try:
-                self.client.drop_collection(self.collection_name)
-            except Exception:
-                pass
+        setup_timeout = max(float(self.timeout), 120.0)
+        if drop and self.client.has_collection(self.collection_name):
+            self.client.drop_collection(self.collection_name, timeout=setup_timeout)
         if self.client.has_collection(self.collection_name):
-            try:
-                self.client.load_collection(self.collection_name)
-            except Exception:
-                pass
+            self.client.load_collection(self.collection_name, timeout=setup_timeout)
             return
 
         schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
@@ -1401,14 +1397,18 @@ class MilvusAdapter(SystemAdapter):
                 metric_type="COSINE",
                 params={"M": 16, "efConstruction": 200},
             )
-        self.client.create_collection(
-            self.collection_name,
-            schema=schema,
-            index_params=index_params,
-            consistency_level="Strong",
-            timeout=self.timeout,
-        )
-        self.client.load_collection(self.collection_name)
+        try:
+            self.client.create_collection(
+                self.collection_name,
+                schema=schema,
+                index_params=index_params,
+                consistency_level="Strong",
+                timeout=setup_timeout,
+            )
+        except Exception:
+            if not self.client.has_collection(self.collection_name):
+                raise
+        self.client.load_collection(self.collection_name, timeout=setup_timeout)
 
     def health(self) -> None:
         self.client.list_collections()
@@ -2316,6 +2316,39 @@ def write_json(path: Path, value: Any) -> None:
         json.dump(value, f, indent=2, ensure_ascii=False, sort_keys=True)
 
 
+def json_contract_value(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (list, tuple)):
+        return [json_contract_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): json_contract_value(item) for key, item in value.items()}
+    return value
+
+
+def build_run_contract(args: argparse.Namespace) -> dict[str, Any]:
+    excluded = {"cmd", "output_dir", "run_id"}
+    return {
+        key: json_contract_value(value)
+        for key, value in sorted(vars(args).items())
+        if key not in excluded
+    }
+
+
+def validate_existing_run_contract(metadata_path: Path, contract: dict[str, Any]) -> dict[str, Any] | None:
+    if not metadata_path.exists():
+        return None
+    with metadata_path.open("r", encoding="utf-8") as f:
+        existing = json.load(f)
+    existing_contract = existing.get("run_contract")
+    if existing_contract != contract:
+        raise RuntimeError(
+            f"run contract mismatch for existing run directory {metadata_path.parent}; "
+            "use the original arguments or a new --run-id"
+        )
+    return existing
+
+
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -3191,8 +3224,13 @@ def run_tables(args: argparse.Namespace) -> Path:
     args.run_id = run_id
     run_dir = args.output_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = run_dir / "run_metadata.json"
+    run_contract = build_run_contract(args)
+    existing_metadata = validate_existing_run_contract(metadata_path, run_contract)
     metadata = {
         "run_id": run_id,
+        "run_contract": run_contract,
+        "tables": args.tables,
         "synthetic_input": str(args.synthetic_input),
         "replay_input": str(args.replay_input),
         "systems": args.systems,
@@ -3208,11 +3246,18 @@ def run_tables(args: argparse.Namespace) -> Path:
         "allow_query_errors": args.allow_query_errors,
         "allow_visibility_timeouts": args.allow_visibility_timeouts,
         "write_rates": args.write_rates,
+        "write_rate": args.write_rate,
+        "fixed_write_rate": args.fixed_write_rate,
         "query_qps": args.query_qps,
+        "query_limit": args.query_limit,
+        "workers": args.workers,
+        "events_per_rate": args.events_per_rate,
+        "visibility_probe_limit": args.visibility_probe_limit,
         "bounded_sla_ms": args.bounded_sla_ms,
         "max_hot_event_bytes": args.max_hot_event_bytes,
         "hot_payload_preview_bytes": args.hot_payload_preview_bytes,
-        "created_at_ms": wall_ms(),
+        "created_at_ms": (existing_metadata or {}).get("created_at_ms", wall_ms()),
+        "status": "running",
         "notes": [
             "write-to-visible is measured by polling /v1/query until expected ids appear",
             "materialization lag uses first-visible time as an external black-box proxy when no materialized timestamp is returned",
@@ -3220,23 +3265,43 @@ def run_tables(args: argparse.Namespace) -> Path:
             "table7 Plasmod reset/rebuild rows are marked requires_manual_* unless the service exposes an automatic failure trigger",
         ],
     }
-    write_json(run_dir / "run_metadata.json", metadata)
+    write_json(metadata_path, metadata)
 
     all_rows: dict[str, list[dict[str, Any]]] = {}
-    selected = set(args.tables)
-    if "all" in selected or "4" in selected:
-        all_rows["table4"] = run_table4(args, run_dir)
-    if "all" in selected or "5" in selected:
-        all_rows["table5"] = run_table5(args, run_dir)
-    if "all" in selected or "6" in selected:
-        all_rows["table6"] = run_table6(args, run_dir)
-    if "all" in selected or "7" in selected:
-        all_rows["table7"] = run_table7(args, run_dir)
-    if "all" in selected or "8" in selected:
-        all_rows["table8"] = run_table8(args, run_dir)
+    try:
+        selected = set(args.tables)
+        if "all" in selected or "4" in selected:
+            all_rows["table4"] = run_table4(args, run_dir)
+        if "all" in selected or "5" in selected:
+            all_rows["table5"] = run_table5(args, run_dir)
+        if "all" in selected or "6" in selected:
+            all_rows["table6"] = run_table6(args, run_dir)
+        if "all" in selected or "7" in selected:
+            all_rows["table7"] = run_table7(args, run_dir)
+        if "all" in selected or "8" in selected:
+            all_rows["table8"] = run_table8(args, run_dir)
+    except Exception as exc:
+        failed_at_ms = wall_ms()
+        metadata.update({
+            "status": "failed",
+            "failed_at_ms": failed_at_ms,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        })
+        write_json(metadata_path, metadata)
+        write_json(run_dir / "run_failure.json", {
+            "run_id": run_id,
+            "failed_at_ms": failed_at_ms,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "run_contract": run_contract,
+        })
+        raise
     with PAYLOAD_EXTERNALIZATION_LOCK:
         metadata["payload_externalization_stats"] = dict(PAYLOAD_EXTERNALIZATION_STATS)
-    write_json(run_dir / "run_metadata.json", metadata)
+    metadata.update({"status": "completed", "completed_at_ms": wall_ms()})
+    write_json(metadata_path, metadata)
     write_json(run_dir / "summary.json", all_rows)
     return run_dir
 

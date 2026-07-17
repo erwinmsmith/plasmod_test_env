@@ -1,4 +1,5 @@
 import unittest
+import json
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -63,6 +64,39 @@ def ingest_result(mode: str, visibility: str, *, sla_ms=None, visible_lag_ms=10.
 
 
 class Table6ConsistencyContractTest(unittest.TestCase):
+    def test_run_id_rejects_mismatched_resume_contract_without_overwriting_metadata(self):
+        with TemporaryDirectory() as tmp:
+            common = [
+                "run", "--tables", "6", "--systems", "plasmod",
+                "--output-dir", tmp, "--run-id", "immutable-run",
+                "--events-per-rate", "10", "--query-limit", "2",
+            ]
+            with patch.object(benchmark, "run_table6", return_value=[]):
+                benchmark.run_tables(benchmark.parse_args(common + ["--fixed-write-rate", "10"]))
+
+            metadata_path = Path(tmp) / "immutable-run" / "run_metadata.json"
+            before = metadata_path.read_text()
+            with patch.object(benchmark, "run_table6", return_value=[]):
+                with self.assertRaisesRegex(RuntimeError, "run contract mismatch"):
+                    benchmark.run_tables(benchmark.parse_args(common + ["--fixed-write-rate", "100"]))
+            self.assertEqual(metadata_path.read_text(), before)
+
+    def test_run_failure_writes_diagnostic_artifact(self):
+        with TemporaryDirectory() as tmp:
+            args = benchmark.parse_args([
+                "run", "--tables", "6", "--systems", "plasmod",
+                "--output-dir", tmp, "--run-id", "failed-run",
+            ])
+            with patch.object(benchmark, "run_table6", side_effect=RuntimeError("injected failure")):
+                with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                    benchmark.run_tables(args)
+
+            failure_path = Path(tmp) / "failed-run" / "run_failure.json"
+            failure = json.loads(failure_path.read_text())
+            self.assertEqual(failure["error_type"], "RuntimeError")
+            self.assertIn("injected failure", failure["error"])
+            self.assertIn("traceback", failure)
+
     def test_hash_embeddings_are_prewarmed_and_reused_from_disk_cache(self):
         with TemporaryDirectory() as tmp:
             cache_path = Path(tmp) / "embeddings.sqlite3"
@@ -106,6 +140,123 @@ class Table6ConsistencyContractTest(unittest.TestCase):
             "PLASMOD_CONSISTENCY_WORKERS='${PLASMOD_CONSISTENCY_WORKERS:-10}'",
             launcher.read_text(),
         )
+
+    def test_table6_full_launcher_pins_validated_experiment_contract(self):
+        launcher = Path(__file__).parents[1] / "scripts" / "run_table6_full.sh"
+        text = launcher.read_text()
+
+        for expected in [
+            ".venv/bin/python",
+            "--tables 6",
+            "--systems plasmod milvus",
+            "--events-per-rate 0",
+            "--fixed-write-rate 100",
+            "--query-qps 5",
+            "--query-limit 5000",
+            "--bounded-sla-ms 1000",
+            "--embedding-cache",
+            "--embedding-batch-size 512",
+            "--milvus-visibility-policy deferred",
+            "--milvus-index-type FLAT",
+            "--milvus-payload-json-bytes 0",
+            "--reset-between-runs",
+        ]:
+            self.assertIn(expected, text)
+
+    def test_milvus_collection_setup_uses_extended_load_timeout(self):
+        class FakeClient:
+            def __init__(self):
+                self.load_timeouts = []
+
+            def has_collection(self, _name):
+                return True
+
+            def load_collection(self, _name, timeout=None):
+                self.load_timeouts.append(timeout)
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        adapter.client = FakeClient()
+        adapter.collection_name = "existing"
+        adapter.timeout = 30.0
+
+        adapter._ensure_collection(drop=False)
+
+        self.assertEqual(adapter.client.load_timeouts, [120.0])
+
+    def test_milvus_collection_setup_recovers_when_create_times_out_after_creation(self):
+        class FakeClient:
+            def __init__(self):
+                self.created = False
+                self.load_timeouts = []
+
+            def has_collection(self, _name):
+                return self.created
+
+            def create_collection(self, _name, **_kwargs):
+                self.created = True
+                raise TimeoutError("created but initial load timed out")
+
+            def load_collection(self, _name, timeout=None):
+                self.load_timeouts.append(timeout)
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        adapter.client = FakeClient()
+        adapter.collection_name = "created-after-timeout"
+        adapter.timeout = 30.0
+        adapter.index_type = "FLAT"
+
+        adapter._ensure_collection(drop=False)
+
+        self.assertEqual(adapter.client.load_timeouts, [120.0])
+
+    def test_milvus_reset_does_not_hide_collection_drop_failure(self):
+        class FakeClient:
+            def has_collection(self, _name):
+                return True
+
+            def drop_collection(self, _name, timeout=None):
+                raise RuntimeError("drop failed")
+
+            def load_collection(self, _name, timeout=None):
+                raise AssertionError("stale collection must not be loaded")
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        adapter.client = FakeClient()
+        adapter.collection_name = "stale"
+        adapter.timeout = 30.0
+
+        with self.assertRaisesRegex(RuntimeError, "drop failed"):
+            adapter._ensure_collection(drop=True)
+
+    def test_milvus_ingest_inserts_each_event_once(self):
+        class FakeEmbedder:
+            def embed_one(self, _text):
+                return [0.0] * benchmark.EMBEDDING_DIM
+
+        class FakeClient:
+            def __init__(self):
+                self.inserts = []
+
+            def insert(self, collection_name, rows, timeout=None):
+                self.inserts.append((collection_name, rows, timeout))
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        adapter.client = FakeClient()
+        adapter.collection_name = "single-insert"
+        adapter.timeout = 30.0
+        adapter.embedder = FakeEmbedder()
+        adapter.visibility_policy = "deferred"
+        adapter.payload_json_bytes = 0
+        adapter.mu = __import__("threading").Lock()
+
+        result = adapter.ingest({
+            "identity": {"event_id": "event"},
+            "object": {"object_id": "object"},
+            "payload": {"text": "hello"},
+        })
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(adapter.client.inserts), 1)
 
     def test_ingest_completion_callback_ignores_cancelled_future(self):
         observed = []
