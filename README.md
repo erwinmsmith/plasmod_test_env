@@ -436,7 +436,7 @@ python3 scripts/agent_native_ablation_benchmark.py run \
 最近通过完整 smoke 的结果目录：
 
 ```text
-results/agent_native_ablation/agent_native_ablation_smoke_20260722_v7/
+results/agent_native_ablation/agent_native_ablation_smoke_20260722_v8/
 ```
 
 ---
