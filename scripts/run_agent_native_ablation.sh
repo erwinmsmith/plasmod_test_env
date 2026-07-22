@@ -8,15 +8,13 @@ shift || true
 case "${MODE}" in
   smoke)
     RUNNER_MODE="smoke"
-    DEFAULT_ARGS=()
     ;;
   run)
     RUNNER_MODE="run"
-    DEFAULT_ARGS=()
     ;;
   full)
     RUNNER_MODE="run"
-    DEFAULT_ARGS=(--event-limit 0)
+    set -- --event-limit 0 "$@"
     ;;
   *)
     echo "usage: $0 {smoke|run|full} [runner arguments]" >&2
@@ -29,5 +27,4 @@ cd "${ROOT}"
 exec python3 scripts/agent_native_ablation_benchmark.py \
   "${RUNNER_MODE}" \
   --run-id "${RUN_ID}" \
-  "${DEFAULT_ARGS[@]}" \
   "$@"

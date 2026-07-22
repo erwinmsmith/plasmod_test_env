@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -14,6 +16,25 @@ assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+
+def test_smoke_launcher_supports_empty_default_arguments_under_nounset(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    launcher = SCRIPT.with_name("run_agent_native_ablation.sh")
+    env = os.environ | {"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"}
+
+    completed = subprocess.run(
+        ["/bin/bash", str(launcher), "smoke", "--port", "18080"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_percentile_and_hash_vector_are_deterministic():
