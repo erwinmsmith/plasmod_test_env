@@ -355,8 +355,30 @@ runner 会启动完整的真实服务路径：当前 C++ retrieval build、Go Pl
 | `governance_ablation.csv` | private leakage, authorized/unauthorized hit, delete visibility delay, quarantine exclusion, policy overhead |
 | `tiered_storage_ablation.csv` | query p50/p95/p99, hot/warm/cold hit rate, promotion p95, RSS memory, stale rate |
 | `full_database_baseline.csv` | 五组 Full variant 的全部指标，合并为一行完整数据库基线 |
+| `ablation_master_table.csv` | 34 个 Full / `w/o` 变体的统一总表：配置、公共指标和五组模块专属指标；非适用项显式为 `N/A (not applicable)` |
+| `ablation_master_style.json` | 总表列组的颜色与语义清单，供 Excel/论文表格导出器稳定复用 |
 
 指标来自真实 HTTP ACK、canonical state、replay API、query diagnostics 和 S3 tier counters。`Object Visibility Coverage` 按 baseline 中 event/memory/state/artifact/edge/version 的对象数量计算；`Stale Rate` 使用 tier 查询后 canonical target 是否可见计算，不把 ANN recall 当作 freshness；governance 对象使用独立 session，避免 conflict lifecycle 干扰 ACL 测量。
+
+#### 6.2.1 最大交集公共口径
+
+`ablation_master_table.csv` 使用 `agent-native-common-v1` 参数集。每个变体在模块专属 probe 之前都执行完全相同的 recorded agent-native workload，包括 governance 组；因此公共性能列不是由不同实验表拼接或估算得到的。
+
+| 公共参数 | 固定规则 |
+|---|---|
+| Event input | 同一有序数据源前缀；`--event-limit 0` 时为全部输入 |
+| Query input | 同一 query sample 选择规则和 `--query-limit` |
+| TopK | 20 |
+| Embedding | 384 维确定性缓存向量，不计入数据库请求延迟 |
+| Write consistency | `strict` |
+| Query consistency | `eventual` |
+| Canonical storage | Badger disk |
+| Cold storage | 真实本地 MinIO S3；即使某个 tier variant 关闭 cold capability，服务拓扑仍保持一致 |
+| Server path | 同一个 Go server、C++ retrieval build 和 HTTP API |
+
+每一行统一计算 19 个公共数值字段：event/query/stale-check 数量，TopK，embedding 维度，write QPS 与 p50/p95/p99，write-to-visible p50/p95，materialization lag p95，query QPS 与 p50/p95/p99，RSS memory，object visibility coverage 和 target stale rate。WAL、materialization、evidence、governance、tier 的特殊指标保留在各自带前缀的列组中；其他模块行写 `N/A (not applicable)`，不使用空白或伪造的 0。
+
+`Comparison Label` 明确给出论文中的 `Full`、`w/o WAL / Event Log`、`w/o Replay`、`w/o Canonical Materialization`、`w/o Agent State`、`w/o Evidence Assembly`、`w/o Access Policy`、`w/o Hot Cache` 等名称；控制变量行使用 `File WAL control`、`Hot Cache = 64/512/2000` 等标签，不错误标成 `w/o`。
 
 ### 6.3 Smoke、定量和全量运行
 
@@ -409,12 +431,12 @@ python3 scripts/agent_native_ablation_benchmark.py run \
   --run-id "${RUN_ID}" --event-limit 0 --query-limit 100 --port 18080 --resume
 ```
 
-结果位于 `results/agent_native_ablation/<run-id>/`。只有 CSV 全部非空、capability 回读一致、服务日志没有 panic/fatal/S3 错误时才生成 `COMPLETE` 和 `summary.json`；任何 HTTP、服务、指标或日志错误都会停止并生成 `FAILED`。每个 variant 的 `capabilities.json`、`measurements.json`、`server.log` 和持久化数据位于 `variants/<variant>/`，可用于审计单项结果。
+结果位于 `results/agent_native_ablation/<run-id>/`。只有分组 CSV 和 34 行总表全部非空、19 个公共指标全部为有限数值、capability 回读一致、服务日志没有 panic/fatal/S3 错误时才生成 `COMPLETE` 和 `summary.json`；任何 HTTP、服务、指标或日志错误都会停止并生成 `FAILED`。每个 variant 的 `capabilities.json`、`measurements.json`、`common_metrics.json`、`server.log` 和持久化数据位于 `variants/<variant>/`，可用于审计单项结果。
 
 最近通过完整 smoke 的结果目录：
 
 ```text
-results/agent_native_ablation/agent_native_ablation_smoke_20260722_v6/
+results/agent_native_ablation/agent_native_ablation_smoke_20260722_v7/
 ```
 
 ---

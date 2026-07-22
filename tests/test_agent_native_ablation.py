@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -48,6 +49,10 @@ def test_every_ablation_table_has_unique_complete_headers():
         assert fields[:2] == ["System", "Variant"]
         assert len(fields) == len(set(fields))
         assert len(fields) >= 8
+    assert len(MODULE.MASTER_FIELDS) == len(set(MODULE.MASTER_FIELDS))
+    assert MODULE.MASTER_FIELDS[:5] == [
+        "System", "Module", "Original Variant", "Comparison Label", "Ablated Capability",
+    ]
 
 
 def test_ablation_matrix_covers_all_declared_variants_and_metrics():
@@ -65,6 +70,49 @@ def test_ablation_matrix_covers_all_declared_variants_and_metrics():
         "No-evidence", "No-proof-trace", "No-access-policy", "No-delete-propagation",
         "No-hot-cache", "No-promotion", "Hot-size-2000",
     }
+    assert len(MODULE.all_variants()) == 34
+    for variant in MODULE.all_variants():
+        label, capability = MODULE.COMPARISON_LABELS[variant.group][variant.name]
+        assert label
+        assert capability
+
+
+def test_master_table_has_common_metrics_and_explicit_not_applicable_cells(tmp_path):
+    tables = {}
+    field_sets = {
+        "wal": MODULE.WAL_FIELDS,
+        "materialization": MODULE.MATERIALIZATION_FIELDS,
+        "evidence": MODULE.EVIDENCE_FIELDS,
+        "governance": MODULE.GOVERNANCE_FIELDS,
+        "tier": MODULE.TIER_FIELDS,
+    }
+    variants_by_group = {
+        "wal": MODULE.recovery_variants(),
+        "materialization": MODULE.materialization_variants(),
+        "evidence": MODULE.evidence_variants(),
+        "governance": MODULE.governance_variants(),
+        "tier": MODULE.tier_variants(),
+    }
+    for group, variants in variants_by_group.items():
+        tables[group] = []
+        for variant in variants:
+            fields = field_sets[group]
+            tables[group].append({
+                field: ("yes" if field == "Query Available During Recovery" else 1)
+                for field in fields
+            } | {"System": "Plasmod", "Variant": variant.name})
+            variant_dir = tmp_path / "variants" / variant.slug
+            variant_dir.mkdir(parents=True)
+            (variant_dir / "common_metrics.json").write_text(json.dumps({
+                "metrics": {field: 1 for field in MODULE.COMMON_FIELDS},
+            }), encoding="utf-8")
+
+    rows = MODULE.build_master_table(tmp_path, tables)
+    assert len(rows) == 34
+    assert all(all(row[field] not in (None, "") for field in MODULE.MASTER_FIELDS) for row in rows)
+    wal_row = next(row for row in rows if row["Module"] == "wal")
+    assert wal_row["WAL | Event Log Size"] == 1
+    assert wal_row["EVIDENCE | Query p95 (ms)"] == MODULE.NOT_APPLICABLE
 
 
 def test_governance_events_use_independent_sessions():

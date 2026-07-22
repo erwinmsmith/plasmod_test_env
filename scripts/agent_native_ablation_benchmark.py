@@ -16,6 +16,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import signal
@@ -82,6 +83,85 @@ TIER_FIELDS = [
     "Cold Hit Rate (%)", "Promotion Latency p95 (ms)", "Memory (MB)",
     "Stale Rate (%)",
 ]
+
+COMMON_PARAMETER_SET = "agent-native-common-v1"
+COMMON_FIELDS = [
+    "Common | Event Count", "Common | Query Count", "Common | Stale Check Count",
+    "Common | TopK", "Common | Embedding Dimension", "Common | Write QPS",
+    "Common | Write p50 (ms)", "Common | Write p95 (ms)", "Common | Write p99 (ms)",
+    "Common | Write-to-Visible p50 (ms)", "Common | Write-to-Visible p95 (ms)",
+    "Common | Materialization Lag p95 (ms)", "Common | Query QPS",
+    "Common | Query p50 (ms)", "Common | Query p95 (ms)", "Common | Query p99 (ms)",
+    "Common | Memory (MB)", "Common | Object Visibility Coverage (%)",
+    "Common | Target Stale Rate (%)",
+]
+MODULE_FIELDS = {
+    "wal": WAL_FIELDS[2:],
+    "materialization": MATERIALIZATION_FIELDS[2:],
+    "evidence": EVIDENCE_FIELDS[2:],
+    "governance": GOVERNANCE_FIELDS[2:],
+    "tier": TIER_FIELDS[2:],
+}
+MASTER_IDENTITY_FIELDS = [
+    "System", "Module", "Original Variant", "Comparison Label", "Ablated Capability",
+    "Parameter Set", "Write Consistency", "Query Consistency", "Storage Backend",
+    "Cold Store", "WAL Mode", "Recovery Replay", "Recovery Projection",
+    "Materialization Profile", "Evidence Profile", "Governance Profile", "Tier Profile",
+    "Hot Cache Size",
+]
+MASTER_FIELDS = MASTER_IDENTITY_FIELDS + COMMON_FIELDS + [
+    f"{group.upper()} | {field}"
+    for group, fields in MODULE_FIELDS.items()
+    for field in fields
+]
+NOT_APPLICABLE = "N/A (not applicable)"
+
+COMPARISON_LABELS = {
+    "wal": {
+        "Full Plasmod": ("Full", "None"),
+        "No-WAL": ("w/o WAL / Event Log", "Durable event log"),
+        "In-memory WAL": ("w/ In-memory WAL", "Durable WAL persistence"),
+        "File WAL": ("File WAL control", "None"),
+        "WAL without replay": ("w/o Replay", "Recovery replay"),
+        "Replay without index rebuild": ("w/o Projection Rebuild", "Retrieval projection rebuild"),
+    },
+    "materialization": {
+        "Full Plasmod": ("Full", "None"),
+        "No-materialization": ("w/o Canonical Materialization", "Canonical object materialization"),
+        "Memory-only": ("Memory-only Materialization", "State, artifact, edge, and version materialization"),
+        "No-agent-state": ("w/o Agent State", "State materialization"),
+        "No-artifact": ("w/o Artifact", "Artifact materialization"),
+        "No-edge": ("w/o Edge", "Relation edge materialization"),
+        "No-object-version": ("w/o Object Version", "Object version materialization"),
+    },
+    "evidence": {
+        "Full Plasmod": ("Full", "None"),
+        "No-evidence": ("w/o Evidence Assembly", "Evidence assembly"),
+        "No-provenance": ("w/o Provenance", "Provenance resolution"),
+        "No-edge-expansion": ("w/o Edge Expansion", "Graph edge expansion"),
+        "One-hop only": ("One-hop Evidence Only", "Multi-hop evidence expansion"),
+        "No-proof-trace": ("w/o Proof Trace", "Proof trace construction"),
+        "Vector-only": ("Vector-only Retrieval", "Canonical evidence hydration"),
+    },
+    "governance": {
+        "Full Plasmod": ("Full", "None"),
+        "No-access-policy": ("w/o Access Policy", "Access policy enforcement"),
+        "Metadata-filter-only": ("Metadata Filter Only", "Policy engine and share contracts"),
+        "No-share-contract": ("w/o Share Contract", "Share contract enforcement"),
+        "No-quarantine": ("w/o Quarantine", "Quarantine exclusion"),
+        "No-delete-propagation": ("w/o Delete Propagation", "Deletion propagation"),
+    },
+    "tier": {
+        "Full Tiering": ("Full", "None"),
+        "No-hot-cache": ("w/o Hot Cache", "Hot cache"),
+        "Warm-only": ("Warm Tier Only", "Hot and cold tiers"),
+        "No-cold": ("w/o Cold Tier", "Cold S3 tier"),
+        "No-promotion": ("w/o Promotion", "Tier promotion"),
+        "Hot-size-64": ("Hot Cache = 64", "Hot cache capacity control"),
+        "Hot-size-512": ("Hot Cache = 512", "Hot cache capacity control"),
+        "Hot-size-2000": ("Hot Cache = 2000", "Hot cache capacity control"),
+    },
+}
 
 
 def utc_id() -> str:
@@ -472,10 +552,51 @@ class RunData:
     wall_seconds: float = 0.0
     state: dict[str, Any] = field(default_factory=dict)
     memory_mb: float = 0.0
+    stale_checks: int = 0
+    stale_misses: int = 0
 
     @property
     def object_ids(self) -> set[str]:
         return self.event_ids | self.memory_ids | self.state_ids | self.artifact_ids
+
+
+def common_metric_row(data: RunData) -> dict[str, Any]:
+    query_seconds = sum(data.query_latencies) / 1000.0
+    visible = data.stale_checks - data.stale_misses
+    return {
+        "Common | Event Count": data.writes,
+        "Common | Query Count": len(data.query_latencies),
+        "Common | Stale Check Count": data.stale_checks,
+        "Common | TopK": 20,
+        "Common | Embedding Dimension": 384,
+        "Common | Write QPS": round(data.writes / max(data.wall_seconds, 1e-9), 6),
+        "Common | Write p50 (ms)": round(percentile(data.write_latencies, 0.50), 6),
+        "Common | Write p95 (ms)": round(percentile(data.write_latencies, 0.95), 6),
+        "Common | Write p99 (ms)": round(percentile(data.write_latencies, 0.99), 6),
+        "Common | Write-to-Visible p50 (ms)": round(percentile(data.visibility_latencies, 0.50), 6),
+        "Common | Write-to-Visible p95 (ms)": round(percentile(data.visibility_latencies, 0.95), 6),
+        "Common | Materialization Lag p95 (ms)": round(
+            percentile(data.materialization_latencies, 0.95), 6),
+        "Common | Query QPS": round(len(data.query_latencies) / max(query_seconds, 1e-9), 6),
+        "Common | Query p50 (ms)": round(percentile(data.query_latencies, 0.50), 6),
+        "Common | Query p95 (ms)": round(percentile(data.query_latencies, 0.95), 6),
+        "Common | Query p99 (ms)": round(percentile(data.query_latencies, 0.99), 6),
+        "Common | Memory (MB)": round(data.memory_mb, 6),
+        "Common | Object Visibility Coverage (%)": round(pct(visible, data.stale_checks), 6),
+        "Common | Target Stale Rate (%)": round(pct(data.stale_misses, data.stale_checks), 6),
+    }
+
+
+def write_common_metrics(server: PlasmodProcess, variant: Variant, data: RunData) -> None:
+    payload = {
+        "system": "Plasmod",
+        "module": variant.group,
+        "variant": variant.name,
+        "parameter_set": COMMON_PARAMETER_SET,
+        "metrics": common_metric_row(data),
+    }
+    (server.variant_dir / "common_metrics.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def query(base: str, text: str, vector: list[float], target_ids: list[str] | None = None,
@@ -566,6 +687,13 @@ def ingest_workload(server: PlasmodProcess, variant: Variant, event_limit: int,
             diagnostics.get("evidence_assembly_latency_ms", 0), "evidence latency"))
         data.promotion_latencies.append(require_number(
             diagnostics.get("promotion_latency_ms", 0), "promotion latency"))
+    for text, vector, expected, requester, workspace, session in data.latest_query_samples:
+        response, _ = query(
+            server.base, text, vector, [expected], "objects_only",
+            requester=requester, workspace=workspace, session=session,
+        )
+        data.stale_checks += 1
+        data.stale_misses += int(expected not in response.get("objects", []))
     state = http_json(server.base, "GET", "/v1/admin/runtime/state")
     data.state = state.get("state") or {}
     data.memory_mb = server.rss_mb()
@@ -580,10 +708,13 @@ def ingest_workload(server: PlasmodProcess, variant: Variant, event_limit: int,
         "promotion_latencies_ms": data.promotion_latencies,
         "state": data.state,
         "memory_mb": data.memory_mb,
+        "stale_checks": data.stale_checks,
+        "stale_misses": data.stale_misses,
         "sample_responses": data.responses[:3],
     }
     (server.variant_dir / "measurements.json").write_text(
         json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_common_metrics(server, variant, data)
     return data
 
 
@@ -828,13 +959,18 @@ def governance_variants() -> list[Variant]:
     ]
 
 
-def run_governance(run_dir: Path, port: int) -> list[dict[str, Any]]:
+def run_governance(run_dir: Path, port: int, event_limit: int,
+                   query_limit: int) -> list[dict[str, Any]]:
     measured = []
     for variant in governance_variants():
         log(f"starting governance variant: {variant.name}")
         server = PlasmodProcess(variant, run_dir, port)
         try:
             server.start(fresh=True)
+            # Every ablation first runs the same agent-native workload. The
+            # governance probes below remain module-specific and do not replace
+            # the common performance/freshness measurements.
+            ingest_workload(server, variant, event_limit, query_limit)
             contract_id = "contract-governance"
             http_json(server.base, "POST", "/v1/share-contracts", {
                 "contract_id": contract_id, "tenant_id": "default",
@@ -967,6 +1103,109 @@ def run_tier(run_dir: Path, port: int, event_limit: int, query_limit: int) -> li
     return rows
 
 
+def all_variants() -> list[Variant]:
+    return [
+        *recovery_variants(),
+        *materialization_variants(),
+        *evidence_variants(),
+        *governance_variants(),
+        *tier_variants(),
+    ]
+
+
+def variant_configuration(variant: Variant) -> dict[str, Any]:
+    defaults = {
+        "WAL Mode": "file",
+        "Recovery Replay": "true",
+        "Recovery Projection": "full",
+        "Materialization Profile": "full",
+        "Evidence Profile": "full",
+        "Governance Profile": "full",
+        "Tier Profile": "full",
+    }
+    env_to_column = {
+        "PLASMOD_WAL_MODE": "WAL Mode",
+        "PLASMOD_RECOVERY_REPLAY": "Recovery Replay",
+        "PLASMOD_RECOVERY_PROJECTION": "Recovery Projection",
+        "PLASMOD_MATERIALIZATION_PROFILE": "Materialization Profile",
+        "PLASMOD_EVIDENCE_PROFILE": "Evidence Profile",
+        "PLASMOD_GOVERNANCE_PROFILE": "Governance Profile",
+        "PLASMOD_TIER_PROFILE": "Tier Profile",
+    }
+    for env_name, column in env_to_column.items():
+        if env_name in variant.env:
+            defaults[column] = variant.env[env_name]
+    defaults["Hot Cache Size"] = variant.hot_size
+    return defaults
+
+
+def build_master_table(run_dir: Path,
+                       tables: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    module_rows = {
+        (group, str(row["Variant"])): row
+        for group, rows in tables.items()
+        for row in rows
+    }
+    rows: list[dict[str, Any]] = []
+    for variant in all_variants():
+        module_row = module_rows.get((variant.group, variant.name))
+        if module_row is None:
+            raise RuntimeError(f"missing module result for {variant.group}/{variant.name}")
+        common_path = run_dir / "variants" / variant.slug / "common_metrics.json"
+        if not common_path.exists():
+            raise RuntimeError(f"missing common metrics for {variant.group}/{variant.name}: {common_path}")
+        common_payload = json.loads(common_path.read_text(encoding="utf-8"))
+        common = common_payload.get("metrics") or {}
+        missing_common = [field for field in COMMON_FIELDS if common.get(field) in (None, "")]
+        if missing_common:
+            raise RuntimeError(
+                f"common metrics incomplete for {variant.group}/{variant.name}: {missing_common}")
+        comparison_label, ablated_capability = COMPARISON_LABELS[variant.group][variant.name]
+        row: dict[str, Any] = {
+            "System": "Plasmod",
+            "Module": variant.group,
+            "Original Variant": variant.name,
+            "Comparison Label": comparison_label,
+            "Ablated Capability": ablated_capability,
+            "Parameter Set": COMMON_PARAMETER_SET,
+            "Write Consistency": "strict",
+            "Query Consistency": "eventual",
+            "Storage Backend": "Badger (disk)",
+            "Cold Store": "MinIO S3",
+            **variant_configuration(variant),
+            **common,
+        }
+        for group, fields in MODULE_FIELDS.items():
+            for field in fields:
+                output_field = f"{group.upper()} | {field}"
+                row[output_field] = module_row[field] if group == variant.group else NOT_APPLICABLE
+        rows.append(row)
+    if len(rows) != 34:
+        raise RuntimeError(f"master ablation table must have 34 variants, got {len(rows)}")
+    return rows
+
+
+def write_master_style_manifest(run_dir: Path) -> None:
+    manifest = {
+        "purpose": "Header and cell colors identify metric scope; colors are not the sole data encoding.",
+        "groups": {
+            "identity_and_parameters": {"color": "#334155", "columns": MASTER_IDENTITY_FIELDS},
+            "common": {"color": "#DBEAFE", "columns": COMMON_FIELDS},
+            "wal": {"color": "#FFEDD5", "columns": [f"WAL | {field}" for field in MODULE_FIELDS["wal"]]},
+            "materialization": {"color": "#DCFCE7", "columns": [
+                f"MATERIALIZATION | {field}" for field in MODULE_FIELDS["materialization"]]},
+            "evidence": {"color": "#F3E8FF", "columns": [
+                f"EVIDENCE | {field}" for field in MODULE_FIELDS["evidence"]]},
+            "governance": {"color": "#FEE2E2", "columns": [
+                f"GOVERNANCE | {field}" for field in MODULE_FIELDS["governance"]]},
+            "tier": {"color": "#CCFBF1", "columns": [f"TIER | {field}" for field in MODULE_FIELDS["tier"]]},
+        },
+        "not_applicable_value": NOT_APPLICABLE,
+    }
+    (run_dir / "ablation_master_style.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def build_full_baseline(tables: dict[str, list[dict[str, Any]]]) -> tuple[list[str], list[dict[str, Any]]]:
     row: dict[str, Any] = {
         "System": "Plasmod", "Variant": "Full database (disk WAL + canonical graph + retrieval + MinIO)",
@@ -1005,13 +1244,25 @@ def main() -> int:
     args = parse_args()
     event_limit = args.event_limit if args.event_limit is not None else (8 if args.mode == "smoke" else 1000)
     query_limit = args.query_limit if args.query_limit is not None else (3 if args.mode == "smoke" else 100)
+    if event_limit < 0:
+        raise ValueError("--event-limit must be 0 (all input) or a positive integer")
+    if query_limit <= 0:
+        raise ValueError("--query-limit must be a positive integer")
     run_id = args.run_id or f"agent_native_ablation_{args.mode}_{utc_id()}"
     run_dir = ROOT / "results" / "agent_native_ablation" / run_id
     run_dir.mkdir(parents=True, exist_ok=args.resume)
     (run_dir / "run.pid").write_text(str(os.getpid()), encoding="utf-8")
     metadata = {
         "run_id": run_id, "mode": args.mode, "event_limit": event_limit,
-        "query_limit": query_limit, "core_commit": subprocess.check_output(
+        "query_limit": query_limit, "top_k": 20, "embedding_dimension": 384,
+        "parameter_set": COMMON_PARAMETER_SET,
+        "write_consistency": "strict", "query_consistency": "eventual",
+        "storage_backend": "Badger (disk)", "cold_store": "MinIO S3",
+        "host": {
+            "platform": platform.platform(), "machine": platform.machine(),
+            "processor": platform.processor(), "logical_cpu_count": os.cpu_count(),
+        },
+        "core_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=CORE, text=True).strip(),
         "experiment_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
@@ -1035,9 +1286,9 @@ def main() -> int:
             ("evidence", "evidence_provenance_ablation.csv", EVIDENCE_FIELDS,
              lambda: run_evidence(run_dir, args.port, event_limit, query_limit)),
             ("governance", "governance_ablation.csv", GOVERNANCE_FIELDS,
-             lambda: run_governance(run_dir, args.port)),
+             lambda: run_governance(run_dir, args.port, event_limit, query_limit)),
             ("tier", "tiered_storage_ablation.csv", TIER_FIELDS,
-             lambda: run_tier(run_dir, args.port, max(event_limit, 8), query_limit)),
+             lambda: run_tier(run_dir, args.port, event_limit, query_limit)),
         ]
         for group, filename, fields, execute in group_specs:
             path = run_dir / filename
@@ -1050,9 +1301,14 @@ def main() -> int:
             log(f"wrote {path.name}")
         full_fields, full_rows = build_full_baseline(tables)
         write_csv(run_dir / "full_database_baseline.csv", full_fields, full_rows)
+        master_rows = build_master_table(run_dir, tables)
+        write_csv(run_dir / "ablation_master_table.csv", MASTER_FIELDS, master_rows)
+        write_master_style_manifest(run_dir)
         validate_service_logs(run_dir)
         summary = {
             "status": "complete", "row_counts": {name: len(rows) for name, rows in tables.items()},
+            "master_row_count": len(master_rows),
+            "common_parameter_set": COMMON_PARAMETER_SET,
             "all_metrics_present": True, "minio_s3_exercised": True,
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
