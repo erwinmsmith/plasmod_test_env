@@ -528,6 +528,28 @@ class Table6ConsistencyContractTest(unittest.TestCase):
         self.assertEqual(client.flush_calls, 1)
         self.assertEqual(ensure_calls, [False])
 
+    def test_milvus_init_retries_on_collection_load_failure(self):
+        class DummyClient:
+            pass
+
+        class DummyEmbedder:
+            def embed_one(self, _text):
+                return [0.0] * benchmark.EMBEDDING_DIM
+
+        ensure_calls = []
+
+        def ensure_collection(self, drop=False):
+            ensure_calls.append(drop)
+            if len(ensure_calls) == 1:
+                raise RuntimeError("wait_for_loading_collection timeout")
+
+        with patch("pymilvus.MilvusClient", lambda *_args, **_kwargs: DummyClient()):
+            with patch.object(benchmark.MilvusAdapter, "_ensure_collection", ensure_collection):
+                with patch.object(benchmark.MilvusAdapter, "_reconnect", lambda self: None):
+                    benchmark.MilvusAdapter(embedder=DummyEmbedder())
+
+        self.assertEqual(ensure_calls, [False, False])
+
     def test_milvus_ingest_retries_after_cannot_find_collection(self):
         class FakeEmbedder:
             def embed_one(self, _text):

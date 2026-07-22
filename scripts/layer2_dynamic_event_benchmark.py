@@ -1361,7 +1361,24 @@ class MilvusAdapter(SystemAdapter):
         self.payload_json_bytes = payload_json_bytes
         self.client = MilvusClient(uri=uri)
         self.mu = threading.Lock()
-        self._ensure_collection(drop=drop_collection)
+        last_error: BaseException | None = None
+        for attempt in range(1, 3):
+            try:
+                self._ensure_collection(drop=drop_collection)
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt >= 2:
+                    raise
+                if not (
+                    self._is_retryable_connection_error(exc)
+                    or self._is_retryable_collection_error(exc)
+                ):
+                    raise
+                self._reconnect()
+                time.sleep(min(1.0, 0.1 * (2 ** (attempt - 1))))
+        if last_error is not None:
+            raise last_error
 
     @staticmethod
     def _is_retryable_connection_error(exc: BaseException) -> bool:
