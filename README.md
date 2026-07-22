@@ -451,30 +451,73 @@ results/agent_native_ablation/agent_native_ablation_smoke_20260722_v8/
 └── plasmod_test_env/     # main branch
 ```
 
-CPU 版本不需要 GPU、Milvus、Docker 或额外 Python package。服务器需要：
+CPU 版本不需要 GPU、Milvus、Docker 或额外 Python package。正式运行条件如下；版本条件来自当前 `go.mod`、CMake 和 runner 代码，而不是通用建议。
 
-- Linux x86_64 或 aarch64；
-- Go 1.25.x；
-- Python 3；runner 只使用标准库；
-- CMake 3.20+、C++17 compiler、GNU Make、Git、curl；
-- `minio` server 和 `mc` client 可执行文件；
-- 可访问的本地回环端口：Plasmod 默认 `18080`，MinIO API `9000`，console `9001`。
+| 类别 | 必需条件 | 不满足时的处理 |
+|---|---|---|
+| OS/architecture | Linux x86_64 或 aarch64；glibc 环境 | 不要复用 macOS binary；在服务器重编译 |
+| Go | 1.25.x 或更高，且满足 `Plasmod/go.mod` | 升级 Go 后重新 `make build` |
+| Python | 3.9+；runner 只用标准库，无需 `pip install` | 升级系统 Python |
+| C++ build | CMake 3.20+、C++17 compiler、GNU Make | 安装 build toolchain 后重建 `.so` |
+| Runtime tools | Git、curl、`minio` server、`mc` client、`ps` | 安装对应 executable 并加入 `PATH` |
+| 数据 | `events.jsonl`、至少一个 `traces_collected/*.jsonl` | 从数据准备机单独同步，Git 不包含它们 |
+| Embedding | 推荐同步 `embedding_cache.sqlite3` | 缺失时可以运行，但会重新生成 cache |
+| CPU | 推荐至少 8 个逻辑核 | 可以 smoke；正式数值需注明硬件限制 |
+| Memory | 推荐至少 32 GB | 先 smoke；监控 OOM/swap 后再决定是否全量 |
+| Storage | 本地 SSD；full 默认至少 250 GB 可用，建议准备 500 GB | 清理/扩容；不要把 Badger data dir 放在 NFS 上 |
+| File limit | full 推荐 `ulimit -n 65536` | 提高当前 shell 或 systemd 的 `LimitNOFILE` |
+| Ports | `127.0.0.1:18080`、`:9000`、`:9001` 可用 | 停止冲突进程或仅为 Plasmod 改 `--port` |
+| Execution user | 对仓库、结果目录、cache 和 MinIO data dir 可读写 | 修复 owner/permission，不使用混合用户运行 |
+
+完整性能对比还需要满足实验条件：同一台机器、同一 commit、同一数据副本和参数；使用交流电或稳定的服务器供电；关闭 sleep；运行期间不要并行编译、跑其他数据库或其他实验；避免 CPU governor、虚拟机资源和磁盘配额在 variant 之间变化。runner 串行运行所有 variant，因此不要另外启动第二个 runner 来“加速”，否则 CPU、I/O 和 MinIO 会相互干扰，数值不再公平。
 
 Ubuntu/Debian 基础构建依赖可先安装：
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential cmake git curl rsync python3 ca-certificates
-go version       # 必须满足 Plasmod/go.mod 当前声明的 Go 版本
+python3 --version # 必须 >= 3.9
+go version        # 必须满足 Plasmod/go.mod 当前声明的 Go 版本
+cmake --version   # 必须 >= 3.20
 minio --version
 mc --version
 ```
 
 Go、MinIO 和 `mc` 如果不在发行版仓库中，应使用对应项目的官方 binary/package 安装。不要把 macOS 下的 `bin/plasmod` 或 `.dylib` 复制到 Linux；必须在服务器重新生成 `.so` 和 Go binary。
 
-全量输入当前约 3.6 GB、36k 文件，且每个 variant 使用独立 Badger data directory 和 S3 prefix。完整 34-variant 运行的实际占用会显著大于原始数据；执行前用 `df -h` 检查专用磁盘，建议至少预留 250 GB，并根据 smoke/中等运行后的单 variant 占用决定是否扩容到 500 GB 以上。内存建议 32 GB，最低配置应先用 smoke 验证。
+全量输入当前约 3.6 GB、36k 文件，且每个 variant 使用独立 Badger data directory 和 S3 prefix。完整 34-variant 运行的实际占用会显著大于原始数据；执行前用 `df -h` 检查专用磁盘。预检默认把 full 的 250 GB 作为最低门槛，并建议根据 smoke/中等运行后的单 variant 占用扩容到 500 GB 以上。
 
-#### 6.5.2 Clone 并锁定分支
+#### 6.5.2 启动责任与服务拓扑
+
+不要把“安装组件”和“手工启动服务”混在一起。消融 runner 是唯一的生命周期管理者：
+
+| 组件 | 是否必须安装/构建 | 是否手工提前启动 | 实际启动者与生命周期 |
+|---|---|---|---|
+| C++ retrieval `.so` | 必须在 Linux 构建一次，每次核心代码变化后重建 | 否；它不是独立服务 | 由 Go binary 通过 CGO 动态加载 |
+| Go `bin/plasmod` | 必须存在；默认 runner 每次先执行 `make build` | **禁止手工启动** | runner 为每个 variant 启动一个，健康检查后测试，再停止 |
+| Badger canonical store | 包含在 Plasmod 中 | 否 | 每个 variant 在独立 `variants/<variant>/data` 内打开 |
+| WAL、materializer、evidence、governance、tier workers | 包含在 Plasmod 中 | 否 | 随当前 variant 的 Plasmod 进程启动，profile 由环境变量选择 |
+| MinIO server | `minio` executable 必须在 `PATH` | 通常不需要 | 9000 无健康实例时由 runner 启动；结束时只停止自己启动的实例 |
+| MinIO bucket | `mc` executable 必须在 `PATH` | 否 | runner 创建/复用 `plasmod-experiments` |
+| Embedding service | 不需要 | 否 | runner 从 SQLite cache 读取确定性 384 维向量；缺失项在本地计算并缓存 |
+| gRPC service | 不需要 | 否 | runner 显式设置 `PLASMOD_GRPC_ENABLED=0`，只走真实 HTTP API |
+| Milvus/Docker/GPU | 本消融实验不需要 | **不要启动** | 不参与该表，不应占用实验资源 |
+
+runner 使用的固定拓扑是：
+
+```text
+agent_native_ablation_benchmark.py
+  -> MinIO 127.0.0.1:9000 (S3 cold tier)
+  -> Plasmod 127.0.0.1:18080 (one variant at a time)
+       -> file/memory/disabled WAL profile
+       -> Badger canonical object graph
+       -> C++ retrieval shared library
+       -> materialization/evidence/governance/tiering profile
+```
+
+因此不要运行核心库的 `scripts/run_full.sh`、`make dev`、`docker compose up`、旧 `start_all.sh` 或单独的 MinIO+Plasmod 启动脚本。唯一例外是复用一套已经健康的 MinIO；它必须监听 `127.0.0.1:9000`，使用 `minioadmin/minioadmin`，并允许 `mc` 创建 `plasmod-experiments` bucket。
+
+#### 6.5.3 Clone 并锁定分支
 
 ```bash
 sudo mkdir -p /srv/Plasmodexp
@@ -492,7 +535,7 @@ git -C plasmod_test_env rev-parse HEAD
 
 私有仓库可将 HTTPS URL 换成已配置 deploy key 的 SSH URL。正式运行期间不要再次 `git pull`；`run_metadata.json` 会记录两个仓库的 commit。
 
-#### 6.5.3 单独传输数据和 embedding cache
+#### 6.5.4 单独传输数据和 embedding cache
 
 实验数据和 embedding cache 被 `.gitignore` 排除，`git clone` 后不会出现，必须从当前机器单独复制：
 
@@ -526,7 +569,7 @@ sha256sum data/layer2_dynamic_events/events.jsonl \
 
 macOS 本地对应命令是 `shasum -a 256 <file>`。如果不复制 cache，runner 会重新计算并写入 cache，但这会增加首次运行准备时间，因此正式服务器应复用现有文件。
 
-#### 6.5.4 在服务器重新构建 Plasmod
+#### 6.5.5 在服务器重新构建 Plasmod
 
 ```bash
 cd /srv/Plasmodexp/Plasmod
@@ -545,7 +588,24 @@ go test ./src/...
 
 runner 在 Linux 上设置 `LD_LIBRARY_PATH=cpp/build:cpp/build/vendor`，在 macOS 上设置对应的 `DYLD_LIBRARY_PATH`。如果 `ldd` 出现 `not found`，不要开始实验，应先修复 shared-library 路径或重新执行 `make build`。
 
-#### 6.5.5 端口和 MinIO 预检
+#### 6.5.6 自动预检
+
+代码、数据和 Linux 构建完成后，先运行仓库内的 preflight。`smoke` 检查 10 GB 可用空间，`full` 默认要求 250 GB；可通过 `PLASMOD_ABLATION_MIN_FREE_GB` 提高门槛，但正式实验不建议降低。
+
+```bash
+cd /srv/Plasmodexp/plasmod_test_env
+
+# smoke 前检查。
+bash scripts/preflight_agent_native_ablation.sh smoke --port 18080
+
+# full 前重新检查；正式运行以这次结果为准。
+ulimit -n 65536
+bash scripts/preflight_agent_native_ablation.sh full --port 18080
+```
+
+preflight 会核对：软件命令和最低版本、核心 `dev`/实验 `main` 分支、tracked working tree、Linux shared library 和 Go binary、动态链接、两类输入、SQLite cache、目录权限、磁盘、CPU、内存、file limit、Plasmod/MinIO 端口、MinIO 凭据以及其他 ablation runner。任何 `[FAIL]` 都必须先解决；`[WARN]` 不会阻止启动，但正式论文运行前需要确认其影响。
+
+#### 6.5.7 端口和 MinIO 行为
 
 runner 会执行以下工作：
 
@@ -564,7 +624,22 @@ curl -fsS http://127.0.0.1:9000/minio/health/live || true
 
 如果 `18080` 被占用，传入例如 `--port 18081`。如果复用已有 MinIO，它必须允许 `minioadmin/minioadmin` 创建实验 bucket；否则停止它，让 runner 启动隔离实例。不要通过公网暴露 9000、9001 或实验 HTTP port。
 
-#### 6.5.6 先执行服务器 smoke
+#### 6.5.8 唯一正确的启动顺序
+
+从空服务器开始，完整顺序固定为：
+
+1. 安装 build/runtime tools 和 `minio`/`mc`，但不手工启动 Plasmod；
+2. clone `Plasmod/dev` 和 `plasmod_test_env/main`，记录 commit；
+3. 传输两类 JSONL 数据和 embedding cache；
+4. 在 Linux 先构建 C++ `.so`，再构建 Go `bin/plasmod`；
+5. 执行 `preflight ... smoke`，修复所有 `[FAIL]`；
+6. 运行 smoke，确认 34 个 variant、结果表和 `COMPLETE`；
+7. 执行 `preflight ... full`，确认磁盘、端口和后台进程仍满足条件；
+8. 使用固定 `RUN_ID` 启动一个全量 runner；不要再启动任何数据库进程；
+9. 用 `tail -F` 观察，不修改代码、数据、commit、端口或参数；
+10. 仅在失败原因修复后用同一 `RUN_ID` 和完全相同参数 `--resume`。
+
+#### 6.5.9 先执行服务器 smoke
 
 ```bash
 cd /srv/Plasmodexp/plasmod_test_env
@@ -584,7 +659,7 @@ wc -l "${RUN_DIR}/ablation_master_table.csv"
 
 预期主表为表头加 34 个 variant，即 `wc -l` 为 35。smoke 未通过时不要启动全量任务，应先检查 `FAILED`、`variants/*/server.log` 和 `minio.log`。
 
-#### 6.5.7 Linux 后台全量运行
+#### 6.5.10 Linux 后台全量运行
 
 Linux 服务器不需要 macOS 的 `caffeinate`。使用固定 `RUN_ID`，以便失败后复用已完成分组：
 
@@ -608,7 +683,7 @@ printf 'RUN_ID=%s\nPID=%s\n' "${RUN_ID}" "$(cat "${LOG_DIR}/runner.pid")"
 
 SSH 断开后 `nohup` 进程会继续运行。完成依赖、代码和数据下载后，实验不需要外网，但本机 loopback、Plasmod 与 MinIO 之间的连接必须保持正常。
 
-#### 6.5.8 查看进度、恢复和取回结果
+#### 6.5.11 查看进度、恢复和取回结果
 
 ```bash
 cd /srv/Plasmodexp/plasmod_test_env
@@ -642,6 +717,22 @@ RUN_PATH="results/agent_native_ablation/${RUN_ID}"
 ```
 
 如果需要完整审计，再单独同步 `variants/*/capabilities.json`、`measurements.json`、`common_metrics.json` 和 `server.log`。不要默认打包整个 `variants/*/data` 与 `minio-data`，它们可能达到数百 GB。
+
+#### 6.5.12 启动命令与参数语义
+
+| 启动方式/参数 | 实际含义 | 正式运行约束 |
+|---|---|---|
+| `run_agent_native_ablation.sh smoke` | 34 个 variant 各使用 8 条 event、最多 3 个 query context | 只验证服务、指标和表格完整性，不作为论文性能值 |
+| `run_agent_native_ablation.sh run` | 默认每个通用 variant 使用 1000 条 event、100 个 query context | 用于中等规模检查 |
+| `run_agent_native_ablation.sh full` | 等价于 runner `run --event-limit 0`，query 默认 100 | 正式全量输入 |
+| `--run-id ID` | 固定结果目录名和 S3 prefix | full 必须显式保存；恢复时不可改变 |
+| `--event-limit 0` | 顺序读取 `events.jsonl` 和全部 trace 文件中的全部 event | full 固定为 0；正整数仅用于 smoke/中等测试 |
+| `--query-limit N` | 从已写入的 agent/session context 中选择最多 N 个 query | 必须大于 0；同一组实验保持一致 |
+| `--port N` | 当前 variant 的 Plasmod HTTP port | 只改 Plasmod port；MinIO 仍固定 9000/9001 |
+| `--skip-build` | 跳过 runner 开始时的 `make build` | 仅限已经按当前 core commit 构建并通过 preflight；不跳过 C++ `.so` 检查 |
+| `--resume` | 复用同一 run id 中已经完整写出的分组 CSV | 必须保持 commit、数据、event/query limit 和 port 不变 |
+
+默认不要设置 runner 内部的 `PLASMOD_*` 或 `S3_*` 环境变量：脚本会为每个 variant 写入固定配置，variant 自身的 ablation profile 最后覆盖对应项。外部 shell 只需要设置 `RUN_ID`；`PLASMOD_ABLATION_MIN_FREE_GB` 仅控制 preflight 的磁盘门槛，不改变实验 workload。
 
 ---
 
