@@ -347,6 +347,11 @@ runner 会启动完整的真实服务路径：当前 C++ retrieval build、Go Pl
 | Access / Scope / Governance | Full Plasmod, No-access-policy, Metadata-filter-only, No-share-contract, No-quarantine, No-delete-propagation |
 | Hot / Warm / Cold | Full Tiering, No-hot-cache, Warm-only, No-cold, No-promotion, Hot-size-64/512/2000 |
 
+五个分组中的 Full 是同一条逻辑基线。runner 只启动一次
+`shared/Full Plasmod`、写入一次公共 workload，并在该生命周期中依次采集五组 Full
+指标；分组 CSV 和主表仍各保留自己的 Full 对照行。其余 29 个消融/控制变量独立运行，
+因此输出保持 34 个逻辑行，实际只有 30 次物理 variant 运行。
+
 | 结果文件 | 完整指标 |
 |---|---|
 | `wal_event_log_ablation.csv` | event log size, recovered objects/relations/latest state, recovery time, replay throughput, query availability, lost events, duplicates |
@@ -355,7 +360,7 @@ runner 会启动完整的真实服务路径：当前 C++ retrieval build、Go Pl
 | `governance_ablation.csv` | private leakage, authorized/unauthorized hit, delete visibility delay, quarantine exclusion, policy overhead |
 | `tiered_storage_ablation.csv` | query p50/p95/p99, hot/warm/cold hit rate, promotion p95, RSS memory, stale rate |
 | `full_database_baseline.csv` | 五组 Full variant 的全部指标，合并为一行完整数据库基线 |
-| `ablation_master_table.csv` | 34 个 Full / `w/o` 变体的统一总表：配置、公共指标和五组模块专属指标；非适用项显式为 `N/A (not applicable)` |
+| `ablation_master_table.csv` | 34 个逻辑 Full / `w/o` 对照行的统一总表：五个 Full 行共享同一次实测基线；非适用项显式为 `N/A (not applicable)` |
 | `ablation_master_style.json` | 总表列组的颜色与语义清单，供 Excel/论文表格导出器稳定复用 |
 
 指标来自真实 HTTP ACK、canonical state、replay API、query diagnostics 和 S3 tier counters。`Object Visibility Coverage` 按 baseline 中 event/memory/state/artifact/edge/version 的对象数量计算；`Stale Rate` 使用 tier 查询后 canonical target 是否可见计算，不把 ANN recall 当作 freshness；governance 对象使用独立 session，避免 conflict lifecycle 干扰 ACL 测量。
@@ -382,7 +387,7 @@ runner 会启动完整的真实服务路径：当前 C++ retrieval build、Go Pl
 
 ### 6.3 Smoke、定量和全量运行
 
-Smoke 使用 8 条记录事件和最多 3 个 query context，验证全部 34 个配置 variant，并生成 1 行完整数据库聚合基线：
+Smoke 使用 8 条记录事件和最多 3 个 query context，验证全部 34 个逻辑对照行（30 次物理运行），并生成 1 行完整数据库聚合基线：
 
 ```bash
 cd /Users/erwin/Downloads/codespace/Plasmodexp/plasmod_test_env
@@ -431,7 +436,7 @@ python3 scripts/agent_native_ablation_benchmark.py run \
   --run-id "${RUN_ID}" --event-limit 0 --query-limit 100 --port 18080 --resume
 ```
 
-结果位于 `results/agent_native_ablation/<run-id>/`。只有分组 CSV 和 34 行总表全部非空、19 个公共指标全部为有限数值、capability 回读一致、服务日志没有 panic/fatal/S3 错误时才生成 `COMPLETE` 和 `summary.json`；任何 HTTP、服务、指标或日志错误都会停止并生成 `FAILED`。每个 variant 的 `capabilities.json`、`measurements.json`、`common_metrics.json`、`server.log` 和持久化数据位于 `variants/<variant>/`，可用于审计单项结果。
+结果位于 `results/agent_native_ablation/<run-id>/`。只有分组 CSV 和 34 行总表全部非空、19 个公共指标全部为有限数值、capability 回读一致、服务日志没有 panic/fatal/S3 错误时才生成 `COMPLETE` 和 `summary.json`；任何 HTTP、服务、指标或日志错误都会停止并生成 `FAILED`。共享 Full 的 capability、公共指标、五组 Full probe 与恢复清单位于 `variants/shared-full-plasmod/`，其余 29 个 variant 保持各自目录。`summary.json` 使用 `shared_full_runs=1` 和 `physical_variant_runs=30` 记录实际执行次数。
 
 最近通过完整 smoke 的结果目录：
 
@@ -485,7 +490,7 @@ mc --version
 
 Go、MinIO 和 `mc` 如果不在发行版仓库中，应使用对应项目的官方 binary/package 安装。不要把 macOS 下的 `bin/plasmod` 或 `.dylib` 复制到 Linux；必须在服务器重新生成 `.so` 和 Go binary。
 
-全量输入当前约 3.6 GB、36k 文件，且每个 variant 使用独立 Badger data directory 和 S3 prefix。完整 34-variant 运行的实际占用会显著大于原始数据；执行前用 `df -h` 检查专用磁盘。预检默认把 full 的 250 GB 作为最低门槛，并建议根据 smoke/中等运行后的单 variant 占用扩容到 500 GB 以上。
+全量输入当前约 3.6 GB、36k 文件。共享 Full 使用一个 Badger data directory 和 S3 prefix，其余 29 个物理 variant 各自隔离；完整运行的实际占用仍会显著大于原始数据。执行前用 `df -h` 检查专用磁盘。预检默认把 full 的 250 GB 作为最低门槛，并建议根据 smoke/中等运行后的单 variant 占用扩容到 500 GB 以上。
 
 #### 6.5.2 启动责任与服务拓扑
 
@@ -633,7 +638,7 @@ curl -fsS http://127.0.0.1:9000/minio/health/live || true
 3. 传输两类 JSONL 数据和 embedding cache；
 4. 在 Linux 先构建 C++ `.so`，再构建 Go `bin/plasmod`；
 5. 执行 `preflight ... smoke`，修复所有 `[FAIL]`；
-6. 运行 smoke，确认 34 个 variant、结果表和 `COMPLETE`；
+6. 运行 smoke，确认 1 次共享 Full、29 次独立消融运行、34 行结果表和 `COMPLETE`；
 7. 执行 `preflight ... full`，确认磁盘、端口和后台进程仍满足条件；
 8. 使用固定 `RUN_ID` 启动一个全量 runner；不要再启动任何数据库进程；
 9. 用 `tail -F` 观察，不修改代码、数据、commit、端口或参数；
@@ -657,7 +662,7 @@ cat "${RUN_DIR}/summary.json"
 wc -l "${RUN_DIR}/ablation_master_table.csv"
 ```
 
-预期主表为表头加 34 个 variant，即 `wc -l` 为 35。smoke 未通过时不要启动全量任务，应先检查 `FAILED`、`variants/*/server.log` 和 `minio.log`。
+预期主表为表头加 34 个逻辑对照行，即 `wc -l` 为 35；`summary.json` 应同时报告 `shared_full_runs=1` 和 `physical_variant_runs=30`。smoke 未通过时不要启动全量任务，应先检查 `FAILED`、`variants/*/server.log` 和 `minio.log`。
 
 #### 6.5.10 Linux 后台全量运行
 
@@ -722,9 +727,9 @@ RUN_PATH="results/agent_native_ablation/${RUN_ID}"
 
 | 启动方式/参数 | 实际含义 | 正式运行约束 |
 |---|---|---|
-| `run_agent_native_ablation.sh smoke` | 34 个 variant 各使用 8 条 event、最多 3 个 query context | 只验证服务、指标和表格完整性，不作为论文性能值 |
-| `run_agent_native_ablation.sh run` | 默认每个通用 variant 使用 1000 条 event、100 个 query context | 用于中等规模检查 |
-| `run_agent_native_ablation.sh full` | 等价于 runner `run --event-limit 0`，query 默认 100 | 正式全量输入 |
+| `run_agent_native_ablation.sh smoke` | 共享 Full 和 29 个独立 variant 各使用 8 条 event、最多 3 个 query context | 生成 34 行逻辑对照，只验证完整性 |
+| `run_agent_native_ablation.sh run` | 共享 Full 和 29 个独立 variant 默认各使用 1000 条 event、100 个 query context | 用于中等规模检查 |
+| `run_agent_native_ablation.sh full` | 30 次物理运行均使用全部输入，query 默认 100；输出仍为 34 行 | 正式全量输入 |
 | `--run-id ID` | 固定结果目录名和 S3 prefix | full 必须显式保存；恢复时不可改变 |
 | `--event-limit 0` | 顺序读取 `events.jsonl` 和全部 trace 文件中的全部 event | full 固定为 0；正整数仅用于 smoke/中等测试 |
 | `--query-limit N` | 从已写入的 agent/session context 中选择最多 N 个 query | 必须大于 0；同一组实验保持一致 |

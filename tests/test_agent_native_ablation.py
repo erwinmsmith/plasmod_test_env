@@ -98,6 +98,48 @@ def test_ablation_matrix_covers_all_declared_variants_and_metrics():
         assert capability
 
 
+def test_physical_matrix_runs_one_shared_full_and_29_non_full_variants():
+    physical = MODULE.physical_variants()
+
+    assert len(physical) == 30
+    assert physical[0] == MODULE.shared_full_variant()
+    assert sum(variant == MODULE.shared_full_variant() for variant in physical) == 1
+    assert all(
+        not MODULE.is_group_full_variant(variant)
+        for variant in physical[1:]
+    )
+    assert len(physical[1:]) == 29
+
+
+def test_shared_full_baseline_round_trips_resume_state(tmp_path):
+    baseline = MODULE.SharedFullBaseline(
+        module_rows={
+            "wal": {"System": "Plasmod", "Variant": "Full Plasmod", "Event Log Size": 8},
+            "materialization": {"System": "Plasmod", "Variant": "Full Plasmod", "Write QPS": 10.0},
+            "evidence": {"System": "Plasmod", "Variant": "Full Plasmod", "Query p95 (ms)": 2.0},
+            "tier": {"System": "Plasmod", "Variant": "Full Tiering", "Hot Cache Size": 2000},
+        },
+        materialization_type_counts={"events": 8, "states": 2},
+        state_ids={"state-2", "state-1"},
+        artifact_ids={"artifact-1"},
+        contexts={
+            "state-1": ("agent-a", "workspace-a", "session-a"),
+            "artifact-1": ("agent-b", "workspace-a", "session-b"),
+        },
+        evidence_totals=(3, 4, 5, 2),
+        governance_measurement={"query_latency": 1.25, "private": False},
+    )
+    path = tmp_path / "shared_full_baseline.json"
+
+    baseline.write(path)
+    loaded = MODULE.SharedFullBaseline.read(path)
+
+    assert loaded == baseline
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "shared-full-baseline-v1"
+    assert payload["state_ids"] == ["state-1", "state-2"]
+
+
 def test_master_table_has_common_metrics_and_explicit_not_applicable_cells(tmp_path):
     tables = {}
     field_sets = {
@@ -114,6 +156,11 @@ def test_master_table_has_common_metrics_and_explicit_not_applicable_cells(tmp_p
         "governance": MODULE.governance_variants(),
         "tier": MODULE.tier_variants(),
     }
+    shared_dir = tmp_path / "variants" / MODULE.shared_full_variant().slug
+    shared_dir.mkdir(parents=True)
+    (shared_dir / "common_metrics.json").write_text(json.dumps({
+        "metrics": {field: 7 for field in MODULE.COMMON_FIELDS},
+    }), encoding="utf-8")
     for group, variants in variants_by_group.items():
         tables[group] = []
         for variant in variants:
@@ -122,15 +169,19 @@ def test_master_table_has_common_metrics_and_explicit_not_applicable_cells(tmp_p
                 field: ("yes" if field == "Query Available During Recovery" else 1)
                 for field in fields
             } | {"System": "Plasmod", "Variant": variant.name})
-            variant_dir = tmp_path / "variants" / variant.slug
-            variant_dir.mkdir(parents=True)
-            (variant_dir / "common_metrics.json").write_text(json.dumps({
-                "metrics": {field: 1 for field in MODULE.COMMON_FIELDS},
-            }), encoding="utf-8")
+            if not MODULE.is_group_full_variant(variant):
+                variant_dir = tmp_path / "variants" / variant.slug
+                variant_dir.mkdir(parents=True)
+                (variant_dir / "common_metrics.json").write_text(json.dumps({
+                    "metrics": {field: 1 for field in MODULE.COMMON_FIELDS},
+                }), encoding="utf-8")
 
     rows = MODULE.build_master_table(tmp_path, tables)
     assert len(rows) == 34
     assert all(all(row[field] not in (None, "") for field in MODULE.MASTER_FIELDS) for row in rows)
+    full_rows = [row for row in rows if row["Comparison Label"] == "Full"]
+    assert len(full_rows) == 5
+    assert {row["Common | Event Count"] for row in full_rows} == {7}
     wal_row = next(row for row in rows if row["Module"] == "wal")
     assert wal_row["WAL | Event Log Size"] == 1
     assert wal_row["EVIDENCE | Query p95 (ms)"] == MODULE.NOT_APPLICABLE

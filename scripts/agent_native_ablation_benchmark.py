@@ -561,6 +561,48 @@ class RunData:
         return self.event_ids | self.memory_ids | self.state_ids | self.artifact_ids
 
 
+@dataclass
+class SharedFullBaseline:
+    module_rows: dict[str, dict[str, Any]]
+    materialization_type_counts: dict[str, int]
+    state_ids: set[str]
+    artifact_ids: set[str]
+    contexts: dict[str, tuple[str, str, str]]
+    evidence_totals: tuple[int, int, int, int]
+    governance_measurement: dict[str, Any]
+
+    def write(self, path: Path) -> None:
+        payload = {
+            "schema_version": "shared-full-baseline-v1",
+            "module_rows": self.module_rows,
+            "materialization_type_counts": self.materialization_type_counts,
+            "state_ids": sorted(self.state_ids),
+            "artifact_ids": sorted(self.artifact_ids),
+            "contexts": {key: list(value) for key, value in sorted(self.contexts.items())},
+            "evidence_totals": list(self.evidence_totals),
+            "governance_measurement": self.governance_measurement,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @classmethod
+    def read(cls, path: Path) -> "SharedFullBaseline":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != "shared-full-baseline-v1":
+            raise RuntimeError(f"unsupported shared Full baseline: {path}")
+        return cls(
+            module_rows=payload["module_rows"],
+            materialization_type_counts={
+                key: int(value) for key, value in payload["materialization_type_counts"].items()
+            },
+            state_ids=set(payload["state_ids"]),
+            artifact_ids=set(payload["artifact_ids"]),
+            contexts={key: tuple(value) for key, value in payload["contexts"].items()},
+            evidence_totals=tuple(int(value) for value in payload["evidence_totals"]),
+            governance_measurement=payload["governance_measurement"],
+        )
+
+
 def common_metric_row(data: RunData) -> dict[str, Any]:
     query_seconds = sum(data.query_latencies) / 1000.0
     visible = data.stale_checks - data.stale_misses
@@ -742,69 +784,77 @@ def recovery_variants() -> list[Variant]:
     ]
 
 
-def run_recovery(run_dir: Path, port: int, event_limit: int, query_limit: int) -> list[dict[str, Any]]:
-    rows = []
-    for variant in recovery_variants():
+def measure_recovery(server: PlasmodProcess, variant: Variant, before: RunData,
+                     output_variant: str | None = None) -> dict[str, Any]:
+    server.restart()
+    http_json(server.base, "POST", "/v1/admin/recovery/reset", {"confirm": "reset_materialized"})
+    replay_response: dict[str, Any] = {}
+    query_available = False
+    replay_wall = 0.0
+    replay_enabled = variant.env.get("PLASMOD_RECOVERY_REPLAY", "true").lower() in (
+        "1", "true", "yes", "on")
+    if replay_enabled:
+        result_holder: dict[str, Any] = {}
+        error_holder: list[BaseException] = []
+
+        def apply_replay() -> None:
+            try:
+                started = time.perf_counter()
+                result_holder.update(http_json(server.base, "POST", "/v1/admin/replay", {
+                    "from_lsn": 0, "limit": 0, "apply": True, "confirm": "apply_replay",
+                }, timeout=300))
+                result_holder["_wall"] = time.perf_counter() - started
+            except BaseException as exc:  # propagated below
+                error_holder.append(exc)
+
+        thread = threading.Thread(target=apply_replay, daemon=True)
+        thread.start()
+        sample = next(iter(before.query_samples), (
+            "state", hash_vector("state"), "", "", "plasmod-ablation", ""))
+        try:
+            query(server.base, sample[0], sample[1], requester=sample[3],
+                  workspace=sample[4], session=sample[5])
+            query_available = True
+        except Exception:
+            query_available = False
+        thread.join(300)
+        if thread.is_alive():
+            raise RuntimeError(f"replay timed out for {variant.name}")
+        if error_holder:
+            raise RuntimeError(f"replay failed for {variant.name}: {error_holder[0]}")
+        replay_response = result_holder
+        replay_wall = float(result_holder.get("_wall", 0))
+    after = (http_json(server.base, "GET", "/v1/admin/runtime/state").get("state") or {})
+    row = {
+        "System": "Plasmod", "Variant": output_variant or variant.name,
+        "Event Log Size": int(replay_response.get("scanned_entries", 0)),
+        "Recovered Objects (%)": round(pct(int(after.get("objects", 0)), len(before.object_ids)), 6),
+        "Recovered Relations (%)": round(pct(int(after.get("edges", 0)), len(before.edge_ids)), 6),
+        "Recovered Latest State (%)": round(pct(int(after.get("latest_states", 0)), len(before.state_ids)), 6),
+        "Recovery Time (s)": round(float(
+            replay_response.get("recovery_time_ms", replay_wall * 1000)) / 1000, 6),
+        "Replay Throughput (events/s)": round(float(
+            replay_response.get("replay_throughput_events_s", 0)), 6),
+        "Query Available During Recovery": "yes" if query_available else "no",
+        "Lost Event Count": max(0, len(before.event_ids) - int(after.get("events", 0))),
+        "Duplicate Object Count": int(replay_response.get("duplicate_objects", 0)),
+    }
+    (server.variant_dir / "recovery.json").write_text(json.dumps({
+        "before": before.state, "replay": replay_response, "after": after, "row": row,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return row
+
+
+def run_recovery(run_dir: Path, port: int, event_limit: int, query_limit: int,
+                 baseline: SharedFullBaseline) -> list[dict[str, Any]]:
+    rows = [baseline.module_rows["wal"]]
+    for variant in recovery_variants()[1:]:
         log(f"starting WAL variant: {variant.name}")
         server = PlasmodProcess(variant, run_dir, port)
         try:
             server.start(fresh=True)
             before = ingest_workload(server, variant, event_limit, query_limit)
-            server.restart()
-            http_json(server.base, "POST", "/v1/admin/recovery/reset", {"confirm": "reset_materialized"})
-            replay_response: dict[str, Any] = {}
-            query_available = False
-            replay_wall = 0.0
-            if variant.name != "WAL without replay":
-                result_holder: dict[str, Any] = {}
-                error_holder: list[BaseException] = []
-                def apply_replay() -> None:
-                    try:
-                        started = time.perf_counter()
-                        result_holder.update(http_json(server.base, "POST", "/v1/admin/replay", {
-                            "from_lsn": 0, "limit": 0, "apply": True, "confirm": "apply_replay",
-                        }, timeout=300))
-                        result_holder["_wall"] = time.perf_counter() - started
-                    except BaseException as exc:  # propagated below
-                        error_holder.append(exc)
-                thread = threading.Thread(target=apply_replay, daemon=True)
-                thread.start()
-                sample = next(iter(before.query_samples), (
-                    "state", hash_vector("state"), "", "", "plasmod-ablation", ""))
-                try:
-                    query(server.base, sample[0], sample[1], requester=sample[3],
-                          workspace=sample[4], session=sample[5])
-                    query_available = True
-                except Exception:
-                    query_available = False
-                thread.join(300)
-                if thread.is_alive():
-                    raise RuntimeError(f"replay timed out for {variant.name}")
-                if error_holder:
-                    raise RuntimeError(f"replay failed for {variant.name}: {error_holder[0]}")
-                replay_response = result_holder
-                replay_wall = float(result_holder.get("_wall", 0))
-            after = (http_json(server.base, "GET", "/v1/admin/runtime/state").get("state") or {})
-            expected_objects = len(before.object_ids)
-            recovered_objects = int(after.get("objects", 0))
-            expected_relations = len(before.edge_ids)
-            expected_states = len(before.state_ids)
-            row = {
-                "System": "Plasmod", "Variant": variant.name,
-                "Event Log Size": int(replay_response.get("scanned_entries", 0)),
-                "Recovered Objects (%)": round(pct(recovered_objects, expected_objects), 6),
-                "Recovered Relations (%)": round(pct(int(after.get("edges", 0)), expected_relations), 6),
-                "Recovered Latest State (%)": round(pct(int(after.get("latest_states", 0)), expected_states), 6),
-                "Recovery Time (s)": round(float(replay_response.get("recovery_time_ms", replay_wall * 1000)) / 1000, 6),
-                "Replay Throughput (events/s)": round(float(replay_response.get("replay_throughput_events_s", 0)), 6),
-                "Query Available During Recovery": "yes" if query_available else "no",
-                "Lost Event Count": max(0, len(before.event_ids) - int(after.get("events", 0))),
-                "Duplicate Object Count": int(replay_response.get("duplicate_objects", 0)),
-            }
-            rows.append(row)
-            (server.variant_dir / "recovery.json").write_text(json.dumps({
-                "before": before.state, "replay": replay_response, "after": after, "row": row,
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            rows.append(measure_recovery(server, variant, before))
         finally:
             server.stop()
     return rows
@@ -836,54 +886,56 @@ def target_hit_rate(base: str, ids: set[str], contexts: dict[str, tuple[str, str
     return pct(hits, len(ids))
 
 
-def run_materialization(run_dir: Path, port: int, event_limit: int, query_limit: int) -> list[dict[str, Any]]:
-    records: list[tuple[Variant, RunData, float, float]] = []
-    baseline: RunData | None = None
-    for variant in materialization_variants():
+def materialization_type_counts(data: RunData) -> dict[str, int]:
+    return {
+        "events": int(data.state.get("events", 0)),
+        "memories": int(data.state.get("memories", 0)),
+        "states": int(data.state.get("states", 0)),
+        "artifacts": int(data.state.get("artifacts", 0)),
+        "edges": int(data.state.get("edges", 0)),
+        "versions": int(data.state.get("versions", 0)),
+    }
+
+
+def measure_materialization(server: PlasmodProcess, variant: Variant, data: RunData,
+                            baseline: SharedFullBaseline,
+                            output_variant: str | None = None) -> dict[str, Any]:
+    state_hit = target_hit_rate(server.base, baseline.state_ids, baseline.contexts)
+    artifact_hit = target_hit_rate(server.base, baseline.artifact_ids, baseline.contexts)
+    baseline_objects = sum(baseline.materialization_type_counts.values())
+    visible_objects = sum(
+        min(int(data.state.get(key, 0)), baseline_count)
+        for key, baseline_count in baseline.materialization_type_counts.items()
+    )
+    baseline_edges = baseline.materialization_type_counts.get("edges", 0)
+    relation_rate = pct(min(int(data.state.get("edges", 0)), baseline_edges), baseline_edges)
+    return {
+        "System": "Plasmod", "Variant": output_variant or variant.name,
+        "Write QPS": round(data.writes / max(data.wall_seconds, 1e-9), 6),
+        "Write p95 (ms)": round(percentile(data.write_latencies, 0.95), 6),
+        "Write-to-Visible p95 (ms)": round(percentile(data.visibility_latencies, 0.95), 6),
+        "Materialization Lag p95 (ms)": round(
+            percentile(data.materialization_latencies, 0.95), 6),
+        "Object Visibility Coverage (%)": round(pct(visible_objects, baseline_objects), 6),
+        "Latest-state Hit Rate (%)": round(state_hit, 6),
+        "Artifact Lookup Accuracy (%)": round(artifact_hit, 6),
+        "Relation Recovery Rate (%)": round(relation_rate, 6),
+        "Stale Result Rate (%)": round(100.0 - state_hit, 6),
+    }
+
+
+def run_materialization(run_dir: Path, port: int, event_limit: int, query_limit: int,
+                        baseline: SharedFullBaseline) -> list[dict[str, Any]]:
+    rows = [baseline.module_rows["materialization"]]
+    for variant in materialization_variants()[1:]:
         log(f"starting materialization variant: {variant.name}")
         server = PlasmodProcess(variant, run_dir, port)
         try:
             server.start(fresh=True)
             data = ingest_workload(server, variant, event_limit, query_limit)
-            if baseline is None:
-                baseline = data
-            state_hit = target_hit_rate(server.base, baseline.state_ids, baseline.contexts)
-            artifact_hit = target_hit_rate(server.base, baseline.artifact_ids, baseline.contexts)
-            records.append((variant, data, state_hit, artifact_hit))
+            rows.append(measure_materialization(server, variant, data, baseline))
         finally:
             server.stop()
-    assert baseline is not None
-    base_type_counts = {
-        "events": int(baseline.state.get("events", 0)),
-        "memories": int(baseline.state.get("memories", 0)),
-        "states": int(baseline.state.get("states", 0)),
-        "artifacts": int(baseline.state.get("artifacts", 0)),
-        "edges": int(baseline.state.get("edges", 0)),
-        "versions": int(baseline.state.get("versions", 0)),
-    }
-    baseline_objects = sum(base_type_counts.values())
-    rows = []
-    for variant, data, state_hit, artifact_hit in records:
-        visible_objects = sum(
-            min(int(data.state.get(key, 0)), baseline_count)
-            for key, baseline_count in base_type_counts.items()
-        )
-        relation_rate = pct(
-            min(int(data.state.get("edges", 0)), int(baseline.state.get("edges", 0))),
-            int(baseline.state.get("edges", 0)),
-        )
-        rows.append({
-            "System": "Plasmod", "Variant": variant.name,
-            "Write QPS": round(data.writes / max(data.wall_seconds, 1e-9), 6),
-            "Write p95 (ms)": round(percentile(data.write_latencies, 0.95), 6),
-            "Write-to-Visible p95 (ms)": round(percentile(data.visibility_latencies, 0.95), 6),
-            "Materialization Lag p95 (ms)": round(percentile(data.materialization_latencies, 0.95), 6),
-            "Object Visibility Coverage (%)": round(pct(visible_objects, baseline_objects), 6),
-            "Latest-state Hit Rate (%)": round(state_hit, 6),
-            "Artifact Lookup Accuracy (%)": round(artifact_hit, 6),
-            "Relation Recovery Rate (%)": round(relation_rate, 6),
-            "Stale Result Rate (%)": round(100.0 - state_hit, 6),
-        })
     return rows
 
 
@@ -908,26 +960,31 @@ def evidence_totals(data: RunData) -> tuple[int, int, int, int]:
     return provenance, edges, proof, supported
 
 
-def run_evidence(run_dir: Path, port: int, event_limit: int, query_limit: int) -> list[dict[str, Any]]:
-    runs: list[tuple[Variant, RunData]] = []
-    for variant in evidence_variants():
+def measure_evidence(variant: Variant, data: RunData,
+                     baseline_totals: tuple[int, int, int, int],
+                     output_variant: str | None = None) -> dict[str, Any]:
+    current = evidence_totals(data)
+    correctness = pct(current[3], len(data.responses))
+    return {
+        "System": "Plasmod", "Variant": output_variant or variant.name,
+        "Query p95 (ms)": round(percentile(data.query_latencies, 0.95), 6),
+        "Evidence Assembly Latency p95 (ms)": round(
+            percentile(data.evidence_latencies, 0.95), 6),
+        "Provenance Completeness (%)": round(pct(current[0], baseline_totals[0]), 6),
+        "Edge Recall (%)": round(pct(current[1], baseline_totals[1]), 6),
+        "Proof Completeness (%)": round(pct(current[2], baseline_totals[2]), 6),
+        "Citation / Evidence Correctness (%)": round(correctness, 6),
+        "Stale Evidence Rate (%)": round(100.0 - correctness, 6),
+    }
+
+
+def run_evidence(run_dir: Path, port: int, event_limit: int, query_limit: int,
+                 baseline: SharedFullBaseline) -> list[dict[str, Any]]:
+    rows = [baseline.module_rows["evidence"]]
+    for variant in evidence_variants()[1:]:
         log(f"starting evidence variant: {variant.name}")
-        runs.append((variant, run_once(variant, run_dir, port, event_limit, query_limit)))
-    baseline = evidence_totals(runs[0][1])
-    rows = []
-    for variant, data in runs:
-        current = evidence_totals(data)
-        correctness = pct(current[3], len(data.responses))
-        rows.append({
-            "System": "Plasmod", "Variant": variant.name,
-            "Query p95 (ms)": round(percentile(data.query_latencies, 0.95), 6),
-            "Evidence Assembly Latency p95 (ms)": round(percentile(data.evidence_latencies, 0.95), 6),
-            "Provenance Completeness (%)": round(pct(current[0], baseline[0]), 6),
-            "Edge Recall (%)": round(pct(current[1], baseline[1]), 6),
-            "Proof Completeness (%)": round(pct(current[2], baseline[2]), 6),
-            "Citation / Evidence Correctness (%)": round(correctness, 6),
-            "Stale Evidence Rate (%)": round(100.0 - correctness, 6),
-        })
+        data = run_once(variant, run_dir, port, event_limit, query_limit)
+        rows.append(measure_evidence(variant, data, baseline.evidence_totals))
     return rows
 
 
@@ -960,10 +1017,80 @@ def governance_variants() -> list[Variant]:
     ]
 
 
+def measure_governance(server: PlasmodProcess, variant: Variant) -> dict[str, Any]:
+    contract_id = f"contract-governance-{variant.slug}"
+    http_json(server.base, "POST", "/v1/share-contracts", {
+        "contract_id": contract_id, "tenant_id": "default",
+        "workspace_id": "plasmod-ablation", "scope": "plasmod-ablation",
+        "read_agents": ["agent-b"], "read_acl": "agent:agent-b",
+    })
+    specs = [
+        ("private", "private", [], ""),
+        ("shared", "restricted_shared", [], contract_id),
+        ("quarantine", "workspace", ["quarantine"], ""),
+        ("deleted", "workspace", [], ""),
+    ]
+    ids: dict[str, str] = {}
+    for ordinal, (kind, visibility, tags, contract) in enumerate(specs, 1):
+        source = governance_event(
+            kind, f"{variant.slug}-{kind}", "agent-a", visibility, tags, contract)
+        event, _, _ = prepare_event(source, ordinal, variant.slug)
+        ack = http_json(server.base, "POST", "/v1/ingest/events", event)
+        ids[kind] = str(ack["memory_id"])
+    qvec = hash_vector("governance sentinel")
+    latencies = []
+
+    def visible(kind: str, requester: str) -> bool:
+        response, latency = query(
+            server.base, f"governance {kind} sentinel", qvec, [ids[kind]],
+            "objects_only", requester=requester, workspace="plasmod-ablation",
+            session=f"governance-{kind}",
+        )
+        latencies.append(latency)
+        return ids[kind] in response.get("objects", [])
+
+    private_leak = visible("private", "agent-b")
+    shared_hit = visible("shared", "agent-b")
+    unauthorized = visible("shared", "agent-c")
+    quarantine_excluded = not visible("quarantine", "agent-a")
+    http_json(server.base, "POST", "/v1/admin/rollback", {
+        "memory_id": ids["deleted"], "action": "deactivate", "reason": "governance measurement",
+    })
+    delete_started = time.perf_counter()
+    delete_timeout_ms = float(os.getenv("PLASMOD_ABLATION_DELETE_TIMEOUT_MS", "500"))
+    deleted_visible = True
+    while deleted_visible:
+        deleted_visible = visible("deleted", "agent-a")
+        elapsed_ms = (time.perf_counter() - delete_started) * 1000
+        if not deleted_visible or elapsed_ms >= delete_timeout_ms:
+            break
+        time.sleep(0.02)
+    delete_delay = min((time.perf_counter() - delete_started) * 1000, delete_timeout_ms)
+    return {
+        "private": private_leak, "shared": shared_hit, "unauthorized": unauthorized,
+        "quarantine": quarantine_excluded, "deleted_visible": deleted_visible,
+        "delete_delay": delete_delay, "query_latency": sum(latencies) / max(len(latencies), 1),
+    }
+
+
+def governance_row(variant_name: str, value: dict[str, Any],
+                   no_access_latency: float) -> dict[str, Any]:
+    return {
+        "System": "Plasmod", "Variant": variant_name,
+        "Private Memory Leakage Rate (%)": 100.0 if value["private"] else 0.0,
+        "Authorized Hit Rate (%)": 100.0 if value["shared"] else 0.0,
+        "Unauthorized Hit Rate (%)": 100.0 if value["unauthorized"] else 0.0,
+        "Delete Visibility Delay (ms)": round(float(value["delete_delay"]), 6),
+        "Quarantine Exclusion Rate (%)": 100.0 if value["quarantine"] else 0.0,
+        "Policy Overhead (ms)": round(max(
+            0.0, float(value["query_latency"]) - no_access_latency), 6),
+    }
+
+
 def run_governance(run_dir: Path, port: int, event_limit: int,
-                   query_limit: int) -> list[dict[str, Any]]:
-    measured = []
-    for variant in governance_variants():
+                   query_limit: int, baseline: SharedFullBaseline) -> list[dict[str, Any]]:
+    measured: list[tuple[Variant, dict[str, Any]]] = []
+    for variant in governance_variants()[1:]:
         log(f"starting governance variant: {variant.name}")
         server = PlasmodProcess(variant, run_dir, port)
         try:
@@ -972,71 +1099,14 @@ def run_governance(run_dir: Path, port: int, event_limit: int,
             # governance probes below remain module-specific and do not replace
             # the common performance/freshness measurements.
             ingest_workload(server, variant, event_limit, query_limit)
-            contract_id = "contract-governance"
-            http_json(server.base, "POST", "/v1/share-contracts", {
-                "contract_id": contract_id, "tenant_id": "default",
-                "workspace_id": "plasmod-ablation", "scope": "plasmod-ablation",
-                "read_agents": ["agent-b"], "read_acl": "agent:agent-b",
-            })
-            specs = [
-                ("private", "private", [], ""),
-                ("shared", "restricted_shared", [], contract_id),
-                ("quarantine", "workspace", ["quarantine"], ""),
-                ("deleted", "workspace", [], ""),
-            ]
-            ids: dict[str, str] = {}
-            for ordinal, (kind, visibility, tags, contract) in enumerate(specs, 1):
-                source = governance_event(kind, f"{variant.slug}-{kind}", "agent-a", visibility, tags, contract)
-                event, _, _ = prepare_event(source, ordinal, variant.slug)
-                ack = http_json(server.base, "POST", "/v1/ingest/events", event)
-                ids[kind] = str(ack["memory_id"])
-            qvec = hash_vector("governance sentinel")
-            latencies = []
-            def visible(kind: str, requester: str) -> bool:
-                response, latency = query(
-                    server.base, f"governance {kind} sentinel", qvec, [ids[kind]],
-                    "objects_only", requester=requester, workspace="plasmod-ablation",
-                    session=f"governance-{kind}",
-                )
-                latencies.append(latency)
-                return ids[kind] in response.get("objects", [])
-            private_leak = visible("private", "agent-b")
-            shared_hit = visible("shared", "agent-b")
-            unauthorized = visible("shared", "agent-c")
-            quarantine_excluded = not visible("quarantine", "agent-a")
-            http_json(server.base, "POST", "/v1/admin/rollback", {
-                "memory_id": ids["deleted"], "action": "deactivate", "reason": "governance measurement",
-            })
-            delete_started = time.perf_counter()
-            delete_timeout_ms = float(os.getenv("PLASMOD_ABLATION_DELETE_TIMEOUT_MS", "500"))
-            deleted_visible = True
-            while deleted_visible:
-                deleted_visible = visible("deleted", "agent-a")
-                elapsed_ms = (time.perf_counter() - delete_started) * 1000
-                if not deleted_visible or elapsed_ms >= delete_timeout_ms:
-                    break
-                time.sleep(0.02)
-            delete_delay = min((time.perf_counter() - delete_started) * 1000, delete_timeout_ms)
-            measured.append((variant, {
-                "private": private_leak, "shared": shared_hit, "unauthorized": unauthorized,
-                "quarantine": quarantine_excluded, "deleted_visible": deleted_visible,
-                "delete_delay": delete_delay, "query_latency": sum(latencies) / max(len(latencies), 1),
-            }))
+            measured.append((variant, measure_governance(server, variant)))
         finally:
             server.stop()
     no_access_latency = next(value["query_latency"] for variant, value in measured if variant.name == "No-access-policy")
-    rows = []
-    for variant, value in measured:
-        rows.append({
-            "System": "Plasmod", "Variant": variant.name,
-            "Private Memory Leakage Rate (%)": 100.0 if value["private"] else 0.0,
-            "Authorized Hit Rate (%)": 100.0 if value["shared"] else 0.0,
-            "Unauthorized Hit Rate (%)": 100.0 if value["unauthorized"] else 0.0,
-            "Delete Visibility Delay (ms)": round(value["delete_delay"], 6),
-            "Quarantine Exclusion Rate (%)": 100.0 if value["quarantine"] else 0.0,
-            "Policy Overhead (ms)": round(max(0.0, value["query_latency"] - no_access_latency), 6),
-        })
-    return rows
+    return [
+        governance_row("Full Plasmod", baseline.governance_measurement, no_access_latency),
+        *(governance_row(variant.name, value, no_access_latency) for variant, value in measured),
+    ]
 
 
 def tier_variants() -> list[Variant]:
@@ -1052,53 +1122,60 @@ def tier_variants() -> list[Variant]:
     ]
 
 
-def run_tier(run_dir: Path, port: int, event_limit: int, query_limit: int) -> list[dict[str, Any]]:
-    rows = []
-    for variant in tier_variants():
+def measure_tier(server: PlasmodProcess, variant: Variant, data: RunData,
+                 output_variant: str | None = None) -> dict[str, Any]:
+    samples = data.latest_query_samples or data.query_samples
+    sampled_id = samples[0][2] if samples else ""
+    archive_id = sampled_id if sampled_id in data.memory_ids else next(iter(data.memory_ids), "")
+    archive_latency = 0.0
+    if archive_id and variant.env.get("PLASMOD_TIER_PROFILE", "full") not in ("warm_only", "no_cold"):
+        archived = http_json(server.base, "POST", "/v1/admin/tier/archive", {"memory_id": archive_id})
+        archive_latency = require_number(archived.get("archive_latency_ms", 0), "archive latency")
+    tier_query_latencies = []
+    hot = warm = cold = stale = total = 0
+    promotions = [archive_latency]
+    for text, vector, expected, requester, workspace, session in samples:
+        response, latency = query(
+            server.base, text, vector, requester=requester, include_cold=True,
+            workspace=workspace, session=session)
+        tier_query_latencies.append(latency)
+        retrieval = response.get("retrieval") or {}
+        hot += int(retrieval.get("hot_candidate_count", 0))
+        warm += int(retrieval.get("warm_candidate_count", 0))
+        cold += int(retrieval.get("cold_candidate_count", 0))
+        promotions.append(float((response.get("diagnostics") or {}).get("promotion_latency_ms", 0)))
+        canonical, _ = query(
+            server.base, text, vector, [expected], "objects_only",
+            requester=requester, workspace=workspace, session=session,
+        )
+        stale += int(expected not in canonical.get("objects", []))
+        total += 1
+    candidates = hot + warm + cold
+    return {
+        "System": "Plasmod", "Variant": output_variant or variant.name,
+        "Hot Cache Size": variant.hot_size,
+        "Query p50 (ms)": round(percentile(tier_query_latencies, 0.50), 6),
+        "Query p95 (ms)": round(percentile(tier_query_latencies, 0.95), 6),
+        "Query p99 (ms)": round(percentile(tier_query_latencies, 0.99), 6),
+        "Hot Hit Rate (%)": round(pct(hot, candidates), 6),
+        "Warm Hit Rate (%)": round(pct(warm, candidates), 6),
+        "Cold Hit Rate (%)": round(pct(cold, candidates), 6),
+        "Promotion Latency p95 (ms)": round(percentile(promotions, 0.95), 6),
+        "Memory (MB)": round(server.rss_mb(), 6),
+        "Stale Rate (%)": round(pct(stale, total), 6),
+    }
+
+
+def run_tier(run_dir: Path, port: int, event_limit: int, query_limit: int,
+             baseline: SharedFullBaseline) -> list[dict[str, Any]]:
+    rows = [baseline.module_rows["tier"]]
+    for variant in tier_variants()[1:]:
         log(f"starting tier variant: {variant.name}")
         server = PlasmodProcess(variant, run_dir, port)
         try:
             server.start(fresh=True)
             data = ingest_workload(server, variant, event_limit, query_limit)
-            samples = data.latest_query_samples or data.query_samples
-            sampled_id = samples[0][2] if samples else ""
-            archive_id = sampled_id if sampled_id in data.memory_ids else next(iter(data.memory_ids), "")
-            archive_latency = 0.0
-            if archive_id and variant.name not in ("Warm-only", "No-cold"):
-                archived = http_json(server.base, "POST", "/v1/admin/tier/archive", {"memory_id": archive_id})
-                archive_latency = require_number(archived.get("archive_latency_ms", 0), "archive latency")
-            tier_query_latencies = []
-            hot = warm = cold = stale = total = 0
-            promotions = [archive_latency]
-            for text, vector, expected, requester, workspace, session in samples:
-                response, latency = query(
-                    server.base, text, vector, requester=requester, include_cold=True,
-                    workspace=workspace, session=session)
-                tier_query_latencies.append(latency)
-                retrieval = response.get("retrieval") or {}
-                hot += int(retrieval.get("hot_candidate_count", 0))
-                warm += int(retrieval.get("warm_candidate_count", 0))
-                cold += int(retrieval.get("cold_candidate_count", 0))
-                promotions.append(float((response.get("diagnostics") or {}).get("promotion_latency_ms", 0)))
-                canonical, _ = query(
-                    server.base, text, vector, [expected], "objects_only",
-                    requester=requester, workspace=workspace, session=session,
-                )
-                stale += int(expected not in canonical.get("objects", []))
-                total += 1
-            candidates = hot + warm + cold
-            rows.append({
-                "System": "Plasmod", "Variant": variant.name, "Hot Cache Size": variant.hot_size,
-                "Query p50 (ms)": round(percentile(tier_query_latencies, 0.50), 6),
-                "Query p95 (ms)": round(percentile(tier_query_latencies, 0.95), 6),
-                "Query p99 (ms)": round(percentile(tier_query_latencies, 0.99), 6),
-                "Hot Hit Rate (%)": round(pct(hot, candidates), 6),
-                "Warm Hit Rate (%)": round(pct(warm, candidates), 6),
-                "Cold Hit Rate (%)": round(pct(cold, candidates), 6),
-                "Promotion Latency p95 (ms)": round(percentile(promotions, 0.95), 6),
-                "Memory (MB)": round(server.rss_mb(), 6),
-                "Stale Rate (%)": round(pct(stale, total), 6),
-            })
+            rows.append(measure_tier(server, variant, data))
         finally:
             server.stop()
     return rows
@@ -1112,6 +1189,84 @@ def all_variants() -> list[Variant]:
         *governance_variants(),
         *tier_variants(),
     ]
+
+
+def shared_full_variant() -> Variant:
+    return Variant("shared", "Full Plasmod", {
+        "PLASMOD_WAL_MODE": "file",
+        "PLASMOD_RECOVERY_REPLAY": "true",
+        "PLASMOD_RECOVERY_PROJECTION": "full",
+        "PLASMOD_MATERIALIZATION_PROFILE": "full",
+        "PLASMOD_EVIDENCE_PROFILE": "full",
+        "PLASMOD_GOVERNANCE_PROFILE": "full",
+        "PLASMOD_TIER_PROFILE": "full",
+    }, 2000)
+
+
+def is_group_full_variant(variant: Variant) -> bool:
+    labels = COMPARISON_LABELS.get(variant.group, {})
+    return labels.get(variant.name, ("", ""))[0] == "Full"
+
+
+def physical_variants() -> list[Variant]:
+    return [shared_full_variant(), *(
+        variant for variant in all_variants() if not is_group_full_variant(variant)
+    )]
+
+
+def common_metrics_path(run_dir: Path, variant: Variant) -> Path:
+    metrics_variant = shared_full_variant() if is_group_full_variant(variant) else variant
+    return run_dir / "variants" / metrics_variant.slug / "common_metrics.json"
+
+
+def shared_full_baseline_path(run_dir: Path) -> Path:
+    return run_dir / "variants" / shared_full_variant().slug / "shared_full_baseline.json"
+
+
+def run_shared_full_baseline(run_dir: Path, port: int, event_limit: int,
+                             query_limit: int) -> SharedFullBaseline:
+    variant = shared_full_variant()
+    log("starting shared Full Plasmod baseline")
+    server = PlasmodProcess(variant, run_dir, port)
+    try:
+        server.start(fresh=True)
+        data = ingest_workload(server, variant, event_limit, query_limit)
+        reference_ids = data.state_ids | data.artifact_ids
+        baseline = SharedFullBaseline(
+            module_rows={},
+            materialization_type_counts=materialization_type_counts(data),
+            state_ids=set(data.state_ids),
+            artifact_ids=set(data.artifact_ids),
+            contexts={
+                object_id: data.contexts[object_id]
+                for object_id in reference_ids if object_id in data.contexts
+            },
+            evidence_totals=evidence_totals(data),
+            governance_measurement={},
+        )
+        baseline.module_rows["materialization"] = measure_materialization(
+            server, variant, data, baseline, "Full Plasmod")
+        baseline.module_rows["evidence"] = measure_evidence(
+            variant, data, baseline.evidence_totals, "Full Plasmod")
+        baseline.module_rows["wal"] = measure_recovery(
+            server, variant, data, "Full Plasmod")
+        baseline.module_rows["tier"] = measure_tier(
+            server, variant, data, "Full Tiering")
+        baseline.governance_measurement = measure_governance(server, variant)
+        baseline.write(shared_full_baseline_path(run_dir))
+        return baseline
+    finally:
+        server.stop()
+
+
+def load_or_run_shared_full_baseline(run_dir: Path, port: int, event_limit: int,
+                                     query_limit: int, resume: bool) -> SharedFullBaseline:
+    path = shared_full_baseline_path(run_dir)
+    common_path = run_dir / "variants" / shared_full_variant().slug / "common_metrics.json"
+    if resume and path.exists() and common_path.exists():
+        log("reusing completed shared Full Plasmod baseline")
+        return SharedFullBaseline.read(path)
+    return run_shared_full_baseline(run_dir, port, event_limit, query_limit)
 
 
 def variant_configuration(variant: Variant) -> dict[str, Any]:
@@ -1152,7 +1307,7 @@ def build_master_table(run_dir: Path,
         module_row = module_rows.get((variant.group, variant.name))
         if module_row is None:
             raise RuntimeError(f"missing module result for {variant.group}/{variant.name}")
-        common_path = run_dir / "variants" / variant.slug / "common_metrics.json"
+        common_path = common_metrics_path(run_dir, variant)
         if not common_path.exists():
             raise RuntimeError(f"missing common metrics for {variant.group}/{variant.name}: {common_path}")
         common_payload = json.loads(common_path.read_text(encoding="utf-8"))
@@ -1259,6 +1414,9 @@ def main() -> int:
         "parameter_set": COMMON_PARAMETER_SET,
         "write_consistency": "strict", "query_consistency": "eventual",
         "storage_backend": "Badger (disk)", "cold_store": "MinIO S3",
+        "logical_variant_rows": len(all_variants()),
+        "physical_variant_runs": len(physical_variants()),
+        "shared_full_runs": 1,
         "host": {
             "platform": platform.platform(), "machine": platform.machine(),
             "processor": platform.processor(), "logical_cpu_count": os.cpu_count(),
@@ -1278,18 +1436,21 @@ def main() -> int:
             log("building current Plasmod core")
             subprocess.run(["make", "build"], cwd=CORE, check=True)
         minio.start()
+        baseline = load_or_run_shared_full_baseline(
+            run_dir, args.port, event_limit, query_limit, args.resume)
         tables: dict[str, list[dict[str, Any]]] = {}
         group_specs = [
             ("wal", "wal_event_log_ablation.csv", WAL_FIELDS,
-             lambda: run_recovery(run_dir, args.port, event_limit, query_limit)),
+             lambda: run_recovery(run_dir, args.port, event_limit, query_limit, baseline)),
             ("materialization", "materialization_ablation.csv", MATERIALIZATION_FIELDS,
-             lambda: run_materialization(run_dir, args.port, event_limit, query_limit)),
+             lambda: run_materialization(
+                 run_dir, args.port, event_limit, query_limit, baseline)),
             ("evidence", "evidence_provenance_ablation.csv", EVIDENCE_FIELDS,
-             lambda: run_evidence(run_dir, args.port, event_limit, query_limit)),
+             lambda: run_evidence(run_dir, args.port, event_limit, query_limit, baseline)),
             ("governance", "governance_ablation.csv", GOVERNANCE_FIELDS,
-             lambda: run_governance(run_dir, args.port, event_limit, query_limit)),
+             lambda: run_governance(run_dir, args.port, event_limit, query_limit, baseline)),
             ("tier", "tiered_storage_ablation.csv", TIER_FIELDS,
-             lambda: run_tier(run_dir, args.port, event_limit, query_limit)),
+             lambda: run_tier(run_dir, args.port, event_limit, query_limit, baseline)),
         ]
         for group, filename, fields, execute in group_specs:
             path = run_dir / filename
@@ -1309,6 +1470,8 @@ def main() -> int:
         summary = {
             "status": "complete", "row_counts": {name: len(rows) for name, rows in tables.items()},
             "master_row_count": len(master_rows),
+            "physical_variant_runs": len(physical_variants()),
+            "shared_full_runs": 1,
             "common_parameter_set": COMMON_PARAMETER_SET,
             "all_metrics_present": True, "minio_s3_exercised": True,
             "completed_at": datetime.now(timezone.utc).isoformat(),
