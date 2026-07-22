@@ -323,7 +323,103 @@ python3 scripts/layer2_dynamic_event_benchmark.py run --tables all --systems mil
 
 ---
 
-## 6. 关键参数
+## 6. Agent-native Database 消融与完整数据库实验
+
+这组实验只由 `plasmod_test_env` 编排。核心库只提供可部署、可验证的 runtime capability，不包含 variant 名称、实验循环或指标聚合。每个 variant 都使用同一个当前 Plasmod 二进制，并通过环境配置关闭真实数据路径；runner 启动后会读取 `/v1/admin/capabilities`，配置未生效会立即停止。
+
+### 6.1 输入与完整服务栈
+
+输入同时覆盖：
+
+- `data/layer2_dynamic_events/events.jsonl`：可重放 agent execution trace，验证恢复、状态、artifact、relation 和 provenance。
+- `data/layer2_dynamic_events/traces_collected/*.jsonl`：记录并规范化的动态 agent event stream，验证写入、物化、治理、evidence 和 tiering。
+- `results/layer2_dynamic_events/embedding_cache.sqlite3`：确定性预计算 embedding cache；数据库实验复用向量，不重复计入 embedding 计算成本。
+
+runner 会启动完整的真实服务路径：当前 C++ retrieval build、Go Plasmod server、文件 WAL、Badger canonical store、hot/warm retrieval plane，以及本地 MinIO 提供的真实 S3 cold store。每个 variant 使用独立 data directory 和 S3 prefix，结束后停止 Plasmod 与 runner 自己启动的 MinIO。
+
+### 6.2 Variant 与指标
+
+| 分组 | Variant |
+|---|---|
+| WAL / Event Log | Full Plasmod, No-WAL, In-memory WAL, File WAL, WAL without replay, Replay without index rebuild |
+| Materialization | Full Plasmod, No-materialization, Memory-only, No-agent-state, No-artifact, No-edge, No-object-version |
+| Evidence / Provenance | Full Plasmod, No-evidence, No-provenance, No-edge-expansion, One-hop only, No-proof-trace, Vector-only |
+| Access / Scope / Governance | Full Plasmod, No-access-policy, Metadata-filter-only, No-share-contract, No-quarantine, No-delete-propagation |
+| Hot / Warm / Cold | Full Tiering, No-hot-cache, Warm-only, No-cold, No-promotion, Hot-size-64/512/2000 |
+
+| 结果文件 | 完整指标 |
+|---|---|
+| `wal_event_log_ablation.csv` | event log size, recovered objects/relations/latest state, recovery time, replay throughput, query availability, lost events, duplicates |
+| `materialization_ablation.csv` | write QPS/p95, write-to-visible p95, materialization lag p95, object coverage, latest-state hit, artifact accuracy, relation recovery, stale rate |
+| `evidence_provenance_ablation.csv` | query p95, evidence assembly p95, provenance completeness, edge recall, proof completeness, citation/evidence correctness, stale evidence |
+| `governance_ablation.csv` | private leakage, authorized/unauthorized hit, delete visibility delay, quarantine exclusion, policy overhead |
+| `tiered_storage_ablation.csv` | query p50/p95/p99, hot/warm/cold hit rate, promotion p95, RSS memory, stale rate |
+| `full_database_baseline.csv` | 五组 Full variant 的全部指标，合并为一行完整数据库基线 |
+
+指标来自真实 HTTP ACK、canonical state、replay API、query diagnostics 和 S3 tier counters。`Object Visibility Coverage` 按 baseline 中 event/memory/state/artifact/edge/version 的对象数量计算；`Stale Rate` 使用 tier 查询后 canonical target 是否可见计算，不把 ANN recall 当作 freshness；governance 对象使用独立 session，避免 conflict lifecycle 干扰 ACL 测量。
+
+### 6.3 Smoke、定量和全量运行
+
+Smoke 使用 8 条记录事件和最多 3 个 query context，验证全部 34 个配置 variant，并生成 1 行完整数据库聚合基线：
+
+```bash
+cd /Users/erwin/Downloads/codespace/Plasmodexp/plasmod_test_env
+bash scripts/run_agent_native_ablation.sh smoke
+```
+
+默认定量运行使用每个通用 variant 1000 条事件和 100 个最新 agent/session query context：
+
+```bash
+bash scripts/run_agent_native_ablation.sh run
+```
+
+全量运行读取 `events.jsonl` 和全部 `traces_collected/*.jsonl`，每个通用 variant 都使用完整输入；query context 默认保持 100，防止查询样本量随事件总量失控：
+
+```bash
+bash scripts/run_agent_native_ablation.sh full
+```
+
+直接调用 runner 可固定 run id、端口和 query 数：
+
+```bash
+python3 scripts/agent_native_ablation_benchmark.py run \
+  --run-id agent_native_ablation_full_$(date +%Y%m%d_%H%M%S) \
+  --event-limit 0 \
+  --query-limit 100 \
+  --port 18080
+```
+
+### 6.4 后台运行、进度与恢复
+
+```bash
+cd /Users/erwin/Downloads/codespace/Plasmodexp/plasmod_test_env
+RUN_ID=agent_native_ablation_full_$(date +%Y%m%d_%H%M%S)
+mkdir -p "logs/${RUN_ID}"
+nohup caffeinate -dimsu python3 scripts/agent_native_ablation_benchmark.py run \
+  --run-id "${RUN_ID}" --event-limit 0 --query-limit 100 --port 18080 \
+  > "logs/${RUN_ID}/run.log" 2>&1 &
+echo "$!" > "logs/${RUN_ID}/runner.pid"
+tail -f "logs/${RUN_ID}/run.log"
+```
+
+关闭 `tail` 不会停止后台实验。已完整写出的分组 CSV 可复用；同一 run id 修复服务后续跑：
+
+```bash
+python3 scripts/agent_native_ablation_benchmark.py run \
+  --run-id "${RUN_ID}" --event-limit 0 --query-limit 100 --port 18080 --resume
+```
+
+结果位于 `results/agent_native_ablation/<run-id>/`。只有 CSV 全部非空、capability 回读一致、服务日志没有 panic/fatal/S3 错误时才生成 `COMPLETE` 和 `summary.json`；任何 HTTP、服务、指标或日志错误都会停止并生成 `FAILED`。每个 variant 的 `capabilities.json`、`measurements.json`、`server.log` 和持久化数据位于 `variants/<variant>/`，可用于审计单项结果。
+
+最近通过完整 smoke 的结果目录：
+
+```text
+results/agent_native_ablation/agent_native_ablation_smoke_20260722_v6/
+```
+
+---
+
+## 7. 关键参数
 
 | 参数 | 含义 |
 |---|---|
