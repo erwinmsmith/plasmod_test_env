@@ -199,6 +199,9 @@ class Table6ConsistencyContractTest(unittest.TestCase):
             def load_collection(self, _name, timeout=None):
                 self.load_timeouts.append(timeout)
 
+            def create_index(self, _name, _index_params, timeout=None):
+                return None
+
         adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
         adapter.client = FakeClient()
         adapter.collection_name = "created-after-timeout"
@@ -208,6 +211,126 @@ class Table6ConsistencyContractTest(unittest.TestCase):
         adapter._ensure_collection(drop=False)
 
         self.assertEqual(adapter.client.load_timeouts, [120.0])
+
+    def test_milvus_collection_setup_retries_load_without_dropping_data(self):
+        class FakeClient:
+            def __init__(self):
+                self.exists = True
+                self.load_calls = []
+                self.drop_calls = 0
+                self.created = False
+
+            def has_collection(self, _name):
+                return self.exists
+
+            def drop_collection(self, _name, timeout=None):
+                self.drop_calls += 1
+                self.exists = False
+
+            def create_collection(self, _name, **_kwargs):
+                self.exists = True
+                self.created = True
+
+            def create_index(self, _name, _index_params, timeout=None):
+                return None
+
+            def load_collection(self, _name, timeout=None):
+                self.load_calls.append(timeout)
+                if len(self.load_calls) == 1:
+                    raise RuntimeError("wait_for_loading_collection timeout")
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        adapter.client = FakeClient()
+        adapter.collection_name = "stalled"
+        adapter.timeout = 30.0
+        adapter.index_type = "FLAT"
+
+        adapter._ensure_collection(drop=False)
+
+        self.assertEqual(adapter.client.load_calls, [120.0, 120.0])
+        self.assertEqual(adapter.client.drop_calls, 0)
+        self.assertFalse(adapter.client.created)
+
+    def test_milvus_collection_setup_retries_multiple_load_timeouts_without_dropping_data(self):
+        class FakeClient:
+            def __init__(self):
+                self.exists = True
+                self.load_calls = []
+                self.drop_calls = 0
+                self.created = False
+
+            def has_collection(self, _name):
+                return self.exists
+
+            def drop_collection(self, _name, timeout=None):
+                self.drop_calls += 1
+                self.exists = False
+
+            def create_collection(self, _name, **_kwargs):
+                self.exists = True
+                self.created = True
+
+            def create_index(self, _name, _index_params, timeout=None):
+                return None
+
+            def load_collection(self, _name, timeout=None):
+                self.load_calls.append(timeout)
+                if len(self.load_calls) <= 2:
+                    raise RuntimeError("wait_for_loading_collection timeout")
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        adapter.client = FakeClient()
+        adapter.collection_name = "multi_timeout"
+        adapter.timeout = 30.0
+        adapter.index_type = "FLAT"
+
+        adapter._ensure_collection(drop=False)
+
+        self.assertEqual(adapter.client.load_calls, [120.0, 120.0, 120.0])
+        self.assertEqual(adapter.client.drop_calls, 0)
+        self.assertFalse(adapter.client.created)
+
+    def test_milvus_query_retries_after_closed_channel(self):
+        class TransientQueryClient:
+            def __init__(self, should_fail):
+                self.should_fail = should_fail
+                self.query_calls = 0
+
+            def query(self, *_args, **_kwargs):
+                self.query_calls += 1
+                if self.should_fail:
+                    raise ValueError("Cannot invoke RPC on closed channel")
+                return [{"event_id": "event", "object_id": "object"}]
+
+        first = TransientQueryClient(True)
+        second = TransientQueryClient(False)
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        adapter.client = first
+        adapter.collection_name = "query-retry-target"
+        adapter.timeout = 30.0
+        adapter.uri = "http://127.0.0.1:19530"
+        adapter._reconnect = lambda: setattr(adapter, "client", second)  # type: ignore[attr-defined]
+
+        query = benchmark.QuerySpec(
+            query_id="query",
+            query_type="visibility",
+            query_text="",
+            session_id="",
+            agent_id="",
+            workspace_id="",
+            tenant_id="",
+            object_types=[],
+            expected_ids={"event"},
+            target_object_ids={"event"},
+            expected_version=0,
+            source_event_type="",
+        )
+        result, _response = adapter.query(query)
+
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(result.visible)
+        self.assertEqual(first.query_calls, 1)
+        self.assertEqual(second.query_calls, 1)
 
     def test_milvus_reset_does_not_hide_collection_drop_failure(self):
         class FakeClient:
@@ -257,6 +380,250 @@ class Table6ConsistencyContractTest(unittest.TestCase):
 
         self.assertTrue(result.ok, result.error)
         self.assertEqual(len(adapter.client.inserts), 1)
+
+    def test_milvus_ingest_retries_once_after_closed_channel(self):
+        class FakeEmbedder:
+            def embed_one(self, _text):
+                return [0.0] * benchmark.EMBEDDING_DIM
+
+        class TransientFailureClient:
+            def __init__(self, *, should_fail_once: bool):
+                self.inserts = []
+                self.flush_calls = 0
+                self.reinsert = should_fail_once
+
+            def insert(self, collection_name, rows, timeout=None):
+                if self.reinsert:
+                    self.reinsert = False
+                    raise ValueError("Cannot invoke RPC on closed channel")
+                self.inserts.append((collection_name, rows, timeout))
+
+            def flush(self, collection_name, timeout=None):
+                self.flush_calls += 1
+
+        first = TransientFailureClient(should_fail_once=True)
+        second = TransientFailureClient(should_fail_once=False)
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        adapter.client = first
+        adapter.collection_name = "retry-target"
+        adapter.timeout = 30.0
+        adapter.embedder = FakeEmbedder()
+        adapter.visibility_policy = "flush_on_ack"
+        adapter.payload_json_bytes = 0
+        adapter.uri = "http://127.0.0.1:19530"
+        adapter.mu = __import__("threading").Lock()
+
+        adapters = [second]
+
+        def reconnect():
+            adapter.client = adapters.pop()
+
+        adapter._reconnect = reconnect  # type: ignore[attr-defined]
+
+        result = adapter.ingest({
+            "identity": {"event_id": "event"},
+            "object": {"object_id": "object"},
+            "payload": {"text": "hello"},
+        })
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(first.inserts), 0)
+        self.assertEqual(len(second.inserts), 1)
+        self.assertEqual(second.flush_calls, 1)
+
+    def test_milvus_ingest_retries_multiple_transient_failures(self):
+        class FakeEmbedder:
+            def embed_one(self, _text):
+                return [0.0] * benchmark.EMBEDDING_DIM
+
+        class TransientFailureClient:
+            def __init__(self, *, remaining_failures: int):
+                self.inserts = []
+                self.flush_calls = 0
+                self.remaining_failures = remaining_failures
+
+            def insert(self, collection_name, rows, timeout=None):
+                if self.remaining_failures > 0:
+                    self.remaining_failures -= 1
+                    raise ValueError("Cannot invoke RPC on closed channel")
+                self.inserts.append((collection_name, rows, timeout))
+
+            def flush(self, collection_name, timeout=None):
+                self.flush_calls += 1
+
+        first = TransientFailureClient(remaining_failures=2)
+        second = TransientFailureClient(remaining_failures=0)
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        adapter.client = first
+        adapter.collection_name = "retry-target"
+        adapter.timeout = 30.0
+        adapter.embedder = FakeEmbedder()
+        adapter.visibility_policy = "flush_on_ack"
+        adapter.payload_json_bytes = 0
+        adapter.uri = "http://127.0.0.1:19530"
+        adapter.mu = __import__("threading").Lock()
+
+        adapters = [second]
+
+        def reconnect():
+            adapter.client = adapters.pop()
+
+        adapter._reconnect = reconnect  # type: ignore[attr-defined]
+
+        result = adapter.ingest({
+            "identity": {"event_id": "event"},
+            "object": {"object_id": "object"},
+            "payload": {"text": "hello"},
+        })
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(first.inserts), 0)
+        self.assertEqual(len(second.inserts), 1)
+        self.assertEqual(second.flush_calls, 1)
+
+    def test_milvus_ingest_retries_after_collection_not_found(self):
+        class FakeEmbedder:
+            def embed_one(self, _text):
+                return [0.0] * benchmark.EMBEDDING_DIM
+
+        class CollectionNotFoundClient:
+            def __init__(self):
+                self.inserts = []
+                self.flush_calls = 0
+                self.fail_once = True
+
+            def insert(self, collection_name, rows, timeout=None):
+                if self.fail_once:
+                    self.fail_once = False
+                    raise RuntimeError("collection not found")
+                self.inserts.append((collection_name, rows, timeout))
+
+            def flush(self, collection_name, timeout=None):
+                self.flush_calls += 1
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        client = CollectionNotFoundClient()
+        adapter.client = client
+        adapter.collection_name = "retry-target"
+        adapter.timeout = 30.0
+        adapter.embedder = FakeEmbedder()
+        adapter.visibility_policy = "flush_on_ack"
+        adapter.payload_json_bytes = 0
+        adapter.uri = "http://127.0.0.1:19530"
+        adapter.mu = __import__("threading").Lock()
+
+        ensure_calls = []
+        adapter._ensure_collection = lambda drop=False: ensure_calls.append(drop)
+
+        result = adapter.ingest({
+            "identity": {"event_id": "event"},
+            "object": {"object_id": "object"},
+            "payload": {"text": "hello"},
+        })
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(client.inserts), 1)
+        self.assertEqual(client.flush_calls, 1)
+        self.assertEqual(ensure_calls, [False])
+
+    def test_milvus_ingest_retries_after_cannot_find_collection(self):
+        class FakeEmbedder:
+            def embed_one(self, _text):
+                return [0.0] * benchmark.EMBEDDING_DIM
+
+        class MissingCollectionClient:
+            def __init__(self):
+                self.inserts = []
+                self.flush_calls = 0
+                self.fail_once = True
+
+            def insert(self, collection_name, rows, timeout=None):
+                if self.fail_once:
+                    self.fail_once = False
+                    raise RuntimeError("can't find collection")
+                self.inserts.append((collection_name, rows, timeout))
+
+            def flush(self, collection_name, timeout=None):
+                self.flush_calls += 1
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        client = MissingCollectionClient()
+        adapter.client = client
+        adapter.collection_name = "retry-target"
+        adapter.timeout = 30.0
+        adapter.embedder = FakeEmbedder()
+        adapter.visibility_policy = "flush_on_ack"
+        adapter.payload_json_bytes = 0
+        adapter.uri = "http://127.0.0.1:19530"
+        adapter.mu = __import__("threading").Lock()
+
+        ensure_calls = []
+        adapter._ensure_collection = lambda drop=False: ensure_calls.append(drop)
+
+        result = adapter.ingest({
+            "identity": {"event_id": "event"},
+            "object": {"object_id": "object"},
+            "payload": {"text": "hello"},
+        })
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(len(client.inserts), 1)
+        self.assertEqual(client.flush_calls, 1)
+        self.assertEqual(ensure_calls, [False])
+
+    def test_milvus_ingest_retries_when_collection_repair_temporarily_fails(self):
+        class FakeEmbedder:
+            def embed_one(self, _text):
+                return [0.0] * benchmark.EMBEDDING_DIM
+
+        class CollectionRepairTransientFailureClient:
+            def __init__(self):
+                self.insert_calls = 0
+                self.inserts = []
+                self.flush_calls = 0
+
+            def insert(self, collection_name, rows, timeout=None):
+                self.insert_calls += 1
+                if self.insert_calls == 1:
+                    raise RuntimeError("collection not found")
+                self.inserts.append((collection_name, rows, timeout))
+
+            def flush(self, collection_name, timeout=None):
+                self.flush_calls += 1
+
+        adapter = benchmark.MilvusAdapter.__new__(benchmark.MilvusAdapter)
+        client = CollectionRepairTransientFailureClient()
+        adapter.client = client
+        adapter.collection_name = "retry-target"
+        adapter.timeout = 30.0
+        adapter.embedder = FakeEmbedder()
+        adapter.visibility_policy = "flush_on_ack"
+        adapter.payload_json_bytes = 0
+        adapter.uri = "http://127.0.0.1:19530"
+        adapter.mu = __import__("threading").Lock()
+
+        recoveries = []
+
+        def ensure_collection(drop=False):
+            recoveries.append(drop)
+            if len(recoveries) == 1:
+                raise RuntimeError("fail connecting to server on 127.0.0.1:19530, illegal connection params or server unavailable")
+
+        adapter._ensure_collection = ensure_collection  # type: ignore[attr-defined]
+        adapter._reconnect = lambda: None  # type: ignore[attr-defined]
+
+        result = adapter.ingest({
+            "identity": {"event_id": "event"},
+            "object": {"object_id": "object"},
+            "payload": {"text": "hello"},
+        })
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(client.insert_calls, 2)
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(client.flush_calls, 1)
 
     def test_ingest_completion_callback_ignores_cancelled_future(self):
         observed = []

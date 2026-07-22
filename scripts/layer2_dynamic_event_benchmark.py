@@ -1348,6 +1348,7 @@ class MilvusAdapter(SystemAdapter):
         visibility_policy: str = "flush_on_ack",
         index_type: str = "HNSW",
         payload_json_bytes: int = 65535,
+        drop_collection: bool = False,
     ):
         from pymilvus import MilvusClient
 
@@ -1360,55 +1361,136 @@ class MilvusAdapter(SystemAdapter):
         self.payload_json_bytes = payload_json_bytes
         self.client = MilvusClient(uri=uri)
         self.mu = threading.Lock()
-        self._ensure_collection(drop=False)
+        self._ensure_collection(drop=drop_collection)
+
+    @staticmethod
+    def _is_retryable_connection_error(exc: BaseException) -> bool:
+        message = str(exc).lower()
+        retryable_signals = (
+            "cannot invoke rpc on closed channel",
+            "fail connecting to server",
+            "deadline exceeded",
+            "connection refused",
+            "failed to connect",
+            "service unavailable",
+        )
+        return any(signal in message for signal in retryable_signals)
+
+    @staticmethod
+    def _is_retryable_collection_error(exc: BaseException) -> bool:
+        message = str(exc).lower()
+        retryable_signals = (
+            "load_collection",
+            "wait_for_loading_collection",
+            "collection not found",
+            "can't find collection",
+        )
+        return any(signal in message for signal in retryable_signals)
+
+    def _reconnect(self) -> None:
+        from pymilvus import MilvusClient
+
+        self.client = MilvusClient(uri=self.uri)
+
+    def _run_with_retry(
+        self,
+        action: Callable[[], Any],
+        attempts: int = 4,
+        *,
+        backoff_s: float = 0.05,
+    ) -> Any:
+        for attempt in range(1, attempts + 1):
+            try:
+                return action()
+            except Exception as exc:
+                if attempt >= attempts:
+                    raise
+                if self._is_retryable_collection_error(exc):
+                    try:
+                        self._ensure_collection(drop=False)
+                    except Exception as repair_exc:
+                        if not (
+                            self._is_retryable_connection_error(repair_exc)
+                            or self._is_retryable_collection_error(repair_exc)
+                        ):
+                            raise
+                        self._reconnect()
+                    time.sleep(min(1.0, backoff_s * (2 ** (attempt - 1)) + 0.05))
+                    continue
+                if self._is_retryable_connection_error(exc):
+                    self._reconnect()
+                    time.sleep(min(1.5, backoff_s * (2 ** (attempt - 1))))
+                    continue
+                raise
 
     def _ensure_collection(self, drop: bool) -> None:
         from pymilvus import DataType, MilvusClient
 
         setup_timeout = max(float(self.timeout), 120.0)
+
+        def create_collection() -> None:
+            schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
+            schema.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=256)
+            schema.add_field("vector", DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
+            schema.add_field("event_id", DataType.VARCHAR, max_length=512)
+            schema.add_field("object_id", DataType.VARCHAR, max_length=512)
+            schema.add_field("session_id", DataType.VARCHAR, max_length=512)
+            schema.add_field("agent_id", DataType.VARCHAR, max_length=256)
+            schema.add_field("workspace_id", DataType.VARCHAR, max_length=256)
+            schema.add_field("tenant_id", DataType.VARCHAR, max_length=256)
+            schema.add_field("event_type", DataType.VARCHAR, max_length=128)
+            schema.add_field("object_type", DataType.VARCHAR, max_length=128)
+            schema.add_field("version", DataType.INT64)
+            schema.add_field("text", DataType.VARCHAR, max_length=8192)
+            schema.add_field("payload_json", DataType.VARCHAR, max_length=65535)
+
+            index_params = MilvusClient.prepare_index_params()
+            if self.index_type == "FLAT":
+                index_params.add_index("vector", index_type="FLAT", metric_type="COSINE", params={})
+            else:
+                index_params.add_index(
+                    "vector",
+                    index_type="HNSW",
+                    metric_type="COSINE",
+                    params={"M": 16, "efConstruction": 200},
+                )
+            try:
+                self.client.create_collection(
+                    self.collection_name,
+                    schema=schema,
+                    consistency_level="Strong",
+                    timeout=setup_timeout,
+                )
+            except Exception:
+                if not self.client.has_collection(self.collection_name):
+                    raise
+            self.client.create_index(self.collection_name, index_params, timeout=setup_timeout)
+
         if drop and self.client.has_collection(self.collection_name):
             self.client.drop_collection(self.collection_name, timeout=setup_timeout)
+
+        def load_collection_with_retry() -> None:
+            last_error: BaseException | None = None
+            for attempt in range(3):
+                try:
+                    self.client.load_collection(self.collection_name, timeout=setup_timeout)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if not self._is_retryable_collection_error(exc) or attempt >= 2:
+                        raise
+                    if not self.client.has_collection(self.collection_name):
+                        create_collection()
+                    time.sleep(min(0.5, 0.1 * (2 ** attempt)))
+            if last_error is not None:
+                raise last_error
+
         if self.client.has_collection(self.collection_name):
-            self.client.load_collection(self.collection_name, timeout=setup_timeout)
+            load_collection_with_retry()
             return
 
-        schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
-        schema.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=256)
-        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
-        schema.add_field("event_id", DataType.VARCHAR, max_length=512)
-        schema.add_field("object_id", DataType.VARCHAR, max_length=512)
-        schema.add_field("session_id", DataType.VARCHAR, max_length=512)
-        schema.add_field("agent_id", DataType.VARCHAR, max_length=256)
-        schema.add_field("workspace_id", DataType.VARCHAR, max_length=256)
-        schema.add_field("tenant_id", DataType.VARCHAR, max_length=256)
-        schema.add_field("event_type", DataType.VARCHAR, max_length=128)
-        schema.add_field("object_type", DataType.VARCHAR, max_length=128)
-        schema.add_field("version", DataType.INT64)
-        schema.add_field("text", DataType.VARCHAR, max_length=8192)
-        schema.add_field("payload_json", DataType.VARCHAR, max_length=65535)
-
-        index_params = MilvusClient.prepare_index_params()
-        if self.index_type == "FLAT":
-            index_params.add_index("vector", index_type="FLAT", metric_type="COSINE", params={})
-        else:
-            index_params.add_index(
-                "vector",
-                index_type="HNSW",
-                metric_type="COSINE",
-                params={"M": 16, "efConstruction": 200},
-            )
-        try:
-            self.client.create_collection(
-                self.collection_name,
-                schema=schema,
-                index_params=index_params,
-                consistency_level="Strong",
-                timeout=setup_timeout,
-            )
-        except Exception:
-            if not self.client.has_collection(self.collection_name):
-                raise
-        self.client.load_collection(self.collection_name, timeout=setup_timeout)
+        create_collection()
+        load_collection_with_retry()
 
     def health(self) -> None:
         self.client.list_collections()
@@ -1451,9 +1533,13 @@ class MilvusAdapter(SystemAdapter):
             vector = self.embedder.embed_one(payload_text(ev))
             row = self._row_for_event(ev, vector)
             with self.mu:
-                self.client.insert(self.collection_name, [row], timeout=self.timeout)
+                self._run_with_retry(
+                    lambda: self.client.insert(self.collection_name, [row], timeout=self.timeout)
+                )
                 if enforce_visibility and self.visibility_policy == "flush_on_ack":
-                    self.client.flush(self.collection_name, timeout=self.timeout)
+                    self._run_with_retry(
+                        lambda: self.client.flush(self.collection_name, timeout=self.timeout)
+                    )
             t1 = now_ms()
             return IngestResult(
                 system=self.name,
@@ -1495,23 +1581,27 @@ class MilvusAdapter(SystemAdapter):
                 clauses.append(f"(event_id in {target_values} or object_id in {target_values} or pk in {target_values})")
             expr = " and ".join(clauses) if clauses else ""
             if q.target_object_ids:
-                rows = self.client.query(
-                    self.collection_name,
-                    filter=expr,
-                    output_fields=["pk", "event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
-                    timeout=self.timeout,
+                rows = self._run_with_retry(
+                    lambda: self.client.query(
+                        self.collection_name,
+                        filter=expr,
+                        output_fields=["pk", "event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
+                        timeout=self.timeout,
+                    )
                 )
                 rows = [rows]
             else:
                 vector = self.embedder.embed_one(q.query_text or "latest")
-                rows = self.client.search(
-                    self.collection_name,
-                    [vector],
-                    limit=10,
-                    filter=expr,
-                    output_fields=["event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
-                    search_params={"ef": 64},
-                    timeout=self.timeout,
+                rows = self._run_with_retry(
+                    lambda: self.client.search(
+                        self.collection_name,
+                        [vector],
+                        limit=10,
+                        filter=expr,
+                        output_fields=["event_id", "object_id", "session_id", "event_type", "object_type", "version", "text"],
+                        search_params={"ef": 64},
+                        timeout=self.timeout,
+                    )
                 )
             ids: set[str] = set()
             objects: list[dict[str, Any]] = []
@@ -1713,6 +1803,7 @@ def make_adapter(
     milvus_visibility_policy: str = "flush_on_ack",
     milvus_index_type: str = "HNSW",
     milvus_payload_json_bytes: int = 65535,
+    drop_collection: bool = False,
 ) -> SystemAdapter:
     if system == "plasmod":
         return PlasmodAdapter(base_url, timeout=timeout)
@@ -1732,6 +1823,7 @@ def make_adapter(
             visibility_policy=milvus_visibility_policy,
             index_type=milvus_index_type,
             payload_json_bytes=milvus_payload_json_bytes,
+            drop_collection=drop_collection,
         )
     if system == "sqlite_metadata":
         return VectorMetadataAdapter(sqlite_path)
@@ -2870,6 +2962,7 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             args.milvus_visibility_policy,
             args.milvus_index_type,
             args.milvus_payload_json_bytes,
+            drop_collection=args.reset_between_runs,
         )
         run_id = f"{args.run_id}_t6_milvus_best_effort"
         if ("Milvus", "Best-effort") in done_keys:
@@ -2892,8 +2985,6 @@ def run_table6(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             prewarm_adapter_embeddings(adapter, events)
         else:
             events = (namespace_event(ev, run_id) for ev in iter_events(args.synthetic_input, limit=args.events_per_rate))
-        if args.reset_between_runs:
-            adapter.reset()
         ingests, queries, _elapsed_s = run_freshness_trial(
             adapter,
             events,
