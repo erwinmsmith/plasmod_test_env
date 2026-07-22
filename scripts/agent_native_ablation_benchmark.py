@@ -464,6 +464,7 @@ class PlasmodProcess:
             "S3_SECURE": "false",
             "S3_REGION": "us-east-1",
             "S3_PREFIX": f"agent-native-ablation/{self.run_dir.name}/{self.variant.slug}",
+            "LD_LIBRARY_PATH": f"{CORE / 'cpp/build'}:{CORE / 'cpp/build/vendor'}:{env.get('LD_LIBRARY_PATH', '')}",
             "DYLD_LIBRARY_PATH": f"{CORE / 'cpp/build'}:{CORE / 'cpp/build/vendor'}:{env.get('DYLD_LIBRARY_PATH', '')}",
         })
         env.update(self.variant.env)

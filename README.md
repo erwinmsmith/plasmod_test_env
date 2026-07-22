@@ -439,6 +439,210 @@ python3 scripts/agent_native_ablation_benchmark.py run \
 results/agent_native_ablation/agent_native_ablation_smoke_20260722_v8/
 ```
 
+### 6.5 迁移到 Linux 服务器运行
+
+#### 6.5.1 目录、资源与依赖
+
+两个仓库必须保持同级目录，因为 runner 通过 `plasmod_test_env/../Plasmod` 定位核心库：
+
+```text
+/srv/Plasmodexp/
+├── Plasmod/              # dev branch
+└── plasmod_test_env/     # main branch
+```
+
+CPU 版本不需要 GPU、Milvus、Docker 或额外 Python package。服务器需要：
+
+- Linux x86_64 或 aarch64；
+- Go 1.25.x；
+- Python 3；runner 只使用标准库；
+- CMake 3.20+、C++17 compiler、GNU Make、Git、curl；
+- `minio` server 和 `mc` client 可执行文件；
+- 可访问的本地回环端口：Plasmod 默认 `18080`，MinIO API `9000`，console `9001`。
+
+Ubuntu/Debian 基础构建依赖可先安装：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake git curl rsync python3 ca-certificates
+go version       # 必须满足 Plasmod/go.mod 当前声明的 Go 版本
+minio --version
+mc --version
+```
+
+Go、MinIO 和 `mc` 如果不在发行版仓库中，应使用对应项目的官方 binary/package 安装。不要把 macOS 下的 `bin/plasmod` 或 `.dylib` 复制到 Linux；必须在服务器重新生成 `.so` 和 Go binary。
+
+全量输入当前约 3.6 GB、36k 文件，且每个 variant 使用独立 Badger data directory 和 S3 prefix。完整 34-variant 运行的实际占用会显著大于原始数据；执行前用 `df -h` 检查专用磁盘，建议至少预留 250 GB，并根据 smoke/中等运行后的单 variant 占用决定是否扩容到 500 GB 以上。内存建议 32 GB，最低配置应先用 smoke 验证。
+
+#### 6.5.2 Clone 并锁定分支
+
+```bash
+sudo mkdir -p /srv/Plasmodexp
+sudo chown "$(id -u):$(id -g)" /srv/Plasmodexp
+cd /srv/Plasmodexp
+
+git clone --branch dev https://github.com/CodeSoul-co/Plasmod.git
+git clone --branch main https://github.com/erwinmsmith/plasmod_test_env.git
+
+git -C Plasmod pull --ff-only origin dev
+git -C plasmod_test_env pull --ff-only origin main
+git -C Plasmod rev-parse HEAD
+git -C plasmod_test_env rev-parse HEAD
+```
+
+私有仓库可将 HTTPS URL 换成已配置 deploy key 的 SSH URL。正式运行期间不要再次 `git pull`；`run_metadata.json` 会记录两个仓库的 commit。
+
+#### 6.5.3 单独传输数据和 embedding cache
+
+实验数据和 embedding cache 被 `.gitignore` 排除，`git clone` 后不会出现，必须从当前机器单独复制：
+
+```bash
+# 先创建服务器目标目录。
+ssh USER@SERVER 'mkdir -p \
+  /srv/Plasmodexp/plasmod_test_env/data/layer2_dynamic_events \
+  /srv/Plasmodexp/plasmod_test_env/results/layer2_dynamic_events'
+
+# 在当前机器执行；替换 SERVER 和用户名。
+cd /Users/erwin/Downloads/codespace/Plasmodexp/plasmod_test_env
+
+rsync -a --info=progress2 --checksum \
+  data/layer2_dynamic_events/ \
+  USER@SERVER:/srv/Plasmodexp/plasmod_test_env/data/layer2_dynamic_events/
+
+rsync -a --info=progress2 --checksum \
+  results/layer2_dynamic_events/embedding_cache.sqlite3 \
+  USER@SERVER:/srv/Plasmodexp/plasmod_test_env/results/layer2_dynamic_events/embedding_cache.sqlite3
+```
+
+两端至少核对文件数、容量和关键文件 checksum：
+
+```bash
+cd /srv/Plasmodexp/plasmod_test_env
+find data/layer2_dynamic_events -type f | wc -l
+du -sh data/layer2_dynamic_events results/layer2_dynamic_events/embedding_cache.sqlite3
+sha256sum data/layer2_dynamic_events/events.jsonl \
+  results/layer2_dynamic_events/embedding_cache.sqlite3
+```
+
+macOS 本地对应命令是 `shasum -a 256 <file>`。如果不复制 cache，runner 会重新计算并写入 cache，但这会增加首次运行准备时间，因此正式服务器应复用现有文件。
+
+#### 6.5.4 在服务器重新构建 Plasmod
+
+```bash
+cd /srv/Plasmodexp/Plasmod
+
+# CPU/HNSW C++ retrieval shared library。
+bash scripts/build_cpp.sh
+
+# Makefile 检测 cpp/build/libplasmod_retrieval.so 后，自动使用 retrieval build tag。
+make build
+
+test -f cpp/build/libplasmod_retrieval.so
+test -x bin/plasmod
+ldd bin/plasmod | grep -E 'plasmod_retrieval|not found' || true
+go test ./src/...
+```
+
+runner 在 Linux 上设置 `LD_LIBRARY_PATH=cpp/build:cpp/build/vendor`，在 macOS 上设置对应的 `DYLD_LIBRARY_PATH`。如果 `ldd` 出现 `not found`，不要开始实验，应先修复 shared-library 路径或重新执行 `make build`。
+
+#### 6.5.5 端口和 MinIO 预检
+
+runner 会执行以下工作：
+
+1. 检查 `127.0.0.1:9000/minio/health/live`；
+2. 如果没有现有 MinIO，则调用 `minio server`，数据放到当前 run 目录的 `minio-data/`；
+3. 使用 `mc` 创建 `plasmod-experiments` bucket；
+4. 每次只启动一个 Plasmod variant，统一监听指定的 HTTP port；
+5. 正常或失败退出时停止自己启动的 Plasmod 和 MinIO。
+
+因此消融实验**不需要**提前运行 `start_all.sh`，也不要手工启动另一个 Plasmod。运行前检查端口：
+
+```bash
+ss -ltnp | grep -E ':18080|:9000|:9001' || true
+curl -fsS http://127.0.0.1:9000/minio/health/live || true
+```
+
+如果 `18080` 被占用，传入例如 `--port 18081`。如果复用已有 MinIO，它必须允许 `minioadmin/minioadmin` 创建实验 bucket；否则停止它，让 runner 启动隔离实例。不要通过公网暴露 9000、9001 或实验 HTTP port。
+
+#### 6.5.6 先执行服务器 smoke
+
+```bash
+cd /srv/Plasmodexp/plasmod_test_env
+bash scripts/run_agent_native_ablation.sh smoke --port 18080
+```
+
+结束后检查最新目录：
+
+```bash
+RUN_DIR="$(find results/agent_native_ablation -maxdepth 1 -type d \
+  -name 'agent_native_ablation_smoke_*' | sort | tail -n 1)"
+test -f "${RUN_DIR}/COMPLETE"
+test ! -f "${RUN_DIR}/FAILED"
+cat "${RUN_DIR}/summary.json"
+wc -l "${RUN_DIR}/ablation_master_table.csv"
+```
+
+预期主表为表头加 34 个 variant，即 `wc -l` 为 35。smoke 未通过时不要启动全量任务，应先检查 `FAILED`、`variants/*/server.log` 和 `minio.log`。
+
+#### 6.5.7 Linux 后台全量运行
+
+Linux 服务器不需要 macOS 的 `caffeinate`。使用固定 `RUN_ID`，以便失败后复用已完成分组：
+
+```bash
+cd /srv/Plasmodexp/plasmod_test_env
+RUN_ID="agent_native_ablation_full_$(date -u +%Y%m%d_%H%M%S)"
+RUN_DIR="results/agent_native_ablation/${RUN_ID}"
+LOG_DIR="logs/${RUN_ID}"
+mkdir -p "${LOG_DIR}"
+
+nohup python3 scripts/agent_native_ablation_benchmark.py run \
+  --run-id "${RUN_ID}" \
+  --event-limit 0 \
+  --query-limit 100 \
+  --port 18080 \
+  > "${LOG_DIR}/run.log" 2>&1 &
+
+echo "$!" > "${LOG_DIR}/runner.pid"
+printf 'RUN_ID=%s\nPID=%s\n' "${RUN_ID}" "$(cat "${LOG_DIR}/runner.pid")"
+```
+
+SSH 断开后 `nohup` 进程会继续运行。完成依赖、代码和数据下载后，实验不需要外网，但本机 loopback、Plasmod 与 MinIO 之间的连接必须保持正常。
+
+#### 6.5.8 查看进度、恢复和取回结果
+
+```bash
+cd /srv/Plasmodexp/plasmod_test_env
+tail -F "logs/${RUN_ID}/run.log"
+ps -fp "$(cat "logs/${RUN_ID}/runner.pid")" || true
+find "results/agent_native_ablation/${RUN_ID}" -maxdepth 1 -name '*.csv' -print
+```
+
+runner 在每个分组完成后立即写对应 CSV；只有五个分组、`full_database_baseline.csv` 和 `ablation_master_table.csv` 全部通过校验后才写 `COMPLETE`。如果服务器重启或任务失败，修复服务/磁盘问题后使用完全相同的 run id 和参数：
+
+```bash
+nohup python3 scripts/agent_native_ablation_benchmark.py run \
+  --run-id "${RUN_ID}" \
+  --event-limit 0 \
+  --query-limit 100 \
+  --port 18080 \
+  --resume \
+  >> "logs/${RUN_ID}/run.log" 2>&1 &
+echo "$!" > "logs/${RUN_ID}/runner.pid"
+```
+
+`--resume` 只复用已经完整写出的分组 CSV；失败中的分组会从该组重新运行，不会把半行结果拼入正式表。任务完成后先取回轻量结果：
+
+```bash
+RUN_PATH="results/agent_native_ablation/${RUN_ID}"
+(
+  cd "${RUN_PATH}"
+  tar -czf "${HOME}/${RUN_ID}_tables.tar.gz" \
+    -- *.csv summary.json run_metadata.json ablation_master_style.json COMPLETE
+)
+```
+
+如果需要完整审计，再单独同步 `variants/*/capabilities.json`、`measurements.json`、`common_metrics.json` 和 `server.log`。不要默认打包整个 `variants/*/data` 与 `minio-data`，它们可能达到数百 GB。
+
 ---
 
 ## 7. 关键参数
