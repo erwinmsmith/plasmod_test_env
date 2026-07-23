@@ -280,6 +280,10 @@ def test_recovery_replay_timeout_scales_with_formal_full_workload():
     assert MODULE.recovery_replay_timeout_s(641_979) >= 6_480
 
 
+def test_recovery_replay_timeout_has_headroom_for_full_projection_replay():
+    assert MODULE.recovery_replay_timeout_s(641_979) >= 12_960
+
+
 def test_measure_recovery_scales_reset_timeout_for_large_wal(
         tmp_path, monkeypatch):
     captured_timeouts = {}
