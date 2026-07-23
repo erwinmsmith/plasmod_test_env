@@ -309,6 +309,52 @@ def test_measure_recovery_scales_reset_timeout_for_large_wal(
         before.writes)
 
 
+def test_measure_recovery_uses_replay_returned_state(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeServer:
+        base = "http://127.0.0.1:18080"
+        variant_dir = tmp_path
+
+        def restart(self):
+            pass
+
+    def fake_http_json(_base, _method, path, _body=None, timeout=60.0):
+        calls.append(path)
+        if path == "/v1/admin/recovery/reset":
+            return {"status": "ok"}
+        if path == "/v1/admin/replay":
+            return {
+                "status": "ok",
+                "scanned_entries": 3,
+                "recovery_time_ms": 1500,
+                "replay_throughput_events_s": 2,
+                "duplicate_objects": 0,
+                "state": {"objects": 4, "edges": 2, "latest_states": 1, "events": 3},
+            }
+        if path == "/v1/admin/runtime/state":
+            raise AssertionError("runtime state should come from replay response")
+        raise AssertionError(f"unexpected request path {path}")
+
+    monkeypatch.setattr(MODULE, "http_json", fake_http_json)
+    monkeypatch.setattr(MODULE, "query", lambda *args, **kwargs: {})
+
+    variant = MODULE.Variant("wal", "Full Plasmod", {"PLASMOD_RECOVERY_REPLAY": "true"})
+    before = MODULE.RunData(
+        writes=3,
+        event_ids={"e1", "e2", "e3"},
+        state_ids={"s1"},
+        edge_ids={"edge1", "edge2"},
+    )
+
+    row = MODULE.measure_recovery(FakeServer(), variant, before)
+
+    assert "/v1/admin/runtime/state" not in calls
+    assert row["Recovered Objects (%)"] == 100
+    assert row["Recovered Relations (%)"] == 100
+    assert row["Recovered Latest State (%)"] == 100
+
+
 def test_recovery_resume_uses_variant_checkpoints_without_restarting_servers(
         tmp_path, monkeypatch):
     baseline_row = {

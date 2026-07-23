@@ -1076,7 +1076,13 @@ def measure_recovery(server: PlasmodProcess, variant: Variant, before: RunData,
             raise RuntimeError(f"replay failed for {variant.name}: {error_holder[0]}")
         replay_response = result_holder
         replay_wall = float(result_holder.get("_wall", 0))
-    after = (http_json(server.base, "GET", "/v1/admin/runtime/state").get("state") or {})
+    after_state = replay_response.get("state") if isinstance(replay_response, dict) else None
+    if isinstance(after_state, dict):
+        after = after_state
+    else:
+        after = (http_json(
+            server.base, "GET", "/v1/admin/runtime/state",
+            timeout=recovery_replay_timeout_s(before.writes)).get("state") or {})
     row = {
         "System": "Plasmod", "Variant": output_variant or variant.name,
         "Event Log Size": int(replay_response.get("scanned_entries", 0)),
