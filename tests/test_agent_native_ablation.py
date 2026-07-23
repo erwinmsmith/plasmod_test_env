@@ -275,6 +275,11 @@ def test_metrics_only_disk_guard_stops_before_safety_floor(tmp_path, monkeypatch
         manager.ensure_capacity("test variant")
 
 
+def test_recovery_replay_timeout_scales_with_formal_full_workload():
+    assert MODULE.recovery_replay_timeout_s(8) == 300
+    assert MODULE.recovery_replay_timeout_s(641_979) >= 1_280
+
+
 def test_recovery_resume_uses_variant_checkpoints_without_restarting_servers(
         tmp_path, monkeypatch):
     baseline_row = {

@@ -39,6 +39,9 @@ DATA = ROOT / "data" / "layer2_dynamic_events"
 DEFAULT_BUCKET = "plasmod-experiments"
 EMBEDDING_CACHE_PATH = ROOT / "results" / "layer2_dynamic_events" / "embedding_cache.sqlite3"
 DEFAULT_PLASMOD_START_TIMEOUT_S = 300.0
+DEFAULT_RECOVERY_REPLAY_TIMEOUT_S = 300.0
+RECOVERY_REPLAY_TIMEOUT_GRACE_S = 60.0
+RECOVERY_REPLAY_TIMEOUT_EVENTS_PER_SECOND = 500.0
 
 CAPABILITY_ENV_FIELDS = {
     "PLASMOD_WAL_MODE": "wal_mode",
@@ -298,6 +301,14 @@ def plasmod_start_timeout_s() -> float:
             f"PLASMOD_ABLATION_PLASMOD_START_TIMEOUT_S must be positive, got {raw!r}"
         )
     return timeout_s
+
+
+def recovery_replay_timeout_s(event_count: int) -> float:
+    scaled_timeout = (
+        math.ceil(max(event_count, 0) / RECOVERY_REPLAY_TIMEOUT_EVENTS_PER_SECOND)
+        + RECOVERY_REPLAY_TIMEOUT_GRACE_S
+    )
+    return max(DEFAULT_RECOVERY_REPLAY_TIMEOUT_S, scaled_timeout)
 
 
 def text_from_event(event: dict[str, Any]) -> str:
@@ -1017,6 +1028,11 @@ def measure_recovery(server: PlasmodProcess, variant: Variant, before: RunData,
     replay_enabled = variant.env.get("PLASMOD_RECOVERY_REPLAY", "true").lower() in (
         "1", "true", "yes", "on")
     if replay_enabled:
+        replay_timeout_s = recovery_replay_timeout_s(before.writes)
+        log(
+            f"{variant.group}/{variant.name}: replaying {before.writes} WAL entries "
+            f"with timeout {replay_timeout_s:.0f}s"
+        )
         result_holder: dict[str, Any] = {}
         error_holder: list[BaseException] = []
 
@@ -1025,7 +1041,7 @@ def measure_recovery(server: PlasmodProcess, variant: Variant, before: RunData,
                 started = time.perf_counter()
                 result_holder.update(http_json(server.base, "POST", "/v1/admin/replay", {
                     "from_lsn": 0, "limit": 0, "apply": True, "confirm": "apply_replay",
-                }, timeout=300))
+                }, timeout=replay_timeout_s))
                 result_holder["_wall"] = time.perf_counter() - started
             except BaseException as exc:  # propagated below
                 error_holder.append(exc)
@@ -1040,9 +1056,11 @@ def measure_recovery(server: PlasmodProcess, variant: Variant, before: RunData,
             query_available = True
         except Exception:
             query_available = False
-        thread.join(300)
+        thread.join(replay_timeout_s)
         if thread.is_alive():
-            raise RuntimeError(f"replay timed out for {variant.name}")
+            raise RuntimeError(
+                f"replay timed out for {variant.name} after {replay_timeout_s:.0f}s"
+            )
         if error_holder:
             raise RuntimeError(f"replay failed for {variant.name}: {error_holder[0]}")
         replay_response = result_holder
