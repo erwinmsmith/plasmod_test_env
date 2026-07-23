@@ -311,6 +311,10 @@ def recovery_replay_timeout_s(event_count: int) -> float:
     return max(DEFAULT_RECOVERY_REPLAY_TIMEOUT_S, scaled_timeout)
 
 
+def recovery_reset_timeout_s(event_count: int) -> float:
+    return recovery_replay_timeout_s(event_count)
+
+
 def text_from_event(event: dict[str, Any]) -> str:
     retrieval = event.get("retrieval") or {}
     if retrieval.get("index_text"):
@@ -1021,7 +1025,14 @@ def recovery_variants() -> list[Variant]:
 def measure_recovery(server: PlasmodProcess, variant: Variant, before: RunData,
                      output_variant: str | None = None) -> dict[str, Any]:
     server.restart()
-    http_json(server.base, "POST", "/v1/admin/recovery/reset", {"confirm": "reset_materialized"})
+    reset_timeout_s = recovery_reset_timeout_s(before.writes)
+    log(
+        f"{variant.group}/{variant.name}: resetting materialized state for "
+        f"{before.writes} WAL entries with timeout {reset_timeout_s:.0f}s"
+    )
+    http_json(
+        server.base, "POST", "/v1/admin/recovery/reset",
+        {"confirm": "reset_materialized"}, timeout=reset_timeout_s)
     replay_response: dict[str, Any] = {}
     query_available = False
     replay_wall = 0.0

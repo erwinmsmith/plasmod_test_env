@@ -280,6 +280,35 @@ def test_recovery_replay_timeout_scales_with_formal_full_workload():
     assert MODULE.recovery_replay_timeout_s(641_979) >= 6_480
 
 
+def test_measure_recovery_scales_reset_timeout_for_large_wal(
+        tmp_path, monkeypatch):
+    captured_timeouts = {}
+
+    class FakeServer:
+        base = "http://127.0.0.1:18080"
+        variant_dir = tmp_path
+
+        def restart(self):
+            pass
+
+    def fake_http_json(_base, _method, path, _body=None, timeout=60.0):
+        captured_timeouts[path] = timeout
+        if path == "/v1/admin/recovery/reset":
+            return {"status": "ok"}
+        if path == "/v1/admin/runtime/state":
+            return {"state": {"objects": 0, "edges": 0, "latest_states": 0, "events": 0}}
+        raise AssertionError(f"unexpected request path {path}")
+
+    monkeypatch.setattr(MODULE, "http_json", fake_http_json)
+    variant = MODULE.Variant("wal", "No-WAL", {"PLASMOD_RECOVERY_REPLAY": "false"})
+    before = MODULE.RunData(writes=641_979)
+
+    MODULE.measure_recovery(FakeServer(), variant, before)
+
+    assert captured_timeouts["/v1/admin/recovery/reset"] >= MODULE.recovery_replay_timeout_s(
+        before.writes)
+
+
 def test_recovery_resume_uses_variant_checkpoints_without_restarting_servers(
         tmp_path, monkeypatch):
     baseline_row = {
