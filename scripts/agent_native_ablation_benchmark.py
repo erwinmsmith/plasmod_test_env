@@ -666,7 +666,7 @@ class PlasmodProcess:
             "PLASMOD_EMBEDDER_DIM": "384",
             "PLASMOD_FLUSH_INTERVAL": "0",
             "PLASMOD_CONSISTENCY_DEFAULT_MODE": "strict",
-            "PLASMOD_CONSISTENCY_CHECKPOINT_FLUSH_INTERVAL": "0",
+            "PLASMOD_CONSISTENCY_CHECKPOINT_FLUSH_INTERVAL": "50ms",
             "PLASMOD_HOT_CACHE_SIZE": str(self.variant.hot_size),
             "S3_ENDPOINT": "127.0.0.1:9000",
             "S3_ACCESS_KEY": "minioadmin",

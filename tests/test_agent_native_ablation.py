@@ -413,6 +413,45 @@ def test_plasmod_start_allows_large_data_restart_to_become_healthy(tmp_path, mon
     assert now >= 60.0
 
 
+def test_plasmod_start_keeps_checkpoint_buffering_enabled(tmp_path, monkeypatch):
+    class FakeProcess:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+    captured_env = {}
+
+    def fake_popen(*args, **kwargs):
+        captured_env.update(kwargs["env"])
+        return FakeProcess()
+
+    def fake_http_json(_base, _method, path, _body=None, timeout=60.0):
+        if path == "/healthz":
+            return {"status": "ok"}
+        if path == "/v1/admin/capabilities":
+            return {"capabilities": {
+                "wal_mode": "file",
+                "recovery_replay": True,
+                "recovery_projection": "full",
+                "materialization_profile": "full",
+                "evidence_profile": "full",
+                "governance_profile": "full",
+                "tier_profile": "full",
+                "hot_cache_size": 2000,
+            }}
+        raise AssertionError(f"unexpected request path {path}")
+
+    monkeypatch.setattr(MODULE.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(MODULE, "http_json", fake_http_json)
+
+    process = MODULE.PlasmodProcess(MODULE.shared_full_variant(), tmp_path, 18080)
+
+    process.start(fresh=True)
+
+    assert captured_env["PLASMOD_CONSISTENCY_CHECKPOINT_FLUSH_INTERVAL"] == "50ms"
+
+
 def test_governance_events_use_independent_sessions():
     private = MODULE.governance_event("private", "e1", "agent-a", "private")
     shared = MODULE.governance_event("shared", "e2", "agent-a", "restricted_shared")
