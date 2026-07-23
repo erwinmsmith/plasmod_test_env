@@ -5,9 +5,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CORE="${ROOT}/../Plasmod"
 MODE="${1:-smoke}"
 PORT=18080
+RETENTION="full"
 
 if [[ "${MODE}" != "smoke" && "${MODE}" != "full" ]]; then
-  echo "usage: $0 {smoke|full} [--port PORT]" >&2
+  echo "usage: $0 {smoke|full} [--port PORT] [--retention full|metrics-only]" >&2
   exit 2
 fi
 shift || true
@@ -19,6 +20,11 @@ while [[ $# -gt 0 ]]; do
       PORT="$2"
       shift 2
       ;;
+    --retention)
+      [[ $# -ge 2 ]] || { echo "--retention requires a value" >&2; exit 2; }
+      RETENTION="$2"
+      shift 2
+      ;;
     *)
       echo "unknown argument: $1" >&2
       exit 2
@@ -28,6 +34,10 @@ done
 
 if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
   echo "invalid port: ${PORT}" >&2
+  exit 2
+fi
+if [[ "${RETENTION}" != "full" && "${RETENTION}" != "metrics-only" ]]; then
+  echo "invalid retention mode: ${RETENTION}" >&2
   exit 2
 fi
 
@@ -75,6 +85,7 @@ echo "  mode:             ${MODE}"
 echo "  experiment repo:  ${ROOT}"
 echo "  core repo:        ${CORE}"
 echo "  Plasmod port:     ${PORT}"
+echo "  retention:        ${RETENTION}"
 echo
 
 for command in git python3 go cmake c++ make curl minio mc ps; do
@@ -222,15 +233,17 @@ done
 
 free_kb="$(df -Pk "${ROOT}" | awk 'NR == 2 {print $4}')"
 free_gb=$((free_kb / 1024 / 1024))
-if [[ "${MODE}" == "full" ]]; then
+if [[ "${MODE}" == "full" && "${RETENTION}" == "metrics-only" ]]; then
+  minimum_free_gb="${PLASMOD_ABLATION_MIN_FREE_GB:-40}"
+elif [[ "${MODE}" == "full" ]]; then
   minimum_free_gb="${PLASMOD_ABLATION_MIN_FREE_GB:-250}"
 else
   minimum_free_gb="${PLASMOD_ABLATION_MIN_FREE_GB:-10}"
 fi
 if (( free_gb >= minimum_free_gb )); then
-  pass "free disk ${free_gb} GB >= ${minimum_free_gb} GB required for ${MODE}"
+  pass "free disk ${free_gb} GB >= ${minimum_free_gb} GB required for ${MODE} (${RETENTION})"
 else
-  fail "free disk ${free_gb} GB < ${minimum_free_gb} GB required for ${MODE}"
+  fail "free disk ${free_gb} GB < ${minimum_free_gb} GB required for ${MODE} (${RETENTION})"
 fi
 
 cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 0)"

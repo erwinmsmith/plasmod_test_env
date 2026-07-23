@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from collections import namedtuple
 
 import pytest
 
@@ -35,6 +36,21 @@ def test_smoke_launcher_supports_empty_default_arguments_under_nounset(tmp_path)
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_preflight_accepts_only_declared_retention_modes():
+    preflight = SCRIPT.with_name("preflight_agent_native_ablation.sh")
+    completed = subprocess.run(
+        ["/bin/bash", str(preflight), "full", "--retention", "discard-everything"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "invalid retention mode" in completed.stderr
+    source = preflight.read_text(encoding="utf-8")
+    assert 'PLASMOD_ABLATION_MIN_FREE_GB:-40' in source
+    assert 'PLASMOD_ABLATION_MIN_FREE_GB:-250' in source
 
 
 def test_percentile_and_hash_vector_are_deterministic():
@@ -138,6 +154,147 @@ def test_shared_full_baseline_round_trips_resume_state(tmp_path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema_version"] == "shared-full-baseline-v1"
     assert payload["state_ids"] == ["state-1", "state-2"]
+
+
+def test_metrics_only_retention_checkpoints_before_removing_variant_data(tmp_path, monkeypatch):
+    variant = MODULE.Variant("wal", "No-WAL")
+    variant_dir = tmp_path / "variants" / variant.slug
+    data_dir = variant_dir / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "badger.data").write_bytes(b"database-bytes")
+    for name in (
+        "capabilities.json", "measurements.json", "common_metrics.json",
+        "server.log", "recovery.json",
+    ):
+        (variant_dir / name).write_text("{}", encoding="utf-8")
+    manager = MODULE.RetentionManager(tmp_path, "metrics-only", disk_floor_gb=10)
+    deleted_prefixes = []
+    monkeypatch.setattr(manager, "_delete_s3_prefix", deleted_prefixes.append)
+    fields = ["System", "Variant", "Metric"]
+    row = {"System": "Plasmod", "Variant": "No-WAL", "Metric": 1.5}
+
+    manager.record_variant(variant, "wal", fields, row)
+
+    assert not data_dir.exists()
+    assert (variant_dir / "result_checkpoint.json").exists()
+    assert (variant_dir / "METRICS_RETAINED").exists()
+    assert (variant_dir / "common_metrics.json").exists()
+    assert deleted_prefixes == [variant]
+    assert manager.load_variant_row(variant, "wal", fields) == row
+
+
+def test_full_retention_keeps_variant_data_while_writing_checkpoint(tmp_path, monkeypatch):
+    variant = MODULE.Variant("tier", "No-hot-cache")
+    data_dir = tmp_path / "variants" / variant.slug / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "warm.db").write_bytes(b"warm-tier")
+    manager = MODULE.RetentionManager(tmp_path, "full", disk_floor_gb=10)
+    monkeypatch.setattr(manager, "_delete_s3_prefix", lambda _variant: pytest.fail("unexpected S3 cleanup"))
+    fields = ["System", "Variant", "Metric"]
+    row = {"System": "Plasmod", "Variant": "No-hot-cache", "Metric": 2.0}
+
+    manager.record_variant(variant, "tier", fields, row)
+
+    assert data_dir.exists()
+    assert (data_dir.parent / "result_checkpoint.json").exists()
+    assert not (data_dir.parent / "METRICS_RETAINED").exists()
+
+
+def test_metrics_only_refuses_cleanup_when_metric_artifact_is_missing(
+        tmp_path, monkeypatch):
+    variant = MODULE.Variant("evidence", "No-proof-trace")
+    variant_dir = tmp_path / "variants" / variant.slug
+    data_dir = variant_dir / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "badger.data").write_bytes(b"database-bytes")
+    for name in ("capabilities.json", "measurements.json", "server.log"):
+        (variant_dir / name).write_text("{}", encoding="utf-8")
+    manager = MODULE.RetentionManager(tmp_path, "metrics-only")
+    monkeypatch.setattr(
+        manager,
+        "_delete_s3_prefix",
+        lambda _variant: pytest.fail("cleanup must not start"),
+    )
+    fields = ["System", "Variant", "Metric"]
+    row = {"System": "Plasmod", "Variant": variant.name, "Metric": 2.5}
+
+    with pytest.raises(RuntimeError, match="missing retained metric artifacts"):
+        manager.record_variant(variant, "evidence", fields, row)
+
+    assert data_dir.exists()
+    assert (variant_dir / "result_checkpoint.json").exists()
+    assert not (variant_dir / "METRICS_RETAINED").exists()
+
+
+def test_retention_reclaimed_bytes_uses_allocated_size_for_sparse_files(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    sparse = data_dir / "sparse.data"
+    with sparse.open("wb") as handle:
+        handle.seek(1024**3)
+        handle.write(b"x")
+    allocated = sparse.stat().st_blocks * 512
+
+    assert MODULE.RetentionManager._directory_size(data_dir) == allocated
+    assert allocated < sparse.stat().st_size
+
+
+def test_metrics_only_disk_guard_stops_before_safety_floor(tmp_path, monkeypatch):
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(
+        MODULE.shutil,
+        "disk_usage",
+        lambda _path: usage(100 * 1024**3, 91 * 1024**3, 9 * 1024**3),
+    )
+    manager = MODULE.RetentionManager(tmp_path, "metrics-only", disk_floor_gb=10)
+
+    with pytest.raises(RuntimeError, match="disk safety floor"):
+        manager.ensure_capacity("test variant")
+
+
+def test_recovery_resume_uses_variant_checkpoints_without_restarting_servers(
+        tmp_path, monkeypatch):
+    baseline_row = {
+        field: (
+            "Plasmod" if field == "System"
+            else "Full Plasmod" if field == "Variant"
+            else "yes" if field == "Query Available During Recovery"
+            else 1
+        )
+        for field in MODULE.WAL_FIELDS
+    }
+    baseline = MODULE.SharedFullBaseline(
+        module_rows={"wal": baseline_row},
+        materialization_type_counts={},
+        state_ids=set(),
+        artifact_ids=set(),
+        contexts={},
+        evidence_totals=(0, 0, 0, 0),
+        governance_measurement={},
+    )
+    manager = MODULE.RetentionManager(tmp_path, "full")
+    expected = [baseline_row]
+    for variant in MODULE.recovery_variants()[1:]:
+        row = {
+            field: (
+                "Plasmod" if field == "System"
+                else variant.name if field == "Variant"
+                else "yes" if field == "Query Available During Recovery"
+                else 2
+            )
+            for field in MODULE.WAL_FIELDS
+        }
+        manager.record_variant(variant, "wal", MODULE.WAL_FIELDS, row)
+        expected.append(row)
+
+    monkeypatch.setattr(
+        MODULE,
+        "PlasmodProcess",
+        lambda *_args, **_kwargs: pytest.fail("checkpointed variant was restarted"),
+    )
+
+    assert MODULE.run_recovery(
+        tmp_path, 18080, 8, 3, baseline, manager) == expected
 
 
 def test_master_table_has_common_metrics_and_explicit_not_applicable_cells(tmp_path):

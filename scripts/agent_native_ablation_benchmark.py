@@ -202,16 +202,31 @@ def require_number(value: Any, name: str) -> float:
     return number
 
 
+def validate_result_row(fields: list[str], row: dict[str, Any], source: str) -> None:
+    missing = [field for field in fields if field not in row or row[field] in (None, "")]
+    if missing:
+        raise RuntimeError(f"{source} missing fields: {missing}")
+    unexpected = [field for field in row if field not in fields]
+    if unexpected:
+        raise RuntimeError(f"{source} has unexpected fields: {unexpected}")
+    for field, value in row.items():
+        if field not in ("System", "Variant", "Query Available During Recovery") and not isinstance(value, str):
+            require_number(value, f"{source}:{field}")
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def write_csv(path: Path, fields: list[str], rows: list[dict[str, Any]]) -> None:
     if not rows:
         raise RuntimeError(f"refusing to write empty result table {path.name}")
     for row_no, row in enumerate(rows, 1):
-        missing = [field for field in fields if field not in row or row[field] in (None, "")]
-        if missing:
-            raise RuntimeError(f"{path.name} row {row_no} missing fields: {missing}")
-        for field, value in row.items():
-            if field not in ("System", "Variant", "Query Available During Recovery") and not isinstance(value, str):
-                require_number(value, f"{path.name}:{row_no}:{field}")
+        validate_result_row(fields, row, f"{path.name} row {row_no}")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -373,6 +388,159 @@ class Variant:
     def slug(self) -> str:
         raw = f"{self.group}-{self.name}".lower()
         return "".join(char if char.isalnum() else "-" for char in raw).strip("-")
+
+
+class RetentionManager:
+    VALID_MODES = {"full", "metrics-only"}
+
+    def __init__(self, run_dir: Path, mode: str, disk_floor_gb: float = 10):
+        if mode not in self.VALID_MODES:
+            raise ValueError(f"unsupported retention mode: {mode}")
+        if disk_floor_gb <= 0:
+            raise ValueError("disk_floor_gb must be positive")
+        self.run_dir = run_dir
+        self.mode = mode
+        self.disk_floor_gb = float(disk_floor_gb)
+
+    def ensure_capacity(self, stage: str) -> None:
+        if self.mode != "metrics-only":
+            return
+        free_bytes = shutil.disk_usage(self.run_dir).free
+        floor_bytes = int(self.disk_floor_gb * 1024**3)
+        if free_bytes < floor_bytes:
+            raise RuntimeError(
+                f"disk safety floor breached during {stage}: "
+                f"{free_bytes / 1024**3:.2f} GB free < {self.disk_floor_gb:g} GB")
+
+    def record_variant(self, variant: Variant, module: str, fields: list[str],
+                       row: dict[str, Any]) -> None:
+        validate_result_row(fields, row, f"{variant.slug} checkpoint")
+        variant_dir = self._variant_dir(variant)
+        checkpoint = {
+            "schema_version": "variant-result-checkpoint-v1",
+            "module": module,
+            "variant_slug": variant.slug,
+            "variant_name": variant.name,
+            "fields": fields,
+            "row": row,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        atomic_write_json(variant_dir / "result_checkpoint.json", checkpoint)
+        if self.mode == "metrics-only":
+            self.cleanup_variant(
+                variant, self._required_metric_files(module))
+
+    def load_variant_row(self, variant: Variant, module: str,
+                         fields: list[str]) -> dict[str, Any] | None:
+        path = self._variant_dir(variant) / "result_checkpoint.json"
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != "variant-result-checkpoint-v1":
+            raise RuntimeError(f"unsupported checkpoint schema in {path}")
+        if payload.get("module") != module or payload.get("variant_slug") != variant.slug:
+            raise RuntimeError(f"checkpoint identity mismatch in {path}")
+        if payload.get("fields") != fields:
+            raise RuntimeError(f"checkpoint fields mismatch in {path}")
+        row = payload.get("row")
+        if not isinstance(row, dict):
+            raise RuntimeError(f"checkpoint row is invalid in {path}")
+        validate_result_row(fields, row, f"{variant.slug} checkpoint")
+        if self.mode == "metrics-only":
+            self.cleanup_variant(
+                variant, self._required_metric_files(module))
+        return row
+
+    def cleanup_variant(self, variant: Variant,
+                        required_files: Iterable[str] = ()) -> None:
+        if self.mode != "metrics-only":
+            return
+        variant_dir = self._variant_dir(variant)
+        data_dir = variant_dir / "data"
+        marker = variant_dir / "METRICS_RETAINED"
+        if marker.exists() and not data_dir.exists():
+            return
+        missing = [
+            name for name in required_files
+            if not (variant_dir / name).is_file()
+        ]
+        if missing:
+            raise RuntimeError(
+                f"{variant.slug} missing retained metric artifacts: {missing}")
+        reclaimed_bytes = self._directory_size(data_dir)
+        if data_dir.exists():
+            shutil.rmtree(data_dir)
+        self._delete_s3_prefix(variant)
+        atomic_write_json(marker, {
+            "status": "metrics-retained",
+            "variant_slug": variant.slug,
+            "local_data_removed": True,
+            "s3_prefix_removed": True,
+            "reclaimed_local_bytes": reclaimed_bytes,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    def summary(self) -> dict[str, Any]:
+        markers = list((self.run_dir / "variants").glob("*/METRICS_RETAINED"))
+        reclaimed_bytes = 0
+        for marker in markers:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            reclaimed_bytes += int(payload.get("reclaimed_local_bytes", 0))
+        return {
+            "retention_mode": self.mode,
+            "retained_variant_count": len(markers),
+            "reclaimed_local_bytes": reclaimed_bytes,
+            "disk_floor_gb": self.disk_floor_gb,
+        }
+
+    def _variant_dir(self, variant: Variant) -> Path:
+        return self.run_dir / "variants" / variant.slug
+
+    @staticmethod
+    def _required_metric_files(module: str) -> tuple[str, ...]:
+        common = (
+            "capabilities.json",
+            "measurements.json",
+            "common_metrics.json",
+            "server.log",
+        )
+        module_files = {
+            "wal": ("recovery.json",),
+            "governance": ("governance_measurement.json",),
+        }
+        return common + module_files.get(module, ())
+
+    @staticmethod
+    def _directory_size(path: Path) -> int:
+        if not path.exists():
+            return 0
+        allocated_bytes = 0
+        for item in path.rglob("*"):
+            if not item.is_file():
+                continue
+            stat = item.stat()
+            allocated_bytes += (
+                stat.st_blocks * 512
+                if hasattr(stat, "st_blocks")
+                else stat.st_size
+            )
+        return allocated_bytes
+
+    def _delete_s3_prefix(self, variant: Variant) -> None:
+        mc = shutil.which("mc")
+        if not mc:
+            raise RuntimeError("MinIO client 'mc' is required for metrics-only cleanup")
+        target = (
+            f"plasmod-ablation/{DEFAULT_BUCKET}/agent-native-ablation/"
+            f"{self.run_dir.name}/{variant.slug}"
+        )
+        completed = subprocess.run(
+            [mc, "rm", "--recursive", "--force", target],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"failed to remove MinIO prefix for {variant.slug}: "
+                f"{completed.stderr.strip()}")
 
 
 class MinioManager:
@@ -582,8 +750,7 @@ class SharedFullBaseline:
             "evidence_totals": list(self.evidence_totals),
             "governance_measurement": self.governance_measurement,
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(path, payload)
 
     @classmethod
     def read(cls, path: Path) -> "SharedFullBaseline":
@@ -669,9 +836,12 @@ def query(base: str, text: str, vector: list[float], target_ids: list[str] | Non
 
 
 def ingest_workload(server: PlasmodProcess, variant: Variant, event_limit: int,
-                    query_limit: int) -> RunData:
+                    query_limit: int,
+                    retention: RetentionManager | None = None) -> RunData:
     data = RunData()
     latest_by_scope: dict[tuple[str, str, str], tuple[str, list[float], str, str, str, str]] = {}
+    if retention is not None:
+        retention.ensure_capacity(f"{variant.slug} ingest start")
     started_all = time.perf_counter()
     for ordinal, source in enumerate(iter_events(event_limit), 1):
         event, text, vector = prepare_event(source, ordinal, variant.group)
@@ -716,6 +886,8 @@ def ingest_workload(server: PlasmodProcess, variant: Variant, event_limit: int,
         scope_key = (requester, workspace, session)
         latest_by_scope.pop(scope_key, None)
         latest_by_scope[scope_key] = (text, vector, target, requester, workspace, session)
+        if retention is not None and ordinal % 100 == 0:
+            retention.ensure_capacity(f"{variant.slug} ingest event {ordinal}")
         if ordinal == 1 or ordinal % 1000 == 0:
             log(f"{variant.group}/{variant.name}: ingested {ordinal}")
     data.wall_seconds = time.perf_counter() - started_all
@@ -758,14 +930,18 @@ def ingest_workload(server: PlasmodProcess, variant: Variant, event_limit: int,
     (server.variant_dir / "measurements.json").write_text(
         json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
     write_common_metrics(server, variant, data)
+    if retention is not None:
+        retention.ensure_capacity(f"{variant.slug} measurement complete")
     return data
 
 
-def run_once(variant: Variant, run_dir: Path, port: int, event_limit: int, query_limit: int) -> RunData:
+def run_once(variant: Variant, run_dir: Path, port: int, event_limit: int,
+             query_limit: int, retention: RetentionManager | None = None) -> RunData:
     server = PlasmodProcess(variant, run_dir, port)
     try:
         server.start(fresh=True)
-        return ingest_workload(server, variant, event_limit, query_limit)
+        return ingest_workload(
+            server, variant, event_limit, query_limit, retention)
     finally:
         server.stop()
 
@@ -846,17 +1022,30 @@ def measure_recovery(server: PlasmodProcess, variant: Variant, before: RunData,
 
 
 def run_recovery(run_dir: Path, port: int, event_limit: int, query_limit: int,
-                 baseline: SharedFullBaseline) -> list[dict[str, Any]]:
+                 baseline: SharedFullBaseline,
+                 retention: RetentionManager) -> list[dict[str, Any]]:
     rows = [baseline.module_rows["wal"]]
     for variant in recovery_variants()[1:]:
+        checkpoint = retention.load_variant_row(variant, "wal", WAL_FIELDS)
+        if checkpoint is not None:
+            log(f"reusing checkpointed WAL variant: {variant.name}")
+            rows.append(checkpoint)
+            continue
         log(f"starting WAL variant: {variant.name}")
+        retention.ensure_capacity(f"{variant.slug} start")
         server = PlasmodProcess(variant, run_dir, port)
+        row: dict[str, Any] | None = None
         try:
             server.start(fresh=True)
-            before = ingest_workload(server, variant, event_limit, query_limit)
-            rows.append(measure_recovery(server, variant, before))
+            before = ingest_workload(
+                server, variant, event_limit, query_limit, retention)
+            row = measure_recovery(server, variant, before)
         finally:
             server.stop()
+        if row is None:
+            raise RuntimeError(f"{variant.name} did not produce a WAL result")
+        retention.record_variant(variant, "wal", WAL_FIELDS, row)
+        rows.append(row)
     return rows
 
 
@@ -925,17 +1114,33 @@ def measure_materialization(server: PlasmodProcess, variant: Variant, data: RunD
 
 
 def run_materialization(run_dir: Path, port: int, event_limit: int, query_limit: int,
-                        baseline: SharedFullBaseline) -> list[dict[str, Any]]:
+                        baseline: SharedFullBaseline,
+                        retention: RetentionManager) -> list[dict[str, Any]]:
     rows = [baseline.module_rows["materialization"]]
     for variant in materialization_variants()[1:]:
+        checkpoint = retention.load_variant_row(
+            variant, "materialization", MATERIALIZATION_FIELDS)
+        if checkpoint is not None:
+            log(f"reusing checkpointed materialization variant: {variant.name}")
+            rows.append(checkpoint)
+            continue
         log(f"starting materialization variant: {variant.name}")
+        retention.ensure_capacity(f"{variant.slug} start")
         server = PlasmodProcess(variant, run_dir, port)
+        row: dict[str, Any] | None = None
         try:
             server.start(fresh=True)
-            data = ingest_workload(server, variant, event_limit, query_limit)
-            rows.append(measure_materialization(server, variant, data, baseline))
+            data = ingest_workload(
+                server, variant, event_limit, query_limit, retention)
+            row = measure_materialization(server, variant, data, baseline)
         finally:
             server.stop()
+        if row is None:
+            raise RuntimeError(
+                f"{variant.name} did not produce a materialization result")
+        retention.record_variant(
+            variant, "materialization", MATERIALIZATION_FIELDS, row)
+        rows.append(row)
     return rows
 
 
@@ -979,12 +1184,23 @@ def measure_evidence(variant: Variant, data: RunData,
 
 
 def run_evidence(run_dir: Path, port: int, event_limit: int, query_limit: int,
-                 baseline: SharedFullBaseline) -> list[dict[str, Any]]:
+                 baseline: SharedFullBaseline,
+                 retention: RetentionManager) -> list[dict[str, Any]]:
     rows = [baseline.module_rows["evidence"]]
     for variant in evidence_variants()[1:]:
+        checkpoint = retention.load_variant_row(
+            variant, "evidence", EVIDENCE_FIELDS)
+        if checkpoint is not None:
+            log(f"reusing checkpointed evidence variant: {variant.name}")
+            rows.append(checkpoint)
+            continue
         log(f"starting evidence variant: {variant.name}")
-        data = run_once(variant, run_dir, port, event_limit, query_limit)
-        rows.append(measure_evidence(variant, data, baseline.evidence_totals))
+        retention.ensure_capacity(f"{variant.slug} start")
+        data = run_once(
+            variant, run_dir, port, event_limit, query_limit, retention)
+        row = measure_evidence(variant, data, baseline.evidence_totals)
+        retention.record_variant(variant, "evidence", EVIDENCE_FIELDS, row)
+        rows.append(row)
     return rows
 
 
@@ -1088,25 +1304,77 @@ def governance_row(variant_name: str, value: dict[str, Any],
 
 
 def run_governance(run_dir: Path, port: int, event_limit: int,
-                   query_limit: int, baseline: SharedFullBaseline) -> list[dict[str, Any]]:
-    measured: list[tuple[Variant, dict[str, Any]]] = []
-    for variant in governance_variants()[1:]:
-        log(f"starting governance variant: {variant.name}")
-        server = PlasmodProcess(variant, run_dir, port)
+                   query_limit: int, baseline: SharedFullBaseline,
+                   retention: RetentionManager) -> list[dict[str, Any]]:
+    variants = governance_variants()[1:]
+    no_access_variant = variants[0]
+    no_access_measurement_path = (
+        run_dir / "variants" / no_access_variant.slug / "governance_measurement.json")
+    no_access_row = retention.load_variant_row(
+        no_access_variant, "governance", GOVERNANCE_FIELDS)
+    if no_access_row is not None:
+        if not no_access_measurement_path.exists():
+            raise RuntimeError(
+                f"missing governance measurement for checkpointed {no_access_variant.name}")
+        no_access_measurement = json.loads(
+            no_access_measurement_path.read_text(encoding="utf-8"))
+        log(f"reusing checkpointed governance variant: {no_access_variant.name}")
+    else:
+        log(f"starting governance variant: {no_access_variant.name}")
+        retention.ensure_capacity(f"{no_access_variant.slug} start")
+        server = PlasmodProcess(no_access_variant, run_dir, port)
         try:
             server.start(fresh=True)
-            # Every ablation first runs the same agent-native workload. The
-            # governance probes below remain module-specific and do not replace
-            # the common performance/freshness measurements.
-            ingest_workload(server, variant, event_limit, query_limit)
-            measured.append((variant, measure_governance(server, variant)))
+            ingest_workload(
+                server, no_access_variant, event_limit, query_limit, retention)
+            no_access_measurement = measure_governance(server, no_access_variant)
+            atomic_write_json(no_access_measurement_path, no_access_measurement)
         finally:
             server.stop()
-    no_access_latency = next(value["query_latency"] for variant, value in measured if variant.name == "No-access-policy")
-    return [
-        governance_row("Full Plasmod", baseline.governance_measurement, no_access_latency),
-        *(governance_row(variant.name, value, no_access_latency) for variant, value in measured),
+        no_access_row = governance_row(
+            no_access_variant.name,
+            no_access_measurement,
+            float(no_access_measurement["query_latency"]),
+        )
+        retention.record_variant(
+            no_access_variant, "governance", GOVERNANCE_FIELDS, no_access_row)
+
+    no_access_latency = float(no_access_measurement["query_latency"])
+    rows = [
+        governance_row(
+            "Full Plasmod", baseline.governance_measurement, no_access_latency),
+        no_access_row,
     ]
+    for variant in variants[1:]:
+        checkpoint = retention.load_variant_row(
+            variant, "governance", GOVERNANCE_FIELDS)
+        if checkpoint is not None:
+            log(f"reusing checkpointed governance variant: {variant.name}")
+            rows.append(checkpoint)
+            continue
+        log(f"starting governance variant: {variant.name}")
+        retention.ensure_capacity(f"{variant.slug} start")
+        server = PlasmodProcess(variant, run_dir, port)
+        measurement: dict[str, Any] | None = None
+        try:
+            server.start(fresh=True)
+            ingest_workload(
+                server, variant, event_limit, query_limit, retention)
+            measurement = measure_governance(server, variant)
+            atomic_write_json(
+                run_dir / "variants" / variant.slug / "governance_measurement.json",
+                measurement,
+            )
+        finally:
+            server.stop()
+        if measurement is None:
+            raise RuntimeError(
+                f"{variant.name} did not produce a governance measurement")
+        row = governance_row(variant.name, measurement, no_access_latency)
+        retention.record_variant(
+            variant, "governance", GOVERNANCE_FIELDS, row)
+        rows.append(row)
+    return rows
 
 
 def tier_variants() -> list[Variant]:
@@ -1167,17 +1435,30 @@ def measure_tier(server: PlasmodProcess, variant: Variant, data: RunData,
 
 
 def run_tier(run_dir: Path, port: int, event_limit: int, query_limit: int,
-             baseline: SharedFullBaseline) -> list[dict[str, Any]]:
+             baseline: SharedFullBaseline,
+             retention: RetentionManager) -> list[dict[str, Any]]:
     rows = [baseline.module_rows["tier"]]
     for variant in tier_variants()[1:]:
+        checkpoint = retention.load_variant_row(variant, "tier", TIER_FIELDS)
+        if checkpoint is not None:
+            log(f"reusing checkpointed tier variant: {variant.name}")
+            rows.append(checkpoint)
+            continue
         log(f"starting tier variant: {variant.name}")
+        retention.ensure_capacity(f"{variant.slug} start")
         server = PlasmodProcess(variant, run_dir, port)
+        row: dict[str, Any] | None = None
         try:
             server.start(fresh=True)
-            data = ingest_workload(server, variant, event_limit, query_limit)
-            rows.append(measure_tier(server, variant, data))
+            data = ingest_workload(
+                server, variant, event_limit, query_limit, retention)
+            row = measure_tier(server, variant, data)
         finally:
             server.stop()
+        if row is None:
+            raise RuntimeError(f"{variant.name} did not produce a tier result")
+        retention.record_variant(variant, "tier", TIER_FIELDS, row)
+        rows.append(row)
     return rows
 
 
@@ -1224,13 +1505,17 @@ def shared_full_baseline_path(run_dir: Path) -> Path:
 
 
 def run_shared_full_baseline(run_dir: Path, port: int, event_limit: int,
-                             query_limit: int) -> SharedFullBaseline:
+                             query_limit: int,
+                             retention: RetentionManager) -> SharedFullBaseline:
     variant = shared_full_variant()
     log("starting shared Full Plasmod baseline")
+    retention.ensure_capacity(f"{variant.slug} start")
     server = PlasmodProcess(variant, run_dir, port)
+    baseline: SharedFullBaseline | None = None
     try:
         server.start(fresh=True)
-        data = ingest_workload(server, variant, event_limit, query_limit)
+        data = ingest_workload(
+            server, variant, event_limit, query_limit, retention)
         reference_ids = data.state_ids | data.artifact_ids
         baseline = SharedFullBaseline(
             module_rows={},
@@ -1254,19 +1539,39 @@ def run_shared_full_baseline(run_dir: Path, port: int, event_limit: int,
             server, variant, data, "Full Tiering")
         baseline.governance_measurement = measure_governance(server, variant)
         baseline.write(shared_full_baseline_path(run_dir))
-        return baseline
     finally:
         server.stop()
+    if baseline is None:
+        raise RuntimeError("shared Full Plasmod did not produce a baseline")
+    SharedFullBaseline.read(shared_full_baseline_path(run_dir))
+    retention.cleanup_variant(variant, (
+        "capabilities.json",
+        "measurements.json",
+        "common_metrics.json",
+        "server.log",
+        "shared_full_baseline.json",
+    ))
+    return baseline
 
 
 def load_or_run_shared_full_baseline(run_dir: Path, port: int, event_limit: int,
-                                     query_limit: int, resume: bool) -> SharedFullBaseline:
+                                     query_limit: int, resume: bool,
+                                     retention: RetentionManager) -> SharedFullBaseline:
     path = shared_full_baseline_path(run_dir)
     common_path = run_dir / "variants" / shared_full_variant().slug / "common_metrics.json"
     if resume and path.exists() and common_path.exists():
         log("reusing completed shared Full Plasmod baseline")
-        return SharedFullBaseline.read(path)
-    return run_shared_full_baseline(run_dir, port, event_limit, query_limit)
+        baseline = SharedFullBaseline.read(path)
+        retention.cleanup_variant(shared_full_variant(), (
+            "capabilities.json",
+            "measurements.json",
+            "common_metrics.json",
+            "server.log",
+            "shared_full_baseline.json",
+        ))
+        return baseline
+    return run_shared_full_baseline(
+        run_dir, port, event_limit, query_limit, retention)
 
 
 def variant_configuration(variant: Variant) -> dict[str, Any]:
@@ -1386,7 +1691,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--resume", action="store_true",
-                        help="reuse completed CSV groups in an existing run directory")
+                        help="reuse completed variant checkpoints and CSV groups")
+    parser.add_argument(
+        "--retention", choices=("full", "metrics-only"), default="full",
+        help="retain all database data or checkpoint metrics and remove per-variant data")
+    parser.add_argument(
+        "--disk-floor-gb", type=float, default=10,
+        help="abort metrics-only ingestion before free disk drops below this value")
     return parser.parse_args()
 
 
@@ -1407,10 +1718,15 @@ def main() -> int:
     run_id = args.run_id or f"agent_native_ablation_{args.mode}_{utc_id()}"
     run_dir = ROOT / "results" / "agent_native_ablation" / run_id
     run_dir.mkdir(parents=True, exist_ok=args.resume)
+    retention = RetentionManager(
+        run_dir, args.retention, disk_floor_gb=args.disk_floor_gb)
+    retention.ensure_capacity("run start")
     (run_dir / "run.pid").write_text(str(os.getpid()), encoding="utf-8")
     metadata = {
         "run_id": run_id, "mode": args.mode, "event_limit": event_limit,
         "query_limit": query_limit, "top_k": 20, "embedding_dimension": 384,
+        "retention_mode": args.retention,
+        "disk_floor_gb": args.disk_floor_gb,
         "parameter_set": COMMON_PARAMETER_SET,
         "write_consistency": "strict", "query_consistency": "eventual",
         "storage_backend": "Badger (disk)", "cold_store": "MinIO S3",
@@ -1437,20 +1753,24 @@ def main() -> int:
             subprocess.run(["make", "build"], cwd=CORE, check=True)
         minio.start()
         baseline = load_or_run_shared_full_baseline(
-            run_dir, args.port, event_limit, query_limit, args.resume)
+            run_dir, args.port, event_limit, query_limit, args.resume, retention)
         tables: dict[str, list[dict[str, Any]]] = {}
         group_specs = [
             ("wal", "wal_event_log_ablation.csv", WAL_FIELDS,
-             lambda: run_recovery(run_dir, args.port, event_limit, query_limit, baseline)),
+             lambda: run_recovery(
+                 run_dir, args.port, event_limit, query_limit, baseline, retention)),
             ("materialization", "materialization_ablation.csv", MATERIALIZATION_FIELDS,
              lambda: run_materialization(
-                 run_dir, args.port, event_limit, query_limit, baseline)),
+                 run_dir, args.port, event_limit, query_limit, baseline, retention)),
             ("evidence", "evidence_provenance_ablation.csv", EVIDENCE_FIELDS,
-             lambda: run_evidence(run_dir, args.port, event_limit, query_limit, baseline)),
+             lambda: run_evidence(
+                 run_dir, args.port, event_limit, query_limit, baseline, retention)),
             ("governance", "governance_ablation.csv", GOVERNANCE_FIELDS,
-             lambda: run_governance(run_dir, args.port, event_limit, query_limit, baseline)),
+             lambda: run_governance(
+                 run_dir, args.port, event_limit, query_limit, baseline, retention)),
             ("tier", "tiered_storage_ablation.csv", TIER_FIELDS,
-             lambda: run_tier(run_dir, args.port, event_limit, query_limit, baseline)),
+             lambda: run_tier(
+                 run_dir, args.port, event_limit, query_limit, baseline, retention)),
         ]
         for group, filename, fields, execute in group_specs:
             path = run_dir / filename
@@ -1474,6 +1794,7 @@ def main() -> int:
             "shared_full_runs": 1,
             "common_parameter_set": COMMON_PARAMETER_SET,
             "all_metrics_present": True, "minio_s3_exercised": True,
+            **retention.summary(),
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
