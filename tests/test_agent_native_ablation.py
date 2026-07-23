@@ -367,6 +367,52 @@ def test_master_table_has_common_metrics_and_explicit_not_applicable_cells(tmp_p
     assert wal_row["EVIDENCE | Query p95 (ms)"] == MODULE.NOT_APPLICABLE
 
 
+def test_plasmod_start_allows_large_data_restart_to_become_healthy(tmp_path, monkeypatch):
+    class FakeProcess:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+    now = 0.0
+
+    def fake_time():
+        return now
+
+    def fake_sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    def fake_http_json(_base, _method, path, _body=None, timeout=60.0):
+        if path == "/healthz":
+            if now < 60.0:
+                raise RuntimeError("not healthy yet")
+            return {"status": "ok"}
+        if path == "/v1/admin/capabilities":
+            return {"capabilities": {
+                "wal_mode": "file",
+                "recovery_replay": True,
+                "recovery_projection": "full",
+                "materialization_profile": "full",
+                "evidence_profile": "full",
+                "governance_profile": "full",
+                "tier_profile": "full",
+                "hot_cache_size": 2000,
+            }}
+        raise AssertionError(f"unexpected request path {path}")
+
+    monkeypatch.setattr(MODULE.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr(MODULE.time, "time", fake_time)
+    monkeypatch.setattr(MODULE.time, "sleep", fake_sleep)
+    monkeypatch.setattr(MODULE, "http_json", fake_http_json)
+
+    process = MODULE.PlasmodProcess(MODULE.shared_full_variant(), tmp_path, 18080)
+
+    process.start(fresh=True)
+
+    assert now >= 60.0
+
+
 def test_governance_events_use_independent_sessions():
     private = MODULE.governance_event("private", "e1", "agent-a", "private")
     shared = MODULE.governance_event("shared", "e2", "agent-a", "restricted_shared")

@@ -38,6 +38,7 @@ CORE = ROOT.parent / "Plasmod"
 DATA = ROOT / "data" / "layer2_dynamic_events"
 DEFAULT_BUCKET = "plasmod-experiments"
 EMBEDDING_CACHE_PATH = ROOT / "results" / "layer2_dynamic_events" / "embedding_cache.sqlite3"
+DEFAULT_PLASMOD_START_TIMEOUT_S = 300.0
 
 CAPABILITY_ENV_FIELDS = {
     "PLASMOD_WAL_MODE": "wal_mode",
@@ -280,6 +281,23 @@ def http_json(base: str, method: str, path: str, body: Any | None = None, timeou
     if not raw:
         return {}
     return json.loads(raw)
+
+
+def plasmod_start_timeout_s() -> float:
+    raw = os.getenv("PLASMOD_ABLATION_PLASMOD_START_TIMEOUT_S")
+    if raw is None or not raw.strip():
+        return DEFAULT_PLASMOD_START_TIMEOUT_S
+    try:
+        timeout_s = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"PLASMOD_ABLATION_PLASMOD_START_TIMEOUT_S must be numeric, got {raw!r}"
+        ) from exc
+    if timeout_s <= 0:
+        raise RuntimeError(
+            f"PLASMOD_ABLATION_PLASMOD_START_TIMEOUT_S must be positive, got {raw!r}"
+        )
+    return timeout_s
 
 
 def text_from_event(event: dict[str, Any]) -> str:
@@ -666,7 +684,8 @@ class PlasmodProcess:
             stdout=self.log_handle, stderr=subprocess.STDOUT, text=True,
         )
         (self.variant_dir / "server.pid").write_text(str(self.process.pid), encoding="utf-8")
-        deadline = time.time() + 45
+        start_timeout_s = plasmod_start_timeout_s()
+        deadline = time.time() + start_timeout_s
         while time.time() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError(f"Plasmod exited for {self.variant.name}; inspect {self.variant_dir / 'server.log'}")
@@ -677,7 +696,10 @@ class PlasmodProcess:
             except Exception:
                 time.sleep(0.25)
         else:
-            raise RuntimeError(f"Plasmod health timeout for {self.variant.name}")
+            raise RuntimeError(
+                f"Plasmod health timeout for {self.variant.name} after {start_timeout_s:.1f}s; "
+                f"inspect {self.variant_dir / 'server.log'}"
+            )
         capabilities = http_json(self.base, "GET", "/v1/admin/capabilities")
         active = capabilities.get("capabilities") or {}
         for env_name, field_name in CAPABILITY_ENV_FIELDS.items():
