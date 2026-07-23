@@ -239,6 +239,29 @@ def test_retention_reclaimed_bytes_uses_allocated_size_for_sparse_files(tmp_path
     assert allocated < sparse.stat().st_size
 
 
+def test_prepare_variant_removes_incomplete_s3_prefix_before_restart(
+        tmp_path, monkeypatch):
+    variant = MODULE.Variant("tier", "Warm-only")
+    manager = MODULE.RetentionManager(tmp_path, "full")
+    removed = []
+    monkeypatch.setattr(manager, "_delete_s3_prefix", removed.append)
+
+    manager.prepare_variant(variant)
+
+    assert removed == [variant]
+
+
+def test_mark_run_started_replaces_stale_terminal_markers(tmp_path):
+    (tmp_path / "FAILED").write_text("old failure", encoding="utf-8")
+    (tmp_path / "COMPLETE").write_text("old completion", encoding="utf-8")
+
+    MODULE.mark_run_started(tmp_path)
+
+    assert not (tmp_path / "FAILED").exists()
+    assert not (tmp_path / "COMPLETE").exists()
+    assert json.loads((tmp_path / "RUNNING").read_text(encoding="utf-8"))["status"] == "running"
+
+
 def test_metrics_only_disk_guard_stops_before_safety_floor(tmp_path, monkeypatch):
     usage = namedtuple("usage", "total used free")
     monkeypatch.setattr(

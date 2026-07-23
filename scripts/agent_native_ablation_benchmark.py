@@ -222,6 +222,19 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     os.replace(temporary, path)
 
 
+def mark_run_started(run_dir: Path) -> None:
+    for name in ("FAILED", "COMPLETE"):
+        try:
+            (run_dir / name).unlink()
+        except FileNotFoundError:
+            pass
+    atomic_write_json(run_dir / "RUNNING", {
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "pid": os.getpid(),
+    })
+
+
 def write_csv(path: Path, fields: list[str], rows: list[dict[str, Any]]) -> None:
     if not rows:
         raise RuntimeError(f"refusing to write empty result table {path.name}")
@@ -411,6 +424,18 @@ class RetentionManager:
             raise RuntimeError(
                 f"disk safety floor breached during {stage}: "
                 f"{free_bytes / 1024**3:.2f} GB free < {self.disk_floor_gb:g} GB")
+
+    def prepare_variant(self, variant: Variant) -> None:
+        variant_dir = self._variant_dir(variant)
+        if (
+            (variant_dir / "result_checkpoint.json").exists()
+            or (variant_dir / "METRICS_RETAINED").exists()
+        ):
+            raise RuntimeError(
+                f"refusing to prepare checkpointed variant {variant.slug}")
+        self.ensure_capacity(f"{variant.slug} start")
+        log(f"clearing incomplete S3 prefix: {variant.slug}")
+        self._delete_s3_prefix(variant)
 
     def record_variant(self, variant: Variant, module: str, fields: list[str],
                        row: dict[str, Any]) -> None:
@@ -1032,7 +1057,7 @@ def run_recovery(run_dir: Path, port: int, event_limit: int, query_limit: int,
             rows.append(checkpoint)
             continue
         log(f"starting WAL variant: {variant.name}")
-        retention.ensure_capacity(f"{variant.slug} start")
+        retention.prepare_variant(variant)
         server = PlasmodProcess(variant, run_dir, port)
         row: dict[str, Any] | None = None
         try:
@@ -1125,7 +1150,7 @@ def run_materialization(run_dir: Path, port: int, event_limit: int, query_limit:
             rows.append(checkpoint)
             continue
         log(f"starting materialization variant: {variant.name}")
-        retention.ensure_capacity(f"{variant.slug} start")
+        retention.prepare_variant(variant)
         server = PlasmodProcess(variant, run_dir, port)
         row: dict[str, Any] | None = None
         try:
@@ -1195,7 +1220,7 @@ def run_evidence(run_dir: Path, port: int, event_limit: int, query_limit: int,
             rows.append(checkpoint)
             continue
         log(f"starting evidence variant: {variant.name}")
-        retention.ensure_capacity(f"{variant.slug} start")
+        retention.prepare_variant(variant)
         data = run_once(
             variant, run_dir, port, event_limit, query_limit, retention)
         row = measure_evidence(variant, data, baseline.evidence_totals)
@@ -1321,7 +1346,7 @@ def run_governance(run_dir: Path, port: int, event_limit: int,
         log(f"reusing checkpointed governance variant: {no_access_variant.name}")
     else:
         log(f"starting governance variant: {no_access_variant.name}")
-        retention.ensure_capacity(f"{no_access_variant.slug} start")
+        retention.prepare_variant(no_access_variant)
         server = PlasmodProcess(no_access_variant, run_dir, port)
         try:
             server.start(fresh=True)
@@ -1353,7 +1378,7 @@ def run_governance(run_dir: Path, port: int, event_limit: int,
             rows.append(checkpoint)
             continue
         log(f"starting governance variant: {variant.name}")
-        retention.ensure_capacity(f"{variant.slug} start")
+        retention.prepare_variant(variant)
         server = PlasmodProcess(variant, run_dir, port)
         measurement: dict[str, Any] | None = None
         try:
@@ -1445,7 +1470,7 @@ def run_tier(run_dir: Path, port: int, event_limit: int, query_limit: int,
             rows.append(checkpoint)
             continue
         log(f"starting tier variant: {variant.name}")
-        retention.ensure_capacity(f"{variant.slug} start")
+        retention.prepare_variant(variant)
         server = PlasmodProcess(variant, run_dir, port)
         row: dict[str, Any] | None = None
         try:
@@ -1509,7 +1534,7 @@ def run_shared_full_baseline(run_dir: Path, port: int, event_limit: int,
                              retention: RetentionManager) -> SharedFullBaseline:
     variant = shared_full_variant()
     log("starting shared Full Plasmod baseline")
-    retention.ensure_capacity(f"{variant.slug} start")
+    retention.prepare_variant(variant)
     server = PlasmodProcess(variant, run_dir, port)
     baseline: SharedFullBaseline | None = None
     try:
@@ -1721,6 +1746,7 @@ def main() -> int:
     retention = RetentionManager(
         run_dir, args.retention, disk_floor_gb=args.disk_floor_gb)
     retention.ensure_capacity("run start")
+    mark_run_started(run_dir)
     (run_dir / "run.pid").write_text(str(os.getpid()), encoding="utf-8")
     metadata = {
         "run_id": run_id, "mode": args.mode, "event_limit": event_limit,
@@ -1798,18 +1824,23 @@ def main() -> int:
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        atomic_write_json(run_dir / "COMPLETE", {
+            "status": "complete",
+            "completed_at": summary["completed_at"],
+        })
         try:
-            (run_dir / "FAILED").unlink()
+            (run_dir / "RUNNING").unlink()
         except FileNotFoundError:
             pass
-        (run_dir / "COMPLETE").write_text(
-            json.dumps({"status": "complete", "completed_at": summary["completed_at"]}, indent=2),
-            encoding="utf-8",
-        )
         log(f"complete: {run_dir}")
         return 0
     except BaseException as exc:
-        (run_dir / "FAILED").write_text(str(exc), encoding="utf-8")
+        (run_dir / "FAILED").write_text(
+            f"{type(exc).__name__}: {exc}", encoding="utf-8")
+        try:
+            (run_dir / "RUNNING").unlink()
+        except FileNotFoundError:
+            pass
         log(f"FAILED: {exc}")
         raise
     finally:

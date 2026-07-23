@@ -447,7 +447,7 @@ python3 scripts/agent_native_ablation_benchmark.py run \
   --retention metrics-only --resume
 ```
 
-结果位于 `results/agent_native_ablation/<run-id>/`。只有分组 CSV 和 34 行总表全部非空、19 个公共指标全部为有限数值、capability 回读一致、服务日志没有 panic/fatal/S3 错误时才生成 `COMPLETE` 和 `summary.json`；任何 HTTP、服务、指标或日志错误都会停止并生成 `FAILED`。共享 Full 的 capability、公共指标、五组 Full probe 与恢复清单位于 `variants/shared-full-plasmod/`，其余 29 个 variant 保持各自目录。`summary.json` 使用 `shared_full_runs=1` 和 `physical_variant_runs=30` 记录实际执行次数，并记录 retention 模式、已清理 variant 数量和回收的本地字节数。
+结果位于 `results/agent_native_ablation/<run-id>/`。运行期间存在 `RUNNING`；只有分组 CSV 和 34 行总表全部非空、19 个公共指标全部为有限数值、capability 回读一致、服务日志没有 panic/fatal/S3 错误时才生成 `COMPLETE` 和 `summary.json`；任何 HTTP、服务、指标或日志错误都会停止并生成 `FAILED`。恢复启动会原子替换旧终态标记，避免监控把旧 `FAILED` 当成当前失败。共享 Full 的 capability、公共指标、五组 Full probe 与恢复清单位于 `variants/shared-full-plasmod/`，其余 29 个 variant 保持各自目录。`summary.json` 使用 `shared_full_runs=1` 和 `physical_variant_runs=30` 记录实际执行次数，并记录 retention 模式、已清理 variant 数量和回收的本地字节数。
 
 最近通过完整 smoke 的结果目录：
 
@@ -724,7 +724,7 @@ nohup python3 scripts/agent_native_ablation_benchmark.py run \
 echo "$!" > "logs/${RUN_ID}/runner.pid"
 ```
 
-`--resume` 优先复用每个已验证的 `result_checkpoint.json`，因此失败中的分组只重跑尚未完成的 variant；已完整写出的分组 CSV 仍可整组复用。任务完成后先取回轻量结果：
+`--resume` 优先复用每个已验证的 `result_checkpoint.json`，因此失败中的分组只重跑尚未完成的 variant；重跑前会先清理该未完成 variant 的旧 S3 prefix，避免混入上一次残留。已完整写出的分组 CSV 仍可整组复用。任务完成后先取回轻量结果：
 
 ```bash
 RUN_PATH="results/agent_native_ablation/${RUN_ID}"
