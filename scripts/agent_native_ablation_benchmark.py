@@ -41,6 +41,9 @@ EMBEDDING_CACHE_PATH = ROOT / "results" / "layer2_dynamic_events" / "embedding_c
 DEFAULT_PLASMOD_START_TIMEOUT_S = 300.0
 DEFAULT_RECOVERY_REPLAY_TIMEOUT_S = 300.0
 DEFAULT_RECOVERY_RESET_TIMEOUT_S = 300.0
+DEFAULT_QUERY_TIMEOUT_S = 60.0
+FORMAL_QUERY_TIMEOUT_S = 300.0
+FORMAL_QUERY_TIMEOUT_EVENT_THRESHOLD = 100_000
 RECOVERY_REPLAY_TIMEOUT_GRACE_S = 60.0
 RECOVERY_REPLAY_TIMEOUT_EVENTS_PER_SECOND = 45.0
 RECOVERY_RESET_TIMEOUT_GRACE_S = 600.0
@@ -268,7 +271,10 @@ def validate_service_logs(run_dir: Path) -> None:
         raise RuntimeError("fatal service log entries detected:\n" + "\n".join(failures))
 
 
-def http_json(base: str, method: str, path: str, body: Any | None = None, timeout: float = 60.0) -> Any:
+def http_json(
+    base: str, method: str, path: str, body: Any | None = None,
+    timeout: float = DEFAULT_QUERY_TIMEOUT_S,
+) -> Any:
     payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     request = Request(
         base + path,
@@ -322,6 +328,12 @@ def recovery_reset_timeout_s(event_count: int) -> float:
         + RECOVERY_RESET_TIMEOUT_GRACE_S
     )
     return max(DEFAULT_RECOVERY_RESET_TIMEOUT_S, scaled_timeout)
+
+
+def formal_query_timeout_s(event_count: int) -> float:
+    if event_count >= FORMAL_QUERY_TIMEOUT_EVENT_THRESHOLD:
+        return FORMAL_QUERY_TIMEOUT_S
+    return DEFAULT_QUERY_TIMEOUT_S
 
 
 def text_from_event(event: dict[str, Any]) -> str:
@@ -893,7 +905,8 @@ def write_common_metrics(server: PlasmodProcess, variant: Variant, data: RunData
 
 def query(base: str, text: str, vector: list[float], target_ids: list[str] | None = None,
           response_mode: str = "structured_evidence", requester: str = "", include_cold: bool = False,
-          workspace: str = "plasmod-ablation", session: str = "") -> tuple[dict[str, Any], float]:
+          workspace: str = "plasmod-ablation", session: str = "",
+          timeout: float = DEFAULT_QUERY_TIMEOUT_S) -> tuple[dict[str, Any], float]:
     body = {
         "query_text": text,
         "query_scope": workspace,
@@ -913,7 +926,7 @@ def query(base: str, text: str, vector: list[float], target_ids: list[str] | Non
     if target_ids:
         body["target_object_ids"] = target_ids
     started = time.perf_counter()
-    response = http_json(base, "POST", "/v1/query", body)
+    response = http_json(base, "POST", "/v1/query", body, timeout=timeout)
     return response, (time.perf_counter() - started) * 1000
 
 
@@ -1504,10 +1517,11 @@ def measure_tier(server: PlasmodProcess, variant: Variant, data: RunData,
     tier_query_latencies = []
     hot = warm = cold = stale = total = 0
     promotions = [archive_latency]
+    query_timeout = formal_query_timeout_s(data.writes)
     for text, vector, expected, requester, workspace, session in samples:
         response, latency = query(
             server.base, text, vector, requester=requester, include_cold=True,
-            workspace=workspace, session=session)
+            workspace=workspace, session=session, timeout=query_timeout)
         tier_query_latencies.append(latency)
         retrieval = response.get("retrieval") or {}
         hot += int(retrieval.get("hot_candidate_count", 0))
@@ -1517,6 +1531,7 @@ def measure_tier(server: PlasmodProcess, variant: Variant, data: RunData,
         canonical, _ = query(
             server.base, text, vector, [expected], "objects_only",
             requester=requester, workspace=workspace, session=session,
+            timeout=query_timeout,
         )
         stale += int(expected not in canonical.get("objects", []))
         total += 1

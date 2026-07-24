@@ -472,6 +472,66 @@ def test_master_table_has_common_metrics_and_explicit_not_applicable_cells(tmp_p
     assert wal_row["EVIDENCE | Query p95 (ms)"] == MODULE.NOT_APPLICABLE
 
 
+def test_measure_tier_scales_query_timeout_for_large_replayed_dataset(monkeypatch):
+    captured_timeouts = []
+
+    class FakeServer:
+        base = "http://127.0.0.1:18080"
+
+        def rss_mb(self):
+            return 123.0
+
+    def fake_http_json(_base, _method, path, _body=None, timeout=60.0):
+        if path == "/v1/admin/tier/archive":
+            return {"archive_latency_ms": 12.0}
+        raise AssertionError(f"unexpected request path {path}")
+
+    def fake_query(
+        _base,
+        _text,
+        _vector,
+        target_ids=None,
+        response_mode="structured_evidence",
+        requester="",
+        include_cold=False,
+        workspace="plasmod-ablation",
+        session="",
+        timeout=60.0,
+    ):
+        captured_timeouts.append(timeout)
+        if response_mode == "objects_only":
+            return {"objects": list(target_ids or [])}, 1.0
+        return {
+            "retrieval": {
+                "hot_candidate_count": 1,
+                "warm_candidate_count": 2,
+                "cold_candidate_count": 3,
+            },
+            "diagnostics": {"promotion_latency_ms": 4.0},
+        }, 1.0
+
+    monkeypatch.setattr(MODULE, "http_json", fake_http_json)
+    monkeypatch.setattr(MODULE, "query", fake_query)
+    data = MODULE.RunData(
+        writes=641_979,
+        memory_ids={"mem-1"},
+        latest_query_samples=[(
+            "agent state",
+            MODULE.hash_vector("agent state"),
+            "mem-1",
+            "agent-1",
+            "plasmod-ablation",
+            "session-1",
+        )],
+    )
+
+    MODULE.measure_tier(FakeServer(), MODULE.shared_full_variant(), data)
+
+    assert MODULE.formal_query_timeout_s(8) == 60.0
+    assert MODULE.formal_query_timeout_s(data.writes) == 300.0
+    assert captured_timeouts == [300.0, 300.0]
+
+
 def test_plasmod_start_allows_large_data_restart_to_become_healthy(tmp_path, monkeypatch):
     class FakeProcess:
         pid = 12345
