@@ -251,6 +251,22 @@ def test_prepare_variant_removes_incomplete_s3_prefix_before_restart(
     assert removed == [variant]
 
 
+def test_offline_recovery_reset_preserves_wal_and_removes_materialized_state(tmp_path):
+    server = MODULE.PlasmodProcess(MODULE.shared_full_variant(), tmp_path, 18080)
+    server.data_dir.mkdir(parents=True)
+    (server.data_dir / "wal.log").write_text("wal entries", encoding="utf-8")
+    for name in (
+        "000001.vlog", "000002.sst", "DISCARD", "KEYREGISTRY", "LOCK", "MANIFEST",
+        "consistency_checkpoint.json", "derivation.log", "hard_delete_tasks.json",
+    ):
+        (server.data_dir / name).write_text(name, encoding="utf-8")
+
+    server.offline_reset_materialized_state()
+
+    assert (server.data_dir / "wal.log").read_text(encoding="utf-8") == "wal entries"
+    assert sorted(path.name for path in server.data_dir.iterdir()) == ["wal.log"]
+
+
 def test_mark_run_started_replaces_stale_terminal_markers(tmp_path):
     (tmp_path / "FAILED").write_text("old failure", encoding="utf-8")
     (tmp_path / "COMPLETE").write_text("old completion", encoding="utf-8")
@@ -282,6 +298,11 @@ def test_recovery_replay_timeout_scales_with_formal_full_workload():
 
 def test_recovery_replay_timeout_has_headroom_for_full_projection_replay():
     assert MODULE.recovery_replay_timeout_s(641_979) >= 12_960
+
+
+def test_recovery_reset_timeout_has_headroom_for_disk_cleanup():
+    assert MODULE.recovery_reset_timeout_s(8) == 300
+    assert MODULE.recovery_reset_timeout_s(641_979) >= 21_600
 
 
 def test_measure_recovery_scales_reset_timeout_for_large_wal(

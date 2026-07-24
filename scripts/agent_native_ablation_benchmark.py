@@ -40,8 +40,11 @@ DEFAULT_BUCKET = "plasmod-experiments"
 EMBEDDING_CACHE_PATH = ROOT / "results" / "layer2_dynamic_events" / "embedding_cache.sqlite3"
 DEFAULT_PLASMOD_START_TIMEOUT_S = 300.0
 DEFAULT_RECOVERY_REPLAY_TIMEOUT_S = 300.0
+DEFAULT_RECOVERY_RESET_TIMEOUT_S = 300.0
 RECOVERY_REPLAY_TIMEOUT_GRACE_S = 60.0
 RECOVERY_REPLAY_TIMEOUT_EVENTS_PER_SECOND = 45.0
+RECOVERY_RESET_TIMEOUT_GRACE_S = 600.0
+RECOVERY_RESET_TIMEOUT_EVENTS_PER_SECOND = 30.0
 
 CAPABILITY_ENV_FIELDS = {
     "PLASMOD_WAL_MODE": "wal_mode",
@@ -312,7 +315,13 @@ def recovery_replay_timeout_s(event_count: int) -> float:
 
 
 def recovery_reset_timeout_s(event_count: int) -> float:
-    return recovery_replay_timeout_s(event_count)
+    if event_count <= DEFAULT_RECOVERY_RESET_TIMEOUT_S * RECOVERY_RESET_TIMEOUT_EVENTS_PER_SECOND:
+        return DEFAULT_RECOVERY_RESET_TIMEOUT_S
+    scaled_timeout = (
+        math.ceil(max(event_count, 0) / RECOVERY_RESET_TIMEOUT_EVENTS_PER_SECOND)
+        + RECOVERY_RESET_TIMEOUT_GRACE_S
+    )
+    return max(DEFAULT_RECOVERY_RESET_TIMEOUT_S, scaled_timeout)
 
 
 def text_from_event(event: dict[str, Any]) -> str:
@@ -738,6 +747,17 @@ class PlasmodProcess:
             )
         (self.variant_dir / "capabilities.json").write_text(
             json.dumps(capabilities, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def offline_reset_materialized_state(self) -> None:
+        if not self.data_dir.exists():
+            return
+        for path in self.data_dir.iterdir():
+            if path.name == "wal.log":
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
 
     def stop(self) -> None:
         if self.process is not None and self.process.poll() is None:
