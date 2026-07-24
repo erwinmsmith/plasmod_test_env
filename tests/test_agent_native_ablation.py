@@ -474,6 +474,7 @@ def test_master_table_has_common_metrics_and_explicit_not_applicable_cells(tmp_p
 
 def test_measure_tier_scales_query_timeout_for_large_replayed_dataset(monkeypatch):
     captured_timeouts = []
+    captured_modes = []
 
     class FakeServer:
         base = "http://127.0.0.1:18080"
@@ -499,6 +500,7 @@ def test_measure_tier_scales_query_timeout_for_large_replayed_dataset(monkeypatc
         timeout=60.0,
     ):
         captured_timeouts.append(timeout)
+        captured_modes.append((response_mode, include_cold))
         if response_mode == "objects_only":
             return {"objects": list(target_ids or [])}, 1.0
         return {
@@ -529,6 +531,7 @@ def test_measure_tier_scales_query_timeout_for_large_replayed_dataset(monkeypatc
 
     assert MODULE.formal_query_timeout_s(8) == 60.0
     assert MODULE.formal_query_timeout_s(data.writes) == 300.0
+    assert captured_modes == [("objects_only", True), ("objects_only", False)]
     assert captured_timeouts == [300.0, 300.0]
 
 

@@ -1520,8 +1520,9 @@ def measure_tier(server: PlasmodProcess, variant: Variant, data: RunData,
     query_timeout = formal_query_timeout_s(data.writes)
     for text, vector, expected, requester, workspace, session in samples:
         response, latency = query(
-            server.base, text, vector, requester=requester, include_cold=True,
-            workspace=workspace, session=session, timeout=query_timeout)
+            server.base, text, vector, response_mode="objects_only",
+            requester=requester, include_cold=True, workspace=workspace,
+            session=session, timeout=query_timeout)
         tier_query_latencies.append(latency)
         retrieval = response.get("retrieval") or {}
         hot += int(retrieval.get("hot_candidate_count", 0))
