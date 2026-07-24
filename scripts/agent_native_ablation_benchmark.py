@@ -787,6 +787,19 @@ class PlasmodProcess:
         self.stop()
         self.start(fresh=False)
 
+    def restart_for_explicit_replay(self) -> None:
+        original_replay = self.variant.env.get("PLASMOD_RECOVERY_REPLAY")
+        self.stop()
+        self.offline_reset_materialized_state()
+        self.variant.env["PLASMOD_RECOVERY_REPLAY"] = "false"
+        try:
+            self.start(fresh=False)
+        finally:
+            if original_replay is None:
+                self.variant.env.pop("PLASMOD_RECOVERY_REPLAY", None)
+            else:
+                self.variant.env["PLASMOD_RECOVERY_REPLAY"] = original_replay
+
     def rss_mb(self) -> float:
         if self.process is None or self.process.poll() is not None:
             return 0.0
@@ -1057,15 +1070,11 @@ def recovery_variants() -> list[Variant]:
 
 def measure_recovery(server: PlasmodProcess, variant: Variant, before: RunData,
                      output_variant: str | None = None) -> dict[str, Any]:
-    server.restart()
-    reset_timeout_s = recovery_reset_timeout_s(before.writes)
     log(
-        f"{variant.group}/{variant.name}: resetting materialized state for "
-        f"{before.writes} WAL entries with timeout {reset_timeout_s:.0f}s"
+        f"{variant.group}/{variant.name}: offline-resetting materialized state "
+        f"for {before.writes} WAL entries"
     )
-    http_json(
-        server.base, "POST", "/v1/admin/recovery/reset",
-        {"confirm": "reset_materialized"}, timeout=reset_timeout_s)
+    server.restart_for_explicit_replay()
     replay_response: dict[str, Any] = {}
     query_available = False
     replay_wall = 0.0

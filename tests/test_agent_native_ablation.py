@@ -267,6 +267,36 @@ def test_offline_recovery_reset_preserves_wal_and_removes_materialized_state(tmp
     assert sorted(path.name for path in server.data_dir.iterdir()) == ["wal.log"]
 
 
+def test_explicit_replay_restart_disables_startup_recovery_temporarily(
+        tmp_path, monkeypatch):
+    variant = MODULE.Variant("wal", "Full Plasmod", {
+        "PLASMOD_RECOVERY_REPLAY": "true",
+    })
+    server = MODULE.PlasmodProcess(variant, tmp_path, 18080)
+    calls = []
+
+    monkeypatch.setattr(server, "stop", lambda: calls.append(("stop", None)))
+    monkeypatch.setattr(
+        server,
+        "offline_reset_materialized_state",
+        lambda: calls.append(("offline_reset", None)),
+    )
+
+    def fake_start(*, fresh):
+        calls.append(("start", fresh, variant.env["PLASMOD_RECOVERY_REPLAY"]))
+
+    monkeypatch.setattr(server, "start", fake_start)
+
+    server.restart_for_explicit_replay()
+
+    assert calls == [
+        ("stop", None),
+        ("offline_reset", None),
+        ("start", False, "false"),
+    ]
+    assert variant.env["PLASMOD_RECOVERY_REPLAY"] == "true"
+
+
 def test_mark_run_started_replaces_stale_terminal_markers(tmp_path):
     (tmp_path / "FAILED").write_text("old failure", encoding="utf-8")
     (tmp_path / "COMPLETE").write_text("old completion", encoding="utf-8")
@@ -305,33 +335,37 @@ def test_recovery_reset_timeout_has_headroom_for_disk_cleanup():
     assert MODULE.recovery_reset_timeout_s(641_979) >= 21_600
 
 
-def test_measure_recovery_scales_reset_timeout_for_large_wal(
+def test_measure_recovery_resets_offline_before_explicit_replay(
         tmp_path, monkeypatch):
-    captured_timeouts = {}
+    calls = []
 
     class FakeServer:
         base = "http://127.0.0.1:18080"
         variant_dir = tmp_path
+        variant = MODULE.Variant("wal", "Full Plasmod", {
+            "PLASMOD_RECOVERY_REPLAY": "true",
+        })
 
-        def restart(self):
-            pass
+        def restart_for_explicit_replay(self):
+            calls.append("restart_for_explicit_replay")
 
     def fake_http_json(_base, _method, path, _body=None, timeout=60.0):
-        captured_timeouts[path] = timeout
+        calls.append(path)
         if path == "/v1/admin/recovery/reset":
-            return {"status": "ok"}
+            raise AssertionError("materialized recovery reset must be offline")
+        if path == "/v1/admin/replay":
+            return {"status": "ok", "state": {"objects": 0, "edges": 0, "latest_states": 0}}
         if path == "/v1/admin/runtime/state":
             return {"state": {"objects": 0, "edges": 0, "latest_states": 0, "events": 0}}
         raise AssertionError(f"unexpected request path {path}")
 
     monkeypatch.setattr(MODULE, "http_json", fake_http_json)
-    variant = MODULE.Variant("wal", "No-WAL", {"PLASMOD_RECOVERY_REPLAY": "false"})
     before = MODULE.RunData(writes=641_979)
 
-    MODULE.measure_recovery(FakeServer(), variant, before)
+    MODULE.measure_recovery(FakeServer(), FakeServer.variant, before)
 
-    assert captured_timeouts["/v1/admin/recovery/reset"] >= MODULE.recovery_replay_timeout_s(
-        before.writes)
+    assert calls[0] == "restart_for_explicit_replay"
+    assert "/v1/admin/replay" in calls
 
 
 def test_measure_recovery_uses_replay_returned_state(tmp_path, monkeypatch):
@@ -341,13 +375,13 @@ def test_measure_recovery_uses_replay_returned_state(tmp_path, monkeypatch):
         base = "http://127.0.0.1:18080"
         variant_dir = tmp_path
 
-        def restart(self):
+        def restart_for_explicit_replay(self):
             pass
 
     def fake_http_json(_base, _method, path, _body=None, timeout=60.0):
         calls.append(path)
         if path == "/v1/admin/recovery/reset":
-            return {"status": "ok"}
+            raise AssertionError("materialized recovery reset must be offline")
         if path == "/v1/admin/replay":
             return {
                 "status": "ok",
