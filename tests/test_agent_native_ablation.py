@@ -321,6 +321,41 @@ def test_metrics_only_disk_guard_stops_before_safety_floor(tmp_path, monkeypatch
         manager.ensure_capacity("test variant")
 
 
+def test_metrics_only_resume_reclaims_incomplete_local_data_before_disk_guard(
+        tmp_path, monkeypatch):
+    usage = namedtuple("usage", "total used free")
+    incomplete = MODULE.Variant("wal", "In-memory WAL")
+    incomplete_dir = tmp_path / "variants" / incomplete.slug
+    incomplete_data = incomplete_dir / "data"
+    incomplete_data.mkdir(parents=True)
+    (incomplete_data / "000001.vlog").write_bytes(b"stale")
+    (incomplete_dir / "server.log").write_text("interrupted", encoding="utf-8")
+    checkpointed = MODULE.Variant("wal", "No-WAL")
+    checkpointed_dir = tmp_path / "variants" / checkpointed.slug
+    checkpointed_dir.mkdir(parents=True)
+    (checkpointed_dir / "result_checkpoint.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        MODULE.shutil,
+        "disk_usage",
+        lambda _path: usage(
+            100 * 1024**3,
+            91 * 1024**3,
+            (9 if incomplete_data.exists() else 11) * 1024**3,
+        ),
+    )
+    manager = MODULE.RetentionManager(tmp_path, "metrics-only", disk_floor_gb=10)
+
+    with pytest.raises(RuntimeError, match="disk safety floor"):
+        manager.ensure_capacity("run start")
+
+    MODULE.reclaim_metrics_only_resume_local_data(manager)
+
+    manager.ensure_capacity("run start")
+    assert not incomplete_data.exists()
+    assert (incomplete_dir / "server.log").exists()
+    assert (checkpointed_dir / "result_checkpoint.json").exists()
+
+
 def test_recovery_replay_timeout_scales_with_formal_full_workload():
     assert MODULE.recovery_replay_timeout_s(8) == 300
     assert MODULE.recovery_replay_timeout_s(641_979) >= 6_480

@@ -632,6 +632,32 @@ class RetentionManager:
                 f"{completed.stderr.strip()}")
 
 
+def reclaim_metrics_only_resume_local_data(retention: RetentionManager) -> None:
+    if retention.mode != "metrics-only":
+        return
+    variants_dir = retention.run_dir / "variants"
+    if not variants_dir.exists():
+        return
+    for variant_dir in variants_dir.iterdir():
+        if not variant_dir.is_dir():
+            continue
+        data_dir = variant_dir / "data"
+        if not data_dir.exists():
+            continue
+        if (
+            (variant_dir / "result_checkpoint.json").exists()
+            or (variant_dir / "METRICS_RETAINED").exists()
+            or (variant_dir / "shared_full_baseline.json").exists()
+        ):
+            continue
+        reclaimed_bytes = retention._directory_size(data_dir)
+        shutil.rmtree(data_dir)
+        log(
+            f"removed incomplete local data before resume: "
+            f"{variant_dir.name} ({reclaimed_bytes / 1024**3:.2f} GB)"
+        )
+
+
 class MinioManager:
     def __init__(self, run_dir: Path):
         self.run_dir = run_dir
@@ -1860,6 +1886,8 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=args.resume)
     retention = RetentionManager(
         run_dir, args.retention, disk_floor_gb=args.disk_floor_gb)
+    if args.resume:
+        reclaim_metrics_only_resume_local_data(retention)
     retention.ensure_capacity("run start")
     mark_run_started(run_dir)
     (run_dir / "run.pid").write_text(str(os.getpid()), encoding="utf-8")
