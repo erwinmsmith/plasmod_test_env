@@ -335,6 +335,99 @@ def test_recovery_reset_timeout_has_headroom_for_disk_cleanup():
     assert MODULE.recovery_reset_timeout_s(641_979) >= 21_600
 
 
+def test_plasmod_process_uses_checkpoint_flush_interval_suited_for_disk_benchmark(
+        tmp_path, monkeypatch):
+    captured_env = {}
+
+    class FakeProcess:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+        def send_signal(self, _signal):
+            pass
+
+        def wait(self, _timeout=None):
+            return 0
+
+    def fake_popen(_args, **kwargs):
+        captured_env.update(kwargs["env"])
+        return FakeProcess()
+
+    def fake_http_json(_base, _method, path, _body=None, timeout=60.0):
+        if path == "/healthz":
+            return {"status": "ok"}
+        if path == "/v1/admin/capabilities":
+            return {
+                "capabilities": {
+                    "wal_mode": "memory",
+                    "recovery_replay": True,
+                    "hot_cache_size": 2000,
+                }
+            }
+        raise AssertionError(f"unexpected request path {path}")
+
+    monkeypatch.setattr(MODULE.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(MODULE, "http_json", fake_http_json)
+    server = MODULE.PlasmodProcess(
+        MODULE.Variant("wal", "In-memory WAL", {
+            "PLASMOD_WAL_MODE": "memory",
+            "PLASMOD_RECOVERY_REPLAY": "true",
+        }),
+        tmp_path,
+        18080,
+    )
+
+    server.start(fresh=True)
+
+    assert captured_env["PLASMOD_CONSISTENCY_CHECKPOINT_FLUSH_INTERVAL"] == "1s"
+
+
+def test_ingest_workload_uses_formal_timeout_for_large_event_runs(tmp_path, monkeypatch):
+    captured_timeouts = []
+
+    class FakeServer:
+        base = "http://127.0.0.1:18080"
+        variant_dir = tmp_path
+
+        def rss_mb(self):
+            return 10.0
+
+    def fake_iter_events(limit):
+        assert limit == 641_979
+        yield {"identity": {"event_id": "source-1"}, "payload": {"text": "one"}}
+        yield {"identity": {"event_id": "source-2"}, "payload": {"text": "two"}}
+
+    def fake_http_json(_base, _method, path, _body=None, timeout=60.0):
+        if path == "/v1/ingest/events":
+            captured_timeouts.append(timeout)
+            return {
+                "status": "accepted",
+                "event_id": f"event-{len(captured_timeouts)}",
+                "materialization_latency_ms": 1.0,
+                "memory_id": f"mem-{len(captured_timeouts)}",
+            }
+        if path == "/v1/query":
+            return {"objects": [f"mem-{len(captured_timeouts)}"]}
+        if path == "/v1/admin/runtime/state":
+            return {"state": {"events": 2, "objects": 2, "edges": 0, "latest_states": 0}}
+        raise AssertionError(f"unexpected request path {path}")
+
+    monkeypatch.setattr(MODULE, "iter_events", fake_iter_events)
+    monkeypatch.setattr(MODULE, "http_json", fake_http_json)
+
+    data = MODULE.ingest_workload(
+        FakeServer(),
+        MODULE.Variant("wal", "In-memory WAL"),
+        641_979,
+        0,
+    )
+
+    assert data.writes == 2
+    assert captured_timeouts == [300.0, 300.0]
+
+
 def test_measure_recovery_resets_offline_before_explicit_replay(
         tmp_path, monkeypatch):
     calls = []
@@ -651,7 +744,8 @@ def test_plasmod_start_keeps_checkpoint_buffering_enabled(tmp_path, monkeypatch)
 
     process.start(fresh=True)
 
-    assert captured_env["PLASMOD_CONSISTENCY_CHECKPOINT_FLUSH_INTERVAL"] == "50ms"
+    assert captured_env["PLASMOD_CONSISTENCY_CHECKPOINT_FLUSH_INTERVAL"] != "0"
+    assert captured_env["PLASMOD_CONSISTENCY_CHECKPOINT_FLUSH_INTERVAL"] != "off"
 
 
 def test_governance_events_use_independent_sessions():

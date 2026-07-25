@@ -41,13 +41,17 @@ EMBEDDING_CACHE_PATH = ROOT / "results" / "layer2_dynamic_events" / "embedding_c
 DEFAULT_PLASMOD_START_TIMEOUT_S = 300.0
 DEFAULT_RECOVERY_REPLAY_TIMEOUT_S = 300.0
 DEFAULT_RECOVERY_RESET_TIMEOUT_S = 300.0
+DEFAULT_INGEST_TIMEOUT_S = 120.0
+FORMAL_INGEST_TIMEOUT_S = 300.0
 DEFAULT_QUERY_TIMEOUT_S = 60.0
 FORMAL_QUERY_TIMEOUT_S = 300.0
 FORMAL_QUERY_TIMEOUT_EVENT_THRESHOLD = 100_000
+FORMAL_INGEST_TIMEOUT_EVENT_THRESHOLD = 100_000
 RECOVERY_REPLAY_TIMEOUT_GRACE_S = 60.0
 RECOVERY_REPLAY_TIMEOUT_EVENTS_PER_SECOND = 45.0
 RECOVERY_RESET_TIMEOUT_GRACE_S = 600.0
 RECOVERY_RESET_TIMEOUT_EVENTS_PER_SECOND = 30.0
+BENCHMARK_CHECKPOINT_FLUSH_INTERVAL = "1s"
 
 CAPABILITY_ENV_FIELDS = {
     "PLASMOD_WAL_MODE": "wal_mode",
@@ -334,6 +338,12 @@ def formal_query_timeout_s(event_count: int) -> float:
     if event_count >= FORMAL_QUERY_TIMEOUT_EVENT_THRESHOLD:
         return FORMAL_QUERY_TIMEOUT_S
     return DEFAULT_QUERY_TIMEOUT_S
+
+
+def ingest_timeout_s(event_count: int) -> float:
+    if event_count == 0 or event_count >= FORMAL_INGEST_TIMEOUT_EVENT_THRESHOLD:
+        return FORMAL_INGEST_TIMEOUT_S
+    return DEFAULT_INGEST_TIMEOUT_S
 
 
 def text_from_event(event: dict[str, Any]) -> str:
@@ -702,7 +712,7 @@ class PlasmodProcess:
             "PLASMOD_EMBEDDER_DIM": "384",
             "PLASMOD_FLUSH_INTERVAL": "0",
             "PLASMOD_CONSISTENCY_DEFAULT_MODE": "strict",
-            "PLASMOD_CONSISTENCY_CHECKPOINT_FLUSH_INTERVAL": "50ms",
+            "PLASMOD_CONSISTENCY_CHECKPOINT_FLUSH_INTERVAL": BENCHMARK_CHECKPOINT_FLUSH_INTERVAL,
             "PLASMOD_HOT_CACHE_SIZE": str(self.variant.hot_size),
             "S3_ENDPOINT": "127.0.0.1:9000",
             "S3_ACCESS_KEY": "minioadmin",
@@ -954,7 +964,10 @@ def ingest_workload(server: PlasmodProcess, variant: Variant, event_limit: int,
     for ordinal, source in enumerate(iter_events(event_limit), 1):
         event, text, vector = prepare_event(source, ordinal, variant.group)
         started = time.perf_counter()
-        ack = http_json(server.base, "POST", "/v1/ingest/events", event, timeout=120)
+        ack = http_json(
+            server.base, "POST", "/v1/ingest/events", event,
+            timeout=ingest_timeout_s(event_limit),
+        )
         write_ms = (time.perf_counter() - started) * 1000
         if ack.get("status") not in ("accepted", "duplicate"):
             raise RuntimeError(f"{variant.name} ingest {ordinal} failed: {ack}")
