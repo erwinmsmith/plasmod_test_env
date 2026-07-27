@@ -419,8 +419,11 @@ def test_plasmod_process_uses_checkpoint_flush_interval_suited_for_disk_benchmar
     assert captured_env["PLASMOD_CONSISTENCY_CHECKPOINT_FLUSH_INTERVAL"] == "1s"
 
 
-def test_ingest_workload_uses_formal_timeout_for_large_event_runs(tmp_path, monkeypatch):
-    captured_timeouts = []
+@pytest.mark.parametrize("event_limit", [0, 641_979])
+def test_ingest_workload_uses_formal_timeouts_for_large_event_runs(
+        tmp_path, monkeypatch, event_limit):
+    captured_ingest_timeouts = []
+    captured_query_timeouts = []
 
     class FakeServer:
         base = "http://127.0.0.1:18080"
@@ -430,21 +433,22 @@ def test_ingest_workload_uses_formal_timeout_for_large_event_runs(tmp_path, monk
             return 10.0
 
     def fake_iter_events(limit):
-        assert limit == 641_979
+        assert limit == event_limit
         yield {"identity": {"event_id": "source-1"}, "payload": {"text": "one"}}
         yield {"identity": {"event_id": "source-2"}, "payload": {"text": "two"}}
 
     def fake_http_json(_base, _method, path, _body=None, timeout=60.0):
         if path == "/v1/ingest/events":
-            captured_timeouts.append(timeout)
+            captured_ingest_timeouts.append(timeout)
             return {
                 "status": "accepted",
-                "event_id": f"event-{len(captured_timeouts)}",
+                "event_id": f"event-{len(captured_ingest_timeouts)}",
                 "materialization_latency_ms": 1.0,
-                "memory_id": f"mem-{len(captured_timeouts)}",
+                "memory_id": f"mem-{len(captured_ingest_timeouts)}",
             }
         if path == "/v1/query":
-            return {"objects": [f"mem-{len(captured_timeouts)}"]}
+            captured_query_timeouts.append(timeout)
+            return {"objects": [f"mem-{len(captured_ingest_timeouts)}"]}
         if path == "/v1/admin/runtime/state":
             return {"state": {"events": 2, "objects": 2, "edges": 0, "latest_states": 0}}
         raise AssertionError(f"unexpected request path {path}")
@@ -455,12 +459,13 @@ def test_ingest_workload_uses_formal_timeout_for_large_event_runs(tmp_path, monk
     data = MODULE.ingest_workload(
         FakeServer(),
         MODULE.Variant("wal", "In-memory WAL"),
-        641_979,
+        event_limit,
         0,
     )
 
     assert data.writes == 2
-    assert captured_timeouts == [300.0, 300.0]
+    assert captured_ingest_timeouts == [300.0, 300.0]
+    assert captured_query_timeouts == [300.0, 300.0]
 
 
 def test_measure_recovery_resets_offline_before_explicit_replay(

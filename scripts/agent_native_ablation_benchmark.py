@@ -335,7 +335,7 @@ def recovery_reset_timeout_s(event_count: int) -> float:
 
 
 def formal_query_timeout_s(event_count: int) -> float:
-    if event_count >= FORMAL_QUERY_TIMEOUT_EVENT_THRESHOLD:
+    if event_count == 0 or event_count >= FORMAL_QUERY_TIMEOUT_EVENT_THRESHOLD:
         return FORMAL_QUERY_TIMEOUT_S
     return DEFAULT_QUERY_TIMEOUT_S
 
@@ -986,6 +986,7 @@ def ingest_workload(server: PlasmodProcess, variant: Variant, event_limit: int,
     latest_by_scope: dict[tuple[str, str, str], tuple[str, list[float], str, str, str, str]] = {}
     if retention is not None:
         retention.ensure_capacity(f"{variant.slug} ingest start")
+    visibility_timeout = formal_query_timeout_s(event_limit)
     started_all = time.perf_counter()
     for ordinal, source in enumerate(iter_events(event_limit), 1):
         event, text, vector = prepare_event(source, ordinal, variant.group)
@@ -1024,6 +1025,7 @@ def ingest_workload(server: PlasmodProcess, variant: Variant, event_limit: int,
         visibility_response, _ = query(
             server.base, text, vector, [target], "objects_only",
             requester=requester, workspace=workspace, session=session,
+            timeout=visibility_timeout,
         )
         data.visibility_latencies.append((time.perf_counter() - visible_started) * 1000)
         if target not in visibility_response.get("objects", []):
