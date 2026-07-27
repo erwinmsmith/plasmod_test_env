@@ -1041,9 +1041,11 @@ def ingest_workload(server: PlasmodProcess, variant: Variant, event_limit: int,
             log(f"{variant.group}/{variant.name}: ingested {ordinal}")
     data.wall_seconds = time.perf_counter() - started_all
     data.latest_query_samples = list(reversed(latest_by_scope.values()))[:query_limit]
+    query_timeout = formal_query_timeout_s(event_limit)
     for text, vector, _, requester, workspace, session in data.query_samples:
         response, latency = query(
-            server.base, text, vector, requester=requester, workspace=workspace, session=session)
+            server.base, text, vector, requester=requester, workspace=workspace,
+            session=session, timeout=query_timeout)
         data.responses.append(response)
         data.query_latencies.append(latency)
         diagnostics = response.get("diagnostics") or {}
@@ -1055,6 +1057,7 @@ def ingest_workload(server: PlasmodProcess, variant: Variant, event_limit: int,
         response, _ = query(
             server.base, text, vector, [expected], "objects_only",
             requester=requester, workspace=workspace, session=session,
+            timeout=query_timeout,
         )
         data.stale_checks += 1
         data.stale_misses += int(expected not in response.get("objects", []))

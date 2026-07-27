@@ -460,12 +460,12 @@ def test_ingest_workload_uses_formal_timeouts_for_large_event_runs(
         FakeServer(),
         MODULE.Variant("wal", "In-memory WAL"),
         event_limit,
-        0,
+        1,
     )
 
     assert data.writes == 2
     assert captured_ingest_timeouts == [300.0, 300.0]
-    assert captured_query_timeouts == [300.0, 300.0]
+    assert captured_query_timeouts == [300.0, 300.0, 300.0, 300.0]
 
 
 def test_measure_recovery_resets_offline_before_explicit_replay(
